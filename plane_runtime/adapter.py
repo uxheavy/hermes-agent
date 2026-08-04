@@ -20,6 +20,7 @@ from .contract import (
     ConversationPublicationObserved,
     InputRequestObserved,
     LeaseError,
+    OutcomeSubmissionObserved,
     ProgressObserved,
     ProductReceipt,
     PublicationReceipt,
@@ -36,6 +37,7 @@ from .contract import (
     UsageObserved,
     RuntimeLease,
     MAX_REFERENCE_LENGTH,
+    MAX_NEW_CONTEXT_EVENT_REFS,
     parse_utc_timestamp,
 )
 from .contract import InvocationEnvelope, PROTOCOL
@@ -87,6 +89,28 @@ class RuntimeHost(Protocol):
         artifact_ref: str,
         digest: str,
         idempotency_key: str,
+    ) -> ProductReceipt:
+        ...
+
+    def submit_outcome(
+        self,
+        *,
+        run_id: str,
+        invocation_id: str,
+        submission_ref: str,
+        idempotency_key: str,
+    ) -> ProductReceipt:
+        ...
+
+
+class CancellationAuthority(Protocol):
+    """Plane-owned cancellation correlation authority."""
+
+    def validate_cancellation(
+        self,
+        *,
+        run: RunSnapshot,
+        invocation: InvocationEnvelope,
     ) -> ProductReceipt:
         ...
 
@@ -179,7 +203,7 @@ class CheckpointAttestation:
 class CheckpointAuthority(Protocol):
     """Host authority for complete, immutable checkpoint attestations."""
 
-    def validate_checkpoint(
+    def claim_checkpoint(
         self,
         *,
         run: RunSnapshot,
@@ -239,6 +263,7 @@ class KernelObservation:
     request_ref: str | None = None
     artifact_ref: str | None = None
     artifact_digest: str | None = None
+    submission_ref: str | None = None
     usage: RuntimeBudget | None = None
 
 
@@ -258,6 +283,14 @@ class KernelResult:
 
 class CancellationRequested(Exception):
     """Internal control flow for an invocation cancelled during dispatch."""
+
+
+class TerminalReconciliationError(ContractError):
+    """Raised when Plane does not accept the proposed terminal transition."""
+
+    def __init__(self, receipt: TerminalReconciliationReceipt) -> None:
+        self.receipt = receipt
+        super().__init__("Plane did not accept the terminal reconciliation proposal")
 
 
 class NeverCancelled:
@@ -455,18 +488,29 @@ class FixtureCheckpointAuthority:
 
     def __init__(self, attestations: Iterable[CheckpointAttestation]) -> None:
         self._lock = RLock()
-        self._attestations: dict[tuple[str, str, str], CheckpointAttestation] = {}
+        self._attestations: dict[tuple[str, ...], CheckpointAttestation] = {}
+        self._consumed: set[tuple[str, ...]] = set()
         for attestation in attestations:
-            key = (
-                attestation.source_run_id,
-                attestation.checkpoint_ref,
-                attestation.allowed_target_invocation_id,
-            )
+            key = self._key(attestation)
             if key in self._attestations:
                 raise ContractError("duplicate checkpoint attestation")
             self._attestations[key] = attestation
 
-    def validate_checkpoint(
+    @staticmethod
+    def _key(attestation: CheckpointAttestation) -> tuple[str, ...]:
+        return (
+            attestation.source_run_id,
+            attestation.source_invocation_id,
+            attestation.checkpoint_ref,
+            attestation.snapshot_digest,
+            attestation.actor_ref,
+            attestation.profile_version,
+            attestation.continuation_event_ref,
+            attestation.continuation_trigger_kind,
+            attestation.allowed_target_invocation_id,
+        )
+
+    def claim_checkpoint(
         self,
         *,
         run: RunSnapshot,
@@ -476,13 +520,13 @@ class FixtureCheckpointAuthority:
         with self._lock:
             if invocation.checkpoint_ref is None:
                 raise BindingError("checkpoint attestation requires a checkpoint reference")
-            canonical = self._attestations.get(
-                (run.run_id, invocation.checkpoint_ref, invocation.invocation_id)
-            )
+            key = self._key(attestation)
+            canonical = self._attestations.get(key)
             if canonical is None or canonical != attestation:
                 raise BindingError("checkpoint attestation is not canonical for this continuation")
             if (
                 attestation.source_run_id != run.run_id
+                or not attestation.source_invocation_id
                 or attestation.snapshot_digest != run.digest()
                 or attestation.actor_ref != run.actor_ref
                 or attestation.profile_version != run.profile_version
@@ -492,6 +536,40 @@ class FixtureCheckpointAuthority:
                 or attestation.continuation_event_ref != invocation.trigger.event_ref
             ):
                 raise BindingError("checkpoint attestation is bound to different run continuation state")
+            if key in self._consumed:
+                raise SequenceError("checkpoint attestation was already consumed")
+            self._consumed.add(key)
+
+
+class FixtureCancellationAuthority:
+    """Deterministic host authority used by tests and the demo service only."""
+
+    def __init__(self, receipts: Iterable[ProductReceipt]) -> None:
+        self._lock = RLock()
+        self._receipts: dict[tuple[str, str], ProductReceipt] = {}
+        for receipt in receipts:
+            key = (receipt.run_id, receipt.invocation_id)
+            if key in self._receipts:
+                raise ContractError("duplicate canonical cancellation receipt")
+            self._receipts[key] = receipt
+
+    def validate_cancellation(
+        self,
+        *,
+        run: RunSnapshot,
+        invocation: InvocationEnvelope,
+    ) -> ProductReceipt:
+        with self._lock:
+            receipt = self._receipts.get((run.run_id, invocation.invocation_id))
+            if receipt is None:
+                raise BindingError("no canonical cancellation receipt exists for this invocation")
+            if (
+                receipt.run_id != run.run_id
+                or receipt.invocation_id != invocation.invocation_id
+                or receipt.resource_ref != invocation.cancellation_ref
+            ):
+                raise BindingError("cancellation receipt is not bound to this invocation")
+            return receipt
 
 
 def _validate_publication_receipt(
@@ -540,6 +618,7 @@ def _terminal_proposal(
     exit_value: RuntimeExit,
     stream: EventStream,
     source: str = "runtime",
+    extra_receipt_refs: Iterable[str] = (),
 ) -> TerminalProposal:
     receipt_refs = tuple(
         receipt_ref
@@ -547,12 +626,18 @@ def _terminal_proposal(
         for receipt_ref in (getattr(event.body, "receipt_ref", None),)
         if receipt_ref is not None
     )
+    receipt_refs += tuple(extra_receipt_refs)
+    receipt_refs = receipt_refs[-MAX_NEW_CONTEXT_EVENT_REFS:]
+    if len(set(receipt_refs)) != len(receipt_refs):
+        raise SequenceError("terminal evidence receipt references must be unique")
     return TerminalProposal(
         run_id=run.run_id,
         invocation_id=invocation.invocation_id,
         kind=exit_value.kind,
         final_sequence=exit_value.final_sequence,
-        evidence_event_ids=tuple(event.event_id for event in stream.events),
+        evidence_event_ids=tuple(
+            event.event_id for event in stream.events[-MAX_NEW_CONTEXT_EVENT_REFS:]
+        ),
         evidence_receipt_refs=receipt_refs,
         failure=exit_value.failure,
         source=source,
@@ -575,9 +660,42 @@ def _reconcile_terminal(
         or receipt.idempotency_key != proposal.idempotency_key
     ):
         raise BindingError("terminal reconciliation receipt is not bound to this proposal")
-    if not receipt.accepted or not receipt.legal_transition:
-        raise BindingError("Plane rejected the terminal proposal or reported an illegal transition")
     return receipt
+
+
+def reconcile_terminal_proposal(
+    *,
+    port: TerminalReconciliationPort,
+    proposal: TerminalProposal,
+) -> TerminalReconciliationReceipt:
+    """Submit one bounded proposal through the injected Plane seam."""
+
+    return _reconcile_terminal(port, proposal)
+
+
+def _validate_terminal_evidence(
+    *,
+    kind: str,
+    stream: EventStream,
+    cancellation_receipt: ProductReceipt | None,
+) -> None:
+    bodies = tuple(event.body for event in stream.events)
+    submissions = tuple(
+        body for body in bodies if isinstance(body, OutcomeSubmissionObserved)
+    )
+    input_requests = tuple(
+        body for body in bodies if isinstance(body, InputRequestObserved)
+    )
+    if kind == "completed" and len(submissions) != 1:
+        raise ContractError(
+            "completed requires exactly one verified outcome-submission receipt"
+        )
+    if kind == "waiting_for_input" and not input_requests:
+        raise ContractError(
+            "waiting_for_input requires a correlated input-request receipt"
+        )
+    if kind == "cancelled" and cancellation_receipt is None:
+        raise ContractError("cancelled requires an authoritative cancellation correlation")
 
 
 def _return_terminal(
@@ -587,17 +705,50 @@ def _return_terminal(
     invocation: InvocationEnvelope,
     stream: EventStream,
     exit_value: RuntimeExit,
+    cancellation_receipt: ProductReceipt | None = None,
 ) -> RuntimeExit:
-    _reconcile_terminal(
+    _validate_terminal_evidence(
+        kind=exit_value.kind,
+        stream=stream,
+        cancellation_receipt=cancellation_receipt,
+    )
+    receipt = _reconcile_terminal(
         port,
         _terminal_proposal(
             run=run,
             invocation=invocation,
             exit_value=exit_value,
             stream=stream,
+            extra_receipt_refs=(
+                (cancellation_receipt.receipt_ref,)
+                if cancellation_receipt is not None
+                else ()
+            ),
         ),
     )
+    if not receipt.accepted or not receipt.legal_transition:
+        raise TerminalReconciliationError(receipt)
     return exit_value
+
+
+def _cancellation_receipt(
+    *,
+    authority: CancellationAuthority | None,
+    run: RunSnapshot,
+    invocation: InvocationEnvelope,
+) -> ProductReceipt:
+    if authority is None:
+        raise ContractError("cancelled execution requires an injected cancellation authority")
+    receipt = authority.validate_cancellation(run=run, invocation=invocation)
+    if not isinstance(receipt, ProductReceipt):
+        raise ContractError("cancellation authority returned an invalid receipt")
+    if (
+        receipt.run_id != run.run_id
+        or receipt.invocation_id != invocation.invocation_id
+        or receipt.resource_ref != invocation.cancellation_ref
+    ):
+        raise BindingError("cancellation receipt is not bound to this invocation")
+    return receipt
 
 
 def execute(
@@ -607,6 +758,7 @@ def execute(
     host: RuntimeHost | None,
     emit: EventSink | None = None,
     cancellation: CancellationSignal | None = None,
+    cancellation_authority: CancellationAuthority | None = None,
     kernel: KernelPort | None = None,
     lease_authority: CanonicalLeaseAuthority | None = None,
     lease_binding: CanonicalLeaseBinding | None = None,
@@ -630,7 +782,7 @@ def execute(
             raise ContractError(
                 "checkpoint continuation requires an injected checkpoint authority and attestation"
             )
-        checkpoint_authority.validate_checkpoint(
+        checkpoint_authority.claim_checkpoint(
             run=run,
             invocation=invocation,
             attestation=checkpoint_attestation,
@@ -647,12 +799,18 @@ def execute(
         expected_causation_ref=invocation.causation_ref,
     )
     if cancellation.is_cancelled():
+        cancellation_receipt = _cancellation_receipt(
+            authority=cancellation_authority,
+            run=run,
+            invocation=invocation,
+        )
         return _return_terminal(
             port=terminal_port,
             run=run,
             invocation=invocation,
             stream=stream,
             exit_value=RuntimeExit(kind="cancelled", final_sequence=stream.last_sequence),
+            cancellation_receipt=cancellation_receipt,
         )
     kernel = kernel or FakeKernel()
     request = KernelRequest(
@@ -670,6 +828,7 @@ def execute(
     )
     transcripts: dict[str, TranscriptObserved] = {}
     pending_input_requests: set[str] = set()
+    outcome_submissions: set[str] = set()
     used = RuntimeBudget()
 
     def on_observation(observation: KernelObservation) -> None:
@@ -751,6 +910,37 @@ def execute(
                 ArtifactObserved(observation.artifact_ref, observation.artifact_digest, receipt.receipt_ref),
             )
             return
+        if observation.kind == "outcome_submission":
+            if host is None:
+                raise ContractError("outcome submissions require a trusted runtime host")
+            if observation.submission_ref is None:
+                raise ContractError("outcome submission requires a submission reference")
+            if observation.submission_ref in outcome_submissions:
+                raise SequenceError("outcome submission reference was reused in one invocation")
+            event_id = f"{invocation.invocation_id}:outcome:{observation.submission_ref}"
+            receipt = host.submit_outcome(
+                run_id=run.run_id,
+                invocation_id=invocation.invocation_id,
+                submission_ref=observation.submission_ref,
+                idempotency_key=event_id,
+            )
+            _validate_product_receipt(
+                receipt,
+                run_id=run.run_id,
+                invocation_id=invocation.invocation_id,
+                resource_ref=observation.submission_ref,
+                idempotency_key=event_id,
+            )
+            outcome_submissions.add(observation.submission_ref)
+            _next_event(
+                stream,
+                invocation,
+                OutcomeSubmissionObserved(
+                    submission_ref=observation.submission_ref,
+                    receipt_ref=receipt.receipt_ref,
+                ),
+            )
+            return
         if observation.kind == "publication_request":
             if host is None:
                 raise ContractError("explicit publication requires a trusted runtime host")
@@ -789,20 +979,32 @@ def execute(
     try:
         result = kernel.dispatch(request, on_observation, cancellation)
     except CancellationRequested:
+        cancellation_receipt = _cancellation_receipt(
+            authority=cancellation_authority,
+            run=run,
+            invocation=invocation,
+        )
         return _return_terminal(
             port=terminal_port,
             run=run,
             invocation=invocation,
             stream=stream,
             exit_value=RuntimeExit(kind="cancelled", final_sequence=stream.last_sequence),
+            cancellation_receipt=cancellation_receipt,
         )
     if cancellation.is_cancelled():
+        cancellation_receipt = _cancellation_receipt(
+            authority=cancellation_authority,
+            run=run,
+            invocation=invocation,
+        )
         return _return_terminal(
             port=terminal_port,
             run=run,
             invocation=invocation,
             stream=stream,
             exit_value=RuntimeExit(kind="cancelled", final_sequence=stream.last_sequence),
+            cancellation_receipt=cancellation_receipt,
         )
     if result.terminal_kind == "waiting_for_input" and not pending_input_requests:
         raise ContractError("waiting_for_input requires a visible authorized input request")
@@ -831,6 +1033,7 @@ class FakeKernelPlan:
     terminal_kind: str = "completed"
     input_request: str | None = None
     input_request_ref: str = "input:fake"
+    outcome_submission_requested: bool = True
     publication_requested: bool = False
     hold_after_observations: int | None = None
 
@@ -875,6 +1078,13 @@ class FakeKernel:
                     message=self.plan.input_request,
                 )
             )
+        if self.plan.outcome_submission_requested and self.plan.terminal_kind == "completed":
+            emit(
+                KernelObservation(
+                    kind="outcome_submission",
+                    submission_ref="submission:fake",
+                )
+            )
         if self.plan.publication_requested:
             emit(KernelObservation(kind="publication_request", transcript_ref=self.plan.transcript_ref))
         if cancellation.is_cancelled():
@@ -889,6 +1099,7 @@ class RecordingHost:
         self.publications: list[tuple[str, str, str]] = []
         self.input_requests: list[tuple[str, str, str]] = []
         self.artifacts: list[tuple[str, str, str]] = []
+        self.outcomes: list[tuple[str, str, str]] = []
         self._receipts: dict[str, PublicationReceipt | ProductReceipt] = {}
 
     def publish_transcript(
@@ -958,6 +1169,30 @@ class RecordingHost:
         self.artifacts.append((run_id, artifact_ref, idempotency_key))
         receipt = ProductReceipt(
             resource_ref=artifact_ref,
+            receipt_ref=f"receipt:{idempotency_key}",
+            run_id=run_id,
+            invocation_id=invocation_id,
+            idempotency_key=idempotency_key,
+        )
+        self._receipts[idempotency_key] = receipt
+        return receipt
+
+    def submit_outcome(
+        self,
+        *,
+        run_id: str,
+        invocation_id: str,
+        submission_ref: str,
+        idempotency_key: str,
+    ) -> ProductReceipt:
+        prior = self._receipts.get(idempotency_key)
+        if prior is not None:
+            if not isinstance(prior, ProductReceipt) or prior.resource_ref != submission_ref:
+                raise BindingError("outcome idempotency key was reused for another operation")
+            return prior
+        self.outcomes.append((run_id, submission_ref, idempotency_key))
+        receipt = ProductReceipt(
+            resource_ref=submission_ref,
             receipt_ref=f"receipt:{idempotency_key}",
             run_id=run_id,
             invocation_id=invocation_id,

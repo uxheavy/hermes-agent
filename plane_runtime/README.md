@@ -11,12 +11,16 @@ state, lifecycle, publication, receipts, credentials, terminal reconciliation,
 and durable recovery.
 
 Execution requires host-injected `CanonicalLeaseAuthority` and
-`CanonicalLeaseBinding` values. Continuations additionally require a complete
-host `CheckpointAttestation` and `CheckpointAuthority`; the envelope's lease
-and checkpoint references are never authorities. Every runtime exit is
-submitted through the injected `TerminalReconciliationPort`, which returns a
-receipt, audit reference, and legal-transition result. A supervisor classifying
-process death uses the same port through `reconcile_process_death()`.
+`CanonicalLeaseBinding` values. Continuations additionally require a complete,
+single-use host `CheckpointAttestation` claim through `CheckpointAuthority`;
+the envelope's lease and checkpoint references are never authorities. A
+completed exit requires an explicit host outcome-submission receipt, waiting
+requires an input-request receipt, and cancellation requires an authoritative
+cancellation correlation. Every runtime exit is submitted through the
+injected `TerminalReconciliationPort`, whose durable implementation must use
+one atomic `(run, invocation)` terminal slot and return a receipt, audit
+reference, and legal-transition result. A supervisor classifying process death
+uses the same port through `reconcile_process_death()`.
 
 The v1 contract contains immutable `RunSnapshot` and `InvocationEnvelope`
 values, bounded `RuntimeEvent` observations/proposals, and one `RuntimeExit`.
@@ -34,7 +38,11 @@ boundary is stable across transport implementations.
 `adapter.py` exposes the narrow `KernelPort` seam. `FakeKernel` is a
 deterministic implementation for contract tests; a real Hermes implementation
 can be added behind the same seam without changing Hermes core modules.
-`service.py` provides a deliberately minimal one-invocation JSON-lines host:
+`service.py` provides a deliberately minimal one-invocation JSON-lines host.
+Unexpected internal exceptions are retained only by the protected failure hook
+and become a bounded generic failed proposal; if that proposal is not
+accepted, the service returns status 1 so a trusted supervisor can reconcile
+the visible failure:
 
 ```bash
 printf '%s\n' '<request JSON>' | python3 -m plane_runtime.service --once

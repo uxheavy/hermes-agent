@@ -1162,10 +1162,15 @@ class TerminalProposal:
 
     @property
     def idempotency_key(self) -> str:
-        return (
-            f"terminal:{self.source}:{self.run_id}:{self.invocation_id}:"
-            f"{self.kind}:{self.final_sequence}"
-        )
+        """Return the one terminal slot shared by runtime and supervisor.
+
+        Proposal details remain part of the value compared by the durable
+        reconciliation port.  They deliberately do not participate in the
+        key: a later competing proposal must collide with the same slot and
+        be rejected or reconciled, never create a second accepted mutation.
+        """
+
+        return f"terminal:{self.run_id}:{self.invocation_id}"
 
 
 @dataclass(frozen=True)

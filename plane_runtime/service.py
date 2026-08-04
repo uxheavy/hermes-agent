@@ -11,6 +11,7 @@ import argparse
 import json
 import sys
 from datetime import datetime, timezone
+from threading import RLock
 from typing import Any, Callable, TextIO
 
 from .adapter import (
@@ -28,14 +29,24 @@ from .adapter import (
     RuntimeHost,
     TerminalReconciliationPort,
     execute,
+    reconcile_terminal_proposal,
 )
 from .contract import (
+    AssignmentSnapshot,
+    ContractDigests,
     ContractError,
     InvocationEnvelope,
+    MAX_NEW_CONTEXT_EVENT_REFS,
+    OperationDescriptor,
+    RuntimeFailure,
+    RuntimeModelRoute,
+    RuntimeBudgetPolicy,
     RunSnapshot,
     RuntimeBudget,
     TerminalProposal,
     TerminalReconciliationReceipt,
+    ToolPresentation,
+    VersionedContextRef,
 )
 
 
@@ -44,19 +55,41 @@ InternalFailureHook = Callable[[Exception], None]
 
 
 class _DemoTerminalPort:
-    """Stateless fixture port for the JSON-lines demonstration service."""
+    """Explicit demo-only terminal fixture, not production durability."""
+
+    def __init__(self) -> None:
+        self._lock = RLock()
+        self._proposals: dict[str, tuple[TerminalProposal, TerminalReconciliationReceipt]] = {}
 
     def reconcile_terminal(self, proposal: TerminalProposal) -> TerminalReconciliationReceipt:
-        return TerminalReconciliationReceipt(
-            receipt_ref=f"receipt:{proposal.idempotency_key}",
-            audit_ref=f"audit:{proposal.idempotency_key}",
-            run_id=proposal.run_id,
-            invocation_id=proposal.invocation_id,
-            kind=proposal.kind,
-            idempotency_key=proposal.idempotency_key,
-            accepted=True,
-            legal_transition=True,
-        )
+        with self._lock:
+            prior = self._proposals.get(proposal.idempotency_key)
+            if prior is not None:
+                prior_proposal, prior_receipt = prior
+                if prior_proposal == proposal:
+                    return prior_receipt
+                return TerminalReconciliationReceipt(
+                    receipt_ref=f"rejected:{proposal.idempotency_key}",
+                    audit_ref=f"audit:{proposal.idempotency_key}:conflict",
+                    run_id=proposal.run_id,
+                    invocation_id=proposal.invocation_id,
+                    kind=proposal.kind,
+                    idempotency_key=proposal.idempotency_key,
+                    accepted=False,
+                    legal_transition=False,
+                )
+            receipt = TerminalReconciliationReceipt(
+                receipt_ref=f"receipt:{proposal.idempotency_key}",
+                audit_ref=f"audit:{proposal.idempotency_key}",
+                run_id=proposal.run_id,
+                invocation_id=proposal.invocation_id,
+                kind=proposal.kind,
+                idempotency_key=proposal.idempotency_key,
+                accepted=True,
+                legal_transition=True,
+            )
+            self._proposals[proposal.idempotency_key] = (proposal, receipt)
+            return receipt
 
 
 _DEMO_LEASE_BINDINGS = (
@@ -79,6 +112,45 @@ _DEMO_LEASE_BINDINGS = (
 )
 
 
+def _demo_snapshot() -> RunSnapshot:
+    """Return the fixed host fixture used to attest the demo continuation."""
+
+    return RunSnapshot(
+        protocol="plane.agent-runtime/v1",
+        run_id="run:one",
+        assignment=AssignmentSnapshot(
+            version="assignment:v1",
+            target_ref="issue:one",
+            objective="Produce the assigned result",
+            acceptance_criteria=("The result is deterministic",),
+        ),
+        actor_ref="agent:one",
+        profile_version="profile:v1",
+        behavioral_prompt="Use the runtime port.",
+        context=(VersionedContextRef("context:one", "sha256:context"),),
+        tool_presentation=ToolPresentation(
+            eager_operations=(OperationDescriptor("operation:read", "sha256:operation"),),
+            catalog_digest="sha256:catalog",
+        ),
+        model=RuntimeModelRoute(model="fake-model", route_ref="route:fake"),
+        total_budget_policy=RuntimeBudgetPolicy(total=RuntimeBudget(5, 100, 100)),
+        contract_digests=ContractDigests("snapshot:v1", "invocation:v1", "event:v1", "exit:v1"),
+    )
+
+
+_DEMO_CHECKPOINT_ATTESTATION = CheckpointAttestation(
+    checkpoint_ref="checkpoint:one",
+    source_run_id="run:one",
+    source_invocation_id="invocation:one",
+    snapshot_digest=_demo_snapshot().digest(),
+    actor_ref="agent:one",
+    profile_version="profile:v1",
+    continuation_event_ref="event:answer",
+    continuation_trigger_kind="continuation",
+    allowed_target_invocation_id="invocation:replacement",
+)
+
+
 def _demo_lease_binding(invocation: InvocationEnvelope) -> CanonicalLeaseBinding:
     """Select one explicit fixture binding; never copy fields from the envelope."""
 
@@ -88,30 +160,18 @@ def _demo_lease_binding(invocation: InvocationEnvelope) -> CanonicalLeaseBinding
     raise ContractError("demo host has no canonical lease fixture for this invocation")
 
 
-def _demo_checkpoint_attestation(
-    run: RunSnapshot, invocation: InvocationEnvelope
-) -> CheckpointAttestation | None:
+def _demo_checkpoint_attestation(invocation: InvocationEnvelope) -> CheckpointAttestation | None:
     if invocation.checkpoint_ref is None:
         return None
     if (
-        run.run_id != "run:one"
+        invocation.run_id != "run:one"
         or invocation.invocation_id != "invocation:replacement"
         or invocation.checkpoint_ref != "checkpoint:one"
         or invocation.trigger.kind != "continuation"
         or invocation.trigger.event_ref != "event:answer"
     ):
         raise ContractError("demo host has no canonical checkpoint fixture for this invocation")
-    return CheckpointAttestation(
-        checkpoint_ref="checkpoint:one",
-        source_run_id="run:one",
-        source_invocation_id="invocation:one",
-        snapshot_digest=run.digest(),
-        actor_ref=run.actor_ref,
-        profile_version=run.profile_version,
-        continuation_event_ref="event:answer",
-        continuation_trigger_kind="continuation",
-        allowed_target_invocation_id="invocation:replacement",
-    )
+    return _DEMO_CHECKPOINT_ATTESTATION
 
 
 def _fake_plan(raw: Any) -> FakeKernelPlan:
@@ -126,6 +186,7 @@ def _fake_plan(raw: Any) -> FakeKernelPlan:
         "terminalKind",
         "inputRequest",
         "inputRequestRef",
+        "outcomeSubmissionRequested",
         "publicationRequested",
         "holdAfterObservations",
     }))
@@ -138,6 +199,9 @@ def _fake_plan(raw: Any) -> FakeKernelPlan:
     terminal_kind = raw.get("terminalKind", defaults.terminal_kind)
     input_request = raw.get("inputRequest")
     input_request_ref = raw.get("inputRequestRef", defaults.input_request_ref)
+    outcome_submission_requested = raw.get(
+        "outcomeSubmissionRequested", defaults.outcome_submission_requested
+    )
     publication_requested = raw.get("publicationRequested", False)
     hold_after_observations = raw.get("holdAfterObservations")
     if not isinstance(transcript, str) or not transcript:
@@ -152,6 +216,8 @@ def _fake_plan(raw: Any) -> FakeKernelPlan:
         raise ContractError("fakePlan.inputRequestRef must be a non-empty string")
     if not isinstance(publication_requested, bool):
         raise ContractError("fakePlan.publicationRequested must be a boolean")
+    if not isinstance(outcome_submission_requested, bool):
+        raise ContractError("fakePlan.outcomeSubmissionRequested must be a boolean")
     if hold_after_observations is not None and (
         isinstance(hold_after_observations, bool)
         or not isinstance(hold_after_observations, int)
@@ -170,6 +236,7 @@ def _fake_plan(raw: Any) -> FakeKernelPlan:
         terminal_kind=terminal_kind,
         input_request=input_request,
         input_request_ref=input_request_ref,
+        outcome_submission_requested=outcome_submission_requested,
         publication_requested=publication_requested,
         hold_after_observations=hold_after_observations,
     )
@@ -187,7 +254,7 @@ def serve_once(
     terminal_port: TerminalReconciliationPort | None = None,
     kernel: KernelPort | None = None,
     internal_failure_hook: InternalFailureHook | None = None,
-) -> None:
+) -> int:
     """Read one serialized invocation and write event/exit JSON lines."""
 
     run: RunSnapshot | None = None
@@ -237,6 +304,7 @@ def serve_once(
         )
         output.write(json.dumps({"type": "exit", "exit": exit_value.to_dict()}, sort_keys=True) + "\n")
         output.flush()
+        return 0
     except (ContractError, TypeError, ValueError, json.JSONDecodeError) as exc:
         output.write(
             json.dumps(
@@ -253,6 +321,39 @@ def serve_once(
                 internal_failure_hook(exc)
             except Exception:
                 pass
+        receipt: TerminalReconciliationReceipt | None = None
+        if run is not None and invocation is not None and terminal_port is not None:
+            proposal = TerminalProposal(
+                run_id=run.run_id,
+                invocation_id=invocation.invocation_id,
+                kind="failed",
+                final_sequence=collector.last_sequence if collector is not None else 0,
+                evidence_event_ids=tuple(
+                    event.event_id
+                    for event in collector.events[-MAX_NEW_CONTEXT_EVENT_REFS:]
+                )
+                if collector is not None
+                else (),
+                failure=RuntimeFailure(
+                    code="runtime_exception",
+                    message=GENERIC_RUNTIME_FAILURE,
+                    retryable=True,
+                ),
+            )
+            try:
+                receipt = reconcile_terminal_proposal(port=terminal_port, proposal=proposal)
+            except Exception:
+                receipt = None
+        if receipt is not None and receipt.accepted and receipt.legal_transition:
+            output.write(
+                json.dumps(
+                    {"type": "reconciliation", "receipt": receipt.__dict__},
+                    sort_keys=True,
+                )
+                + "\n"
+            )
+            output.flush()
+            return 0
         output.write(
             json.dumps(
                 {
@@ -271,6 +372,7 @@ def serve_once(
             + "\n"
         )
         output.flush()
+        return 1
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -291,13 +393,13 @@ def main(argv: list[str] | None = None) -> int:
         lease_authority = FixtureCanonicalLeaseAuthority(
             _DEMO_LEASE_BINDINGS, clock=lambda: datetime.now(timezone.utc)
         )
-        checkpoint_attestation = _demo_checkpoint_attestation(run, invocation)
+        checkpoint_attestation = _demo_checkpoint_attestation(invocation)
         checkpoint_authority = (
             FixtureCheckpointAuthority([checkpoint_attestation])
             if checkpoint_attestation is not None
             else None
         )
-        serve_once(
+        return serve_once(
             request_line,
             sys.stdout,
             host=RecordingHost(),
