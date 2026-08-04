@@ -8,8 +8,12 @@ returns one exit.  A supervisor can replace the process with a new invocation.
 from __future__ import annotations
 
 import argparse
+import errno
 import json
+import os
+import selectors
 import sys
+import time
 from datetime import datetime, timezone
 from typing import Any, BinaryIO, Callable, TextIO
 
@@ -48,6 +52,7 @@ from .contract import (
     MAX_NEW_CONTEXT_EVENT_REFS,
     OperationDescriptor,
     RuntimeFailure,
+    RuntimeConfigurationError,
     RuntimeModelRoute,
     RuntimeBudgetPolicy,
     RunSnapshot,
@@ -73,45 +78,157 @@ MAX_SERVICE_REQUEST_BYTES = (
     + MAX_FAKE_PLAN_BYTES
     + 16 * 1024
 )
+SERVICE_FRAME_TIMEOUT_SECONDS = 1.0
+SERVICE_FRAME_READ_CHUNK_BYTES = 16 * 1024
 
 
-def _read_bounded_request_line(stream: TextIO) -> str:
-    """Read one complete UTF-8 JSON-lines frame without unbounded buffering."""
+class _ServiceFrameReader:
+    """Acquire bounded JSON-lines frames from a real stream without blocking forever."""
 
-    source: BinaryIO | TextIO = getattr(stream, "buffer", stream)
-    frame = bytearray()
-    while len(frame) < MAX_SERVICE_REQUEST_BYTES + 1:
-        raw = source.read(1)
-        if not raw:
-            break
+    def __init__(
+        self,
+        stream: TextIO | BinaryIO,
+        *,
+        timeout_seconds: float = SERVICE_FRAME_TIMEOUT_SECONDS,
+        chunk_bytes: int = SERVICE_FRAME_READ_CHUNK_BYTES,
+    ) -> None:
+        if not isinstance(timeout_seconds, (int, float)) or timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be positive")
+        if isinstance(chunk_bytes, bool) or not isinstance(chunk_bytes, int) or chunk_bytes <= 0:
+            raise ValueError("chunk_bytes must be a positive integer")
+        self._owner = stream
+        self._source: BinaryIO | TextIO = getattr(stream, "buffer", stream)
+        self._timeout_seconds = float(timeout_seconds)
+        self._chunk_bytes = chunk_bytes
+        self._carry = bytearray()
+        self._selector: selectors.BaseSelector | None = None
+        self._fd: int | None = None
+        try:
+            self._fd = self._source.fileno()  # type: ignore[union-attr]
+        except (AttributeError, OSError, ValueError):
+            self._fd = None
+        if self._fd is not None:
+            selector: selectors.BaseSelector | None = None
+            try:
+                selector = selectors.DefaultSelector()
+                selector.register(self._source, selectors.EVENT_READ)
+                self._selector = selector
+            except (OSError, ValueError):
+                if selector is not None:
+                    selector.close()
+                self._selector = None
+                self._fd = None
+
+    def __enter__(self) -> "_ServiceFrameReader":
+        return self
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        self.close()
+
+    def close(self) -> None:
+        if self._selector is not None:
+            self._selector.close()
+            self._selector = None
+        self._carry.clear()
+
+    def _read_chunk(self, deadline: float, max_bytes: int) -> bytes:
+        read_size = min(self._chunk_bytes, max_bytes)
+        if read_size <= 0:
+            raise BoundsError(
+                f"service request exceeds {MAX_SERVICE_REQUEST_BYTES} UTF-8 bytes"
+            )
+        if self._selector is not None and self._fd is not None:
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise BoundsError("service request frame timed out")
+                if not self._selector.select(timeout=remaining):
+                    raise BoundsError("service request frame timed out")
+                try:
+                    return os.read(self._fd, read_size)
+                except InterruptedError:
+                    continue
+                except BlockingIOError as exc:
+                    if exc.errno not in (errno.EAGAIN, errno.EWOULDBLOCK):
+                        raise ContractError("service input stream could not be read") from exc
+                    continue
+                except OSError as exc:
+                    raise ContractError("service input stream could not be read") from exc
+
+        try:
+            # Text-only test streams count characters in read(size), so cap
+            # the character chunk at the worst-case UTF-8 expansion too.
+            raw = self._source.read(max(1, read_size // 4))  # type: ignore[union-attr]
+        except Exception as exc:
+            raise ContractError("service input stream could not be read") from exc
         if isinstance(raw, str):
             try:
-                raw_bytes = raw.encode("utf-8")
+                return raw.encode("utf-8")
             except UnicodeEncodeError as exc:
                 raise ContractError("service request must be valid UTF-8") from exc
-        else:
-            raw_bytes = raw
-        if not isinstance(raw_bytes, bytes) or not raw_bytes:
-            raise ContractError("service input stream returned an invalid frame")
-        frame.extend(raw_bytes)
-        if raw_bytes.endswith(b"\n"):
-            break
-    raw_bytes = bytes(frame)
-    if not raw_bytes:
-        return ""
-    if not raw_bytes.endswith(b"\n") or raw_bytes.count(b"\n") != 1:
-        raise BoundsError("service request must be one terminated JSON line")
-    frame = raw_bytes[:-1]
-    if frame.endswith(b"\r"):
-        frame = frame[:-1]
-    if len(frame) > MAX_SERVICE_REQUEST_BYTES:
-        raise BoundsError(
-            f"service request exceeds {MAX_SERVICE_REQUEST_BYTES} UTF-8 bytes"
-        )
-    try:
-        return frame.decode("utf-8")
-    except UnicodeDecodeError as exc:
-        raise ContractError("service request must be valid UTF-8") from exc
+        if isinstance(raw, bytes):
+            return raw
+        if not raw:
+            return b""
+        raise ContractError("service input stream returned an invalid frame")
+
+    def read_frame(self) -> str:
+        """Read one complete frame, retaining bytes belonging to later frames."""
+
+        deadline = time.monotonic() + self._timeout_seconds
+        while True:
+            newline = self._carry.find(b"\n")
+            if newline >= 0:
+                frame = bytes(self._carry[:newline])
+                del self._carry[: newline + 1]
+                if frame.endswith(b"\r"):
+                    frame = frame[:-1]
+                if len(frame) > MAX_SERVICE_REQUEST_BYTES:
+                    raise BoundsError(
+                        f"service request exceeds {MAX_SERVICE_REQUEST_BYTES} UTF-8 bytes"
+                    )
+                try:
+                    return frame.decode("utf-8")
+                except UnicodeDecodeError as exc:
+                    raise ContractError("service request must be valid UTF-8") from exc
+
+            if len(self._carry) > MAX_SERVICE_REQUEST_BYTES:
+                raise BoundsError(
+                    f"service request exceeds {MAX_SERVICE_REQUEST_BYTES} UTF-8 bytes"
+                )
+            raw = self._read_chunk(
+                deadline,
+                MAX_SERVICE_REQUEST_BYTES + 1 - len(self._carry),
+            )
+            if not raw:
+                if not self._carry:
+                    return ""
+                raise BoundsError("service request frame is unterminated")
+            self._carry.extend(raw)
+
+
+def _read_bounded_request_line(
+    stream: TextIO | BinaryIO,
+    *,
+    timeout_seconds: float = SERVICE_FRAME_TIMEOUT_SECONDS,
+) -> str:
+    """Read one bounded UTF-8 JSON-lines frame from a service stream."""
+
+    reader = getattr(stream, "_plane_runtime_frame_reader", None)
+    if (
+        not isinstance(reader, _ServiceFrameReader)
+        or reader._owner is not stream
+        or reader._timeout_seconds != float(timeout_seconds)
+    ):
+        if isinstance(reader, _ServiceFrameReader):
+            reader.close()
+        reader = _ServiceFrameReader(stream, timeout_seconds=timeout_seconds)
+        try:
+            setattr(stream, "_plane_runtime_frame_reader", reader)
+        except (AttributeError, TypeError):
+            with reader:
+                return reader.read_frame()
+    return reader.read_frame()
 
 
 class _DemoTerminalPort(FixtureTerminalReconciliationPort):
@@ -499,6 +616,22 @@ def serve_once(
         )
         output.flush()
         return 1
+    except RuntimeConfigurationError:
+        output.write(
+            json.dumps(
+                {
+                    "type": "error",
+                    "error": {
+                        "code": "runtime_configuration",
+                        "message": "runtime dependencies are not configured",
+                    },
+                },
+                sort_keys=True,
+            )
+            + "\n"
+        )
+        output.flush()
+        return 1
     except TerminalReconciliationError as exc:
         return _handle_terminal_reconciliation_failure(
             exc=exc,
@@ -536,7 +669,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     del args
     try:
-        request_line = _read_bounded_request_line(sys.stdin)
+        with _ServiceFrameReader(sys.stdin) as reader:
+            request_line = reader.read_frame()
     except (BoundsError, ContractError):
         return 2
     if not request_line:

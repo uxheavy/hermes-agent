@@ -33,6 +33,7 @@ from .contract import (
     RuntimeEvent,
     RuntimeExit,
     RuntimeFailure,
+    RuntimeConfigurationError,
     RunSnapshot,
     SequenceError,
     TerminalProposal,
@@ -59,6 +60,7 @@ from .contract import (
     MAX_TERMINAL_EVIDENCE,
     canonical_json_bytes,
     parse_utc_timestamp,
+    product_proof_identity,
 )
 from .contract import InvocationEnvelope, PROTOCOL
 
@@ -800,6 +802,10 @@ def _reconcile_terminal(
             message="terminal reconciliation receipt is not bound to this proposal",
         )
     if not receipt.accepted or not receipt.legal_transition:
+        if receipt.proofs or receipt.product_receipts:
+            raise TerminalReconciliationError(
+                message="rejected terminal receipt cannot carry product proofs",
+            )
         return receipt
     if len(receipt.proofs) != 5:
         raise TerminalReconciliationError(
@@ -856,15 +862,34 @@ def _reconcile_terminal(
         )
     seen_receipts: set[str] = set()
     seen_resources: set[str] = set()
+    seen_idempotency_keys: set[str] = set()
     for product_receipt, (expected_kind, expected_resource) in zip(
         receipt.product_receipts, expected
     ):
-        if product_receipt.receipt_ref in seen_receipts or product_receipt.resource_ref in seen_resources:
+        if (
+            product_receipt.receipt_ref in seen_receipts
+            or product_receipt.resource_ref in seen_resources
+            or product_receipt.idempotency_key in seen_idempotency_keys
+        ):
             raise TerminalReconciliationError(
                 message="terminal reconciliation receipt contains duplicate product proof",
             )
         seen_receipts.add(product_receipt.receipt_ref)
         seen_resources.add(product_receipt.resource_ref)
+        seen_idempotency_keys.add(product_receipt.idempotency_key)
+        expected_receipt_ref, expected_idempotency_key = product_proof_identity(
+            proof_kind=expected_kind,
+            product_kind=expected_kind,
+            resource_ref=expected_resource,
+            run_id=proposal.run_id,
+            invocation_id=proposal.invocation_id,
+            actor_ref=proposal.actor_ref,
+            workspace_ref=proposal.workspace_ref,
+            snapshot_digest=proposal.snapshot_digest,
+            terminal_slot=proposal.idempotency_key,
+            terminal_kind=proposal.kind,
+            proposal_digest=proposal.digest(),
+        )
         if (
             product_receipt.run_id != proposal.run_id
             or product_receipt.invocation_id != proposal.invocation_id
@@ -876,6 +901,8 @@ def _reconcile_terminal(
             or product_receipt.snapshot_digest != proposal.snapshot_digest
             or product_receipt.terminal_slot != proposal.idempotency_key
             or product_receipt.proposal_digest != proposal.digest()
+            or product_receipt.receipt_ref != expected_receipt_ref
+            or product_receipt.idempotency_key != expected_idempotency_key
         ):
             raise TerminalReconciliationError(
                 message="terminal reconciliation receipt contains wrong product proof",
@@ -1119,10 +1146,24 @@ def execute(
     """
 
     _validate_inputs(run, invocation)
+    cancellation = cancellation if cancellation is not None else NeverCancelled()
+    try:
+        initially_cancelled = cancellation.is_cancelled()
+    except Exception as exc:
+        # A broken injected signal is a dependency failure.  Keep the original
+        # exception private while preserving the existing execution-failure
+        # classification at the service boundary.
+        raise ContractError("cancellation signal could not be evaluated") from exc
+    if not isinstance(initially_cancelled, bool):
+        raise ContractError("cancellation signal must return a boolean")
     if lease_authority is None or lease_binding is None:
         raise LeaseError("execution requires an injected canonical lease authority and host binding")
     if terminal_port is None:
         raise ContractError("execution requires an injected terminal reconciliation port")
+    if initially_cancelled and cancellation_authority is None:
+        raise RuntimeConfigurationError(
+            "signalled cancellation requires an injected cancellation authority"
+        )
     if invocation.checkpoint_ref is not None and (
         checkpoint_authority is None or checkpoint_attestation is None
     ):
@@ -1142,7 +1183,6 @@ def execute(
             invocation=invocation,
             attestation=checkpoint_attestation,
         )
-    cancellation = cancellation or NeverCancelled()
     if execution_phase is not None:
         execution_phase.execution_started = True
     stream = EventStream(
@@ -1151,7 +1191,7 @@ def execute(
         sink=emit,
         expected_causation_ref=invocation.causation_ref,
     )
-    if cancellation.is_cancelled():
+    if initially_cancelled:
         cancellation_receipt = _cancellation_receipt(
             authority=cancellation_authority,
             run=run,
@@ -1556,16 +1596,27 @@ class FixtureTerminalReconciliationPort:
         self,
         proposal: TerminalProposal,
         resource_ref: str,
-        suffix: str,
         kind: str,
     ) -> ProductReceipt:
-        key = f"{proposal.idempotency_key}:{suffix}"
-        return ProductReceipt(
+        receipt_ref, idempotency_key = product_proof_identity(
+            proof_kind=kind,
+            product_kind=kind,
             resource_ref=resource_ref,
-            receipt_ref=f"product-receipt:{key}",
             run_id=proposal.run_id,
             invocation_id=proposal.invocation_id,
-            idempotency_key=key,
+            actor_ref=proposal.actor_ref,
+            workspace_ref=proposal.workspace_ref,
+            snapshot_digest=proposal.snapshot_digest,
+            terminal_slot=proposal.idempotency_key,
+            terminal_kind=proposal.kind,
+            proposal_digest=proposal.digest(),
+        )
+        return ProductReceipt(
+            resource_ref=resource_ref,
+            receipt_ref=receipt_ref,
+            run_id=proposal.run_id,
+            invocation_id=proposal.invocation_id,
+            idempotency_key=idempotency_key,
             kind=kind,
             actor_ref=proposal.actor_ref,
             workspace_ref=proposal.workspace_ref,
@@ -1592,7 +1643,6 @@ class FixtureTerminalReconciliationPort:
                     self._product_receipt(
                         proposal,
                         proposal.outcome_proposal.submission_ref,
-                        "outcome",
                         "outcome_submission",
                     )
                 )
@@ -1602,7 +1652,6 @@ class FixtureTerminalReconciliationPort:
                     self._product_receipt(
                         proposal,
                         proposal.input_request_proposal.request_ref,
-                        "input",
                         "input_request",
                     )
                 )
@@ -1612,7 +1661,6 @@ class FixtureTerminalReconciliationPort:
                     self._product_receipt(
                         proposal,
                         f"product-event:{key}",
-                        "cancelled",
                         "terminal_event",
                     )
                 )
@@ -1621,20 +1669,19 @@ class FixtureTerminalReconciliationPort:
                     self._product_receipt(
                         proposal,
                         f"product-event:{key}",
-                        proposal.kind,
                         "terminal_event",
                     )
                 )
             artifact_items = proposal.artifact_proposals
             product_receipts.extend(
                 self._product_receipt(
-                    proposal, item.artifact_ref, f"artifact:{index}", "artifact"
+                    proposal, item.artifact_ref, "artifact"
                 )
-                for index, item in enumerate(artifact_items)
+                for item in artifact_items
             )
             product_receipts.extend(
-                self._product_receipt(proposal, item.message_ref, f"message:{index}", "message")
-                for index, item in enumerate(proposal.message_proposals)
+                self._product_receipt(proposal, item.message_ref, "message")
+                for item in proposal.message_proposals
             )
             product_event_kind = {
                 "completed": "OutcomeSubmission",

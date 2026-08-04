@@ -45,6 +45,7 @@ MAX_MESSAGE_PROPOSAL_BYTES = 64 * 1024
 MAX_TERMINAL_PROPOSAL_BYTES = 128 * 1024
 MAX_TERMINAL_RECEIPT_BYTES = 128 * 1024
 MAX_TERMINAL_PROOFS = 5
+PRODUCT_PROOF_IDENTITY_VERSION = "plane-product-proof/v1"
 
 
 class ContractError(ValueError):
@@ -65,6 +66,10 @@ class BoundsError(ContractError):
 
 class LeaseError(ContractError):
     """Raised when an invocation lease is not valid for execution."""
+
+
+class RuntimeConfigurationError(ContractError):
+    """Raised when a dependency required by the actual invocation is absent."""
 
 
 JSONScalar = Union[None, bool, int, float, str]
@@ -157,6 +162,50 @@ def canonical_json_bytes(value: Mapping[str, Any]) -> bytes:
 
 def _digest(value: Mapping[str, Any]) -> str:
     return hashlib.sha256(_canonical_json(value)).hexdigest()
+
+
+def product_proof_identity(
+    *,
+    proof_kind: str,
+    product_kind: str,
+    resource_ref: str,
+    run_id: str,
+    invocation_id: str,
+    actor_ref: str,
+    workspace_ref: str,
+    snapshot_digest: str,
+    terminal_slot: str,
+    terminal_kind: str,
+    proposal_digest: str,
+) -> tuple[str, str]:
+    """Derive the trusted-host identity pair for one product proof.
+
+    The identity is a deterministic binding of the whole terminal context,
+    not an authentication mechanism.  Plane ingress remains authoritative;
+    this pair prevents a receipt from being substituted for another product
+    operation while it crosses the runtime boundary.
+    """
+
+    fields = {
+        "version": PRODUCT_PROOF_IDENTITY_VERSION,
+        "proofKind": _require_text(proof_kind, "productProof.proofKind"),
+        "productKind": _require_text(product_kind, "productProof.productKind"),
+        "resourceRef": _require_text(resource_ref, "productProof.resourceRef"),
+        "runId": _require_text(run_id, "productProof.runId"),
+        "invocationId": _require_text(invocation_id, "productProof.invocationId"),
+        "actorRef": _require_text(actor_ref, "productProof.actorRef"),
+        "workspaceRef": _require_text(workspace_ref, "productProof.workspaceRef"),
+        "snapshotDigest": _require_text(snapshot_digest, "productProof.snapshotDigest"),
+        "terminalSlot": _require_text(terminal_slot, "productProof.terminalSlot"),
+        "terminalKind": _require_text(terminal_kind, "productProof.terminalKind"),
+        "proposalDigest": _require_text(proposal_digest, "productProof.proposalDigest"),
+    }
+    digest = hashlib.sha256(_canonical_json(fields)).hexdigest()
+    namespace = fields["proofKind"]
+    return (
+        f"product-receipt:{namespace}:{digest}",
+        f"product-idempotency:{namespace}:{digest}",
+    )
 
 
 def parse_utc_timestamp(value: Any, name: str = "timestamp") -> datetime:
@@ -1949,6 +1998,14 @@ class TerminalReconciliationReceipt:
             for item in product_receipts
         ):
             raise BindingError("terminal product receipt is not bound to the terminal slot")
+        if len({item.receipt_ref for item in product_receipts}) != len(product_receipts):
+            raise ContractError("terminal product receipts must contain unique receipt identities")
+        if len({item.idempotency_key for item in product_receipts}) != len(product_receipts):
+            raise ContractError(
+                "terminal product receipts must contain unique idempotency identities"
+            )
+        if len({item.resource_ref for item in product_receipts}) != len(product_receipts):
+            raise ContractError("terminal product receipts must contain unique product resources")
         object.__setattr__(self, "product_receipts", product_receipts)
         if self.accepted and self.legal_transition:
             if len(proofs) != MAX_TERMINAL_PROOFS or {
