@@ -1952,6 +1952,8 @@ class TerminalReconciliationReceipt:
         )
         if not isinstance(self.accepted, bool) or not isinstance(self.legal_transition, bool):
             raise ContractError("terminal receipt decisions must be booleans")
+        if self.accepted != self.legal_transition:
+            raise ContractError("terminal receipt decision flags must agree")
         proofs = tuple(self.proofs)
         if len(proofs) > MAX_TERMINAL_PROOFS:
             raise BoundsError(f"terminalReceipt.proofs exceeds {MAX_TERMINAL_PROOFS} items")
@@ -2007,6 +2009,11 @@ class TerminalReconciliationReceipt:
         if len({item.resource_ref for item in product_receipts}) != len(product_receipts):
             raise ContractError("terminal product receipts must contain unique product resources")
         object.__setattr__(self, "product_receipts", product_receipts)
+        if not self.accepted or not self.legal_transition:
+            if proofs or product_receipts:
+                raise ContractError(
+                    "rejected terminal receipt must be proofless and product-receipt-free"
+                )
         if self.accepted and self.legal_transition:
             if len(proofs) != MAX_TERMINAL_PROOFS or {
                 item.proof_kind for item in proofs

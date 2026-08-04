@@ -276,7 +276,7 @@ class ExecutionPhase:
 
 
 class TerminalReconciliationError(ContractError):
-    """Raised when Plane does not accept the proposed terminal transition."""
+    """Raised when terminal reconciliation cannot be trusted or reached."""
 
     def __init__(
         self,
@@ -285,6 +285,20 @@ class TerminalReconciliationError(ContractError):
     ) -> None:
         self.receipt = receipt
         super().__init__(message)
+
+
+class TerminalReconciliationRejected(Exception):
+    """Raised only for a fully validated, proofless legal terminal rejection."""
+
+    def __init__(self, receipt: TerminalReconciliationReceipt) -> None:
+        if not isinstance(receipt, TerminalReconciliationReceipt):
+            raise TypeError("terminal rejection requires a terminal reconciliation receipt")
+        if receipt.accepted or receipt.legal_transition:
+            raise ValueError("terminal rejection receipt must be rejected and illegal")
+        if receipt.proofs or receipt.product_receipts:
+            raise ValueError("terminal rejection receipt must be proofless")
+        self.receipt = receipt
+        super().__init__("Plane legally rejected the terminal reconciliation proposal")
 
 
 class NeverCancelled:
@@ -802,9 +816,14 @@ def _reconcile_terminal(
             message="terminal reconciliation receipt is not bound to this proposal",
         )
     if not receipt.accepted or not receipt.legal_transition:
-        if receipt.proofs or receipt.product_receipts:
+        if (
+            receipt.accepted
+            or receipt.legal_transition
+            or receipt.proofs
+            or receipt.product_receipts
+        ):
             raise TerminalReconciliationError(
-                message="rejected terminal receipt cannot carry product proofs",
+                message="terminal rejection receipt is not a proofless legal rejection",
             )
         return receipt
     if len(receipt.proofs) != 5:
@@ -1043,7 +1062,7 @@ def _return_terminal(
         proposal,
     )
     if not receipt.accepted or not receipt.legal_transition:
-        raise TerminalReconciliationError(receipt)
+        raise TerminalReconciliationRejected(receipt)
     return exit_value
 
 
@@ -1567,29 +1586,33 @@ class FixtureTerminalReconciliationPort:
             idempotency_key=key,
             accepted=accepted,
             legal_transition=legal_transition,
-            proofs=tuple(
-                TerminalProof(
-                    proof_kind=proof_kind,
-                    proof_ref=_terminal_proof_ref(proof_kind, key),
-                    resource_ref=_terminal_proof_resource(proof_kind, key),
-                    run_id=proposal.run_id,
-                    invocation_id=proposal.invocation_id,
-                    actor_ref=proposal.actor_ref,
-                    workspace_ref=proposal.workspace_ref,
-                    snapshot_digest=proposal.snapshot_digest,
-                    terminal_slot=key,
-                    terminal_kind=proposal.kind,
-                    proposal_digest=proposal.digest(),
+            proofs=(
+                tuple(
+                    TerminalProof(
+                        proof_kind=proof_kind,
+                        proof_ref=_terminal_proof_ref(proof_kind, key),
+                        resource_ref=_terminal_proof_resource(proof_kind, key),
+                        run_id=proposal.run_id,
+                        invocation_id=proposal.invocation_id,
+                        actor_ref=proposal.actor_ref,
+                        workspace_ref=proposal.workspace_ref,
+                        snapshot_digest=proposal.snapshot_digest,
+                        terminal_slot=key,
+                        terminal_kind=proposal.kind,
+                        proposal_digest=proposal.digest(),
+                    )
+                    for proof_kind in (
+                        "operation_attempt",
+                        "application",
+                        "gateway",
+                        "audit",
+                        "product_event",
+                    )
                 )
-                for proof_kind in (
-                    "operation_attempt",
-                    "application",
-                    "gateway",
-                    "audit",
-                    "product_event",
-                )
+                if accepted and legal_transition
+                else ()
             ),
-            product_receipts=product_receipts,
+            product_receipts=product_receipts if accepted and legal_transition else (),
         )
 
     def _product_receipt(

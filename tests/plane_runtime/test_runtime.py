@@ -79,6 +79,7 @@ from plane_runtime import (
     TerminalProposal,
     TerminalProof,
     TerminalReconciliationError,
+    TerminalReconciliationRejected,
     TerminalReconciliationReceipt,
     ToolPresentation,
     TranscriptObserved,
@@ -94,6 +95,7 @@ from plane_runtime.adapter import KernelObservation, KernelRequest, KernelResult
 from plane_runtime.service import (
     MAX_SERVICE_REQUEST_BYTES,
     SERVICE_FRAME_READ_CHUNK_BYTES,
+    SERVICE_FRAME_TERMINATOR_ALLOWANCE,
     _ServiceFrameReader,
     _read_bounded_request_line,
     main as service_main,
@@ -183,6 +185,20 @@ def typed_terminal_proofs(proposal: TerminalProposal) -> tuple[TerminalProof, ..
             proposal_digest=proposal.digest(),
         )
         for proof_kind, prefix in prefixes.items()
+    )
+
+
+def proofless_rejection(proposal: TerminalProposal) -> TerminalReconciliationReceipt:
+    """Build the only valid denial shape shared by terminal fakes."""
+
+    return TerminalReconciliationReceipt(
+        receipt_ref=f"rejected:{proposal.idempotency_key}",
+        run_id=proposal.run_id,
+        invocation_id=proposal.invocation_id,
+        kind=proposal.kind,
+        idempotency_key=proposal.idempotency_key,
+        accepted=False,
+        legal_transition=False,
     )
 
 
@@ -567,15 +583,7 @@ class RejectingTerminalPort:
     def reconcile_terminal(self, proposal: TerminalProposal) -> TerminalReconciliationReceipt:
         self.calls += 1
         self.proposals.append(proposal)
-        return TerminalReconciliationReceipt(
-            receipt_ref=f"rejected:{proposal.idempotency_key}",
-            run_id=proposal.run_id,
-            invocation_id=proposal.invocation_id,
-            kind=proposal.kind,
-            idempotency_key=proposal.idempotency_key,
-            accepted=False,
-            legal_transition=False,
-        )
+        return proofless_rejection(proposal)
 
 
 class FailingTerminalPort:
@@ -586,6 +594,18 @@ class FailingTerminalPort:
         del proposal
         self.calls += 1
         raise ValueError("terminal provider secret")
+
+
+class AttachedReceiptFailurePort:
+    """Raise a transport failure that happens to carry a misleading receipt."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self.product_events: list[str] = []
+
+    def reconcile_terminal(self, proposal: TerminalProposal) -> TerminalReconciliationReceipt:
+        self.calls += 1
+        raise TerminalReconciliationError(proofless_rejection(proposal))
 
 
 class SharedTerminalPort:
@@ -608,15 +628,7 @@ class SharedTerminalPort:
             if prior is not None:
                 prior_proposal, prior_receipt = prior
                 if prior_proposal != proposal:
-                    return TerminalReconciliationReceipt(
-                        receipt_ref=f"rejected:{key}",
-                        run_id=proposal.run_id,
-                        invocation_id=proposal.invocation_id,
-                        kind=proposal.kind,
-                        idempotency_key=key,
-                        accepted=False,
-                        legal_transition=False,
-                    )
+                    return proofless_rejection(proposal)
                 return prior_receipt
             receipt = self._new_receipt(proposal)
             if not receipt.accepted:
@@ -699,15 +711,7 @@ class SharedTerminalPort:
             prior = state.get(key)
             if prior is not None:
                 if prior["proposal"] != proposal.to_dict():
-                    return TerminalReconciliationReceipt(
-                        receipt_ref=f"rejected:{key}",
-                        run_id=proposal.run_id,
-                        invocation_id=proposal.invocation_id,
-                        kind=proposal.kind,
-                        idempotency_key=key,
-                        accepted=False,
-                        legal_transition=False,
-                    )
+                    return proofless_rejection(proposal)
                 return TerminalReconciliationReceipt.from_dict(prior["receipt"])
             receipt = self._new_receipt(proposal)
             if receipt.accepted:
@@ -1693,7 +1697,7 @@ class RuntimeContractTests(unittest.TestCase):
 
         events = []
         port = RejectingTerminalPort()
-        with self.assertRaises(ContractError):
+        with self.assertRaises(TerminalReconciliationRejected):
             run_execute(
                 snapshot=snapshot,
                 invocation=make_invocation(snapshot, invocation_id="invocation:published"),
@@ -1797,6 +1801,27 @@ class RuntimeContractTests(unittest.TestCase):
             reconcile_terminal_proposal(port=shared_identity_port, proposal=proposal)
         self.assertEqual(shared_identity_port.calls, 1)
 
+    def test_validated_rejection_is_structurally_distinct_from_bad_reconciliation(self) -> None:
+        snapshot = make_snapshot()
+        invocation = make_invocation(snapshot, invocation_id="invocation:rejection-type")
+        port = RejectingTerminalPort()
+        with self.assertRaises(TerminalReconciliationRejected) as raised:
+            run_execute(snapshot=snapshot, invocation=invocation, terminal_port=port)
+        self.assertNotIsInstance(raised.exception, TerminalReconciliationError)
+        self.assertEqual(port.calls, 1)
+        self.assertEqual(len(port.proposals), 1)
+        self.assertEqual(port.product_events, [])
+        receipt = raised.exception.receipt
+        self.assertFalse(receipt.accepted)
+        self.assertFalse(receipt.legal_transition)
+        self.assertEqual(receipt.proofs, ())
+        self.assertEqual(receipt.product_receipts, ())
+
+        malformed = ForgedReceiptPort(lambda receipt: object())
+        with self.assertRaises(TerminalReconciliationError) as malformed_error:
+            reconcile_terminal_proposal(port=malformed, proposal=port.proposals[0])
+        self.assertIs(type(malformed_error.exception), TerminalReconciliationError)
+
     def test_completed_requires_outcome_receipt_not_progress_usage_or_transcript_evidence(self) -> None:
         with self.assertRaises(ContractError):
             run_execute(
@@ -1805,7 +1830,7 @@ class RuntimeContractTests(unittest.TestCase):
                 kernel=FakeKernel(FakeKernelPlan(outcome_submission_requested=False)),
             )
 
-    def test_terminal_slot_reconciles_runtime_and_supervisor_competition_once(self) -> None:
+    def test_runtime_first_rejects_late_supervisor_mutation_with_one_slot(self) -> None:
         snapshot = make_snapshot()
         invocation = make_invocation(snapshot, invocation_id="invocation:terminal-slot")
         port = SharedTerminalPort()
@@ -1829,8 +1854,12 @@ class RuntimeContractTests(unittest.TestCase):
         )
         self.assertFalse(process_death.accepted)
         self.assertFalse(process_death.legal_transition)
+        self.assertEqual(process_death.proofs, ())
+        self.assertEqual(process_death.product_receipts, ())
         self.assertEqual(process_death, replay)
         self.assertEqual(len(port.accepted), 1)
+        self.assertEqual(len(port.product_events), 1)
+        self.assertEqual(len(port.product_receipts), 1)
         self.assertEqual(
             TerminalProposal(
                 snapshot.run_id,
@@ -1849,7 +1878,7 @@ class RuntimeContractTests(unittest.TestCase):
     def test_supervisor_first_rejects_late_runtime_product_mutation(self) -> None:
         snapshot = make_snapshot()
         invocation = make_invocation(snapshot, invocation_id="invocation:supervisor-first")
-        port = FixtureTerminalReconciliationPort()
+        port = SharedTerminalPort()
         supervisor_receipt = reconcile_process_death(
             port=port,
             run=snapshot,
@@ -1857,20 +1886,24 @@ class RuntimeContractTests(unittest.TestCase):
             final_sequence=0,
         )
         self.assertTrue(supervisor_receipt.accepted)
-        with self.assertRaises(ContractError):
+        with self.assertRaises(TerminalReconciliationRejected) as raised:
             run_execute(snapshot=snapshot, invocation=invocation, terminal_port=port)
+        self.assertFalse(raised.exception.receipt.accepted)
+        self.assertFalse(raised.exception.receipt.legal_transition)
+        self.assertEqual(raised.exception.receipt.proofs, ())
+        self.assertEqual(raised.exception.receipt.product_receipts, ())
         self.assertEqual(port.accepted, ["terminal:run:one:invocation:supervisor-first"])
-        self.assertEqual(port.product_events, [(port.accepted[0], "failed")])
-        self.assertEqual(len(port.receipts), 1)
+        self.assertEqual(port.product_events, [f"product-event:{port.accepted[0]}"])
+        self.assertEqual(len(port.product_receipts), 1)
         self.assertEqual(
-            port.receipts[0].product_receipts[0].resource_ref,
-            product_event_resource(port.receipts[0]),
+            port.product_receipts[0].resource_ref,
+            f"product-event:{port.accepted[0]}",
         )
 
     def test_synchronized_runtime_and_supervisor_race_has_one_product_event(self) -> None:
         snapshot = make_snapshot()
         invocation = make_invocation(snapshot, invocation_id="invocation:synchronized")
-        port = FixtureTerminalReconciliationPort()
+        port = SharedTerminalPort()
         start = threading.Barrier(2)
         results: list[tuple[str, bool]] = []
         errors: list[Exception] = []
@@ -1880,7 +1913,7 @@ class RuntimeContractTests(unittest.TestCase):
                 start.wait(timeout=5)
                 run_execute(snapshot=snapshot, invocation=invocation, terminal_port=port)
                 results.append(("runtime", True))
-            except ContractError:
+            except TerminalReconciliationRejected:
                 results.append(("runtime", False))
             except Exception as exc:  # pragma: no cover - makes a race failure visible
                 errors.append(exc)
@@ -1908,10 +1941,8 @@ class RuntimeContractTests(unittest.TestCase):
         self.assertEqual(sum(accepted for _, accepted in results), 1)
         self.assertEqual(len(port.accepted), 1)
         self.assertEqual(len(port.product_events), 1)
-        self.assertEqual(
-            port.receipts[0].product_receipts[0].resource_ref,
-            product_event_resource(port.receipts[0]),
-        )
+        self.assertEqual(len(port.product_receipts), 1)
+        self.assertEqual(port.product_receipts[0].resource_ref, port.product_events[0])
 
     def test_exact_runtime_replay_returns_the_same_atomic_receipt(self) -> None:
         snapshot = make_snapshot()
@@ -1950,6 +1981,13 @@ class RuntimeContractTests(unittest.TestCase):
             proof = next(item for item in receipt.proofs if item.proof_kind == "product_event")
             object.__setattr__(proof, "proposal_digest", "digest:forged")
             return receipt
+
+        snapshot = make_snapshot()
+        invocation = make_invocation(snapshot, invocation_id="invocation:rejected-proof")
+        accepted_port = FixtureTerminalReconciliationPort()
+        run_execute(snapshot=snapshot, invocation=invocation, terminal_port=accepted_port)
+        with self.assertRaises(ContractError):
+            replace(accepted_port.receipts[0], accepted=False, legal_transition=False)
 
         for index, forge in enumerate(
             (
@@ -2371,12 +2409,35 @@ class RuntimeContractTests(unittest.TestCase):
         self.assertEqual(
             _read_bounded_request_line(StringIO(exact_frame + "\n")), exact_frame
         )
+        self.assertEqual(
+            _read_bounded_request_line(StringIO(exact_frame + "\r\n")), exact_frame
+        )
         with self.assertRaises(BoundsError):
             _read_bounded_request_line(StringIO("a" * (MAX_SERVICE_REQUEST_BYTES + 1) + "\n"))
         with self.assertRaises(BoundsError):
             _read_bounded_request_line(
+                StringIO("a" * (MAX_SERVICE_REQUEST_BYTES + 1) + "\r\n")
+            )
+        with self.assertRaises(BoundsError):
+            _read_bounded_request_line(
                 StringIO("é" * ((MAX_SERVICE_REQUEST_BYTES // 2) + 1) + "\n")
             )
+        multibyte_exact = "é" * (MAX_SERVICE_REQUEST_BYTES // 2)
+        self.assertEqual(
+            len(multibyte_exact.encode("utf-8")), MAX_SERVICE_REQUEST_BYTES
+        )
+        self.assertEqual(
+            _read_bounded_request_line(StringIO(multibyte_exact + "\n")), multibyte_exact
+        )
+        self.assertEqual(
+            _read_bounded_request_line(StringIO(multibyte_exact + "\r\n")), multibyte_exact
+        )
+        multibyte_over = multibyte_exact + "a"
+        self.assertEqual(len(multibyte_over.encode("utf-8")), MAX_SERVICE_REQUEST_BYTES + 1)
+        for terminator in ("\n", "\r\n"):
+            with self.subTest(terminator=repr(terminator)):
+                with self.assertRaises(BoundsError):
+                    _read_bounded_request_line(StringIO(multibyte_over + terminator))
         with self.assertRaises(BoundsError):
             _read_bounded_request_line(StringIO(valid))
 
@@ -2399,7 +2460,7 @@ class RuntimeContractTests(unittest.TestCase):
         self.assertEqual(reader.read_frame(), "")
         reader.close()
 
-        cached_stream = StringIO("cached-one\ncached-two\n")
+        cached_stream = StringIO("cached-one\r\ncached-two\n")
         self.assertEqual(_read_bounded_request_line(cached_stream), "cached-one")
         self.assertEqual(_read_bounded_request_line(cached_stream), "cached-two")
 
@@ -2432,7 +2493,8 @@ class RuntimeContractTests(unittest.TestCase):
         with self.assertRaises(BoundsError):
             reader.read_frame()
         self.assertLessEqual(
-            len(reader._carry), MAX_SERVICE_REQUEST_BYTES + 4  # type: ignore[attr-defined]
+            len(reader._carry),
+            MAX_SERVICE_REQUEST_BYTES + SERVICE_FRAME_TERMINATOR_ALLOWANCE,  # type: ignore[attr-defined]
         )
         reader.close()
 
@@ -2704,6 +2766,28 @@ class RuntimeContractTests(unittest.TestCase):
         )
         self.assertNotIn("terminal provider secret", json.dumps(lines))
 
+        malformed_port = ForgedReceiptPort(lambda receipt: object())
+        status, lines, _ = serve_fixture(
+            snapshot,
+            make_invocation(snapshot, invocation_id="invocation:malformed-receipt"),
+            terminal_port=malformed_port,
+        )
+        self.assertEqual(status, 1)
+        self.assertEqual(malformed_port.calls, 1)
+        self.assertEqual(lines[-1]["request"]["code"], "terminal_reconciliation_unavailable")
+        self.assertEqual(malformed_port.product_events, [])
+
+        attached_receipt_port = AttachedReceiptFailurePort()
+        status, lines, _ = serve_fixture(
+            snapshot,
+            make_invocation(snapshot, invocation_id="invocation:attached-receipt-failure"),
+            terminal_port=attached_receipt_port,
+        )
+        self.assertEqual(status, 1)
+        self.assertEqual(attached_receipt_port.calls, 1)
+        self.assertEqual(lines[-1]["request"]["code"], "terminal_reconciliation_unavailable")
+        self.assertEqual(attached_receipt_port.product_events, [])
+
     def test_service_legal_terminal_rejection_is_bounded_and_single_attempt(self) -> None:
         snapshot = make_snapshot()
         invocation = make_invocation(snapshot, invocation_id="invocation:legal-rejection")
@@ -2718,9 +2802,8 @@ class RuntimeContractTests(unittest.TestCase):
         self.assertEqual(len(port.proposals), 1)
         self.assertEqual(port.product_events, [])
         self.assertEqual(lines[-1]["type"], "reconciliation_request")
-        self.assertEqual(
-            lines[-1]["request"]["code"], "terminal_reconciliation_unavailable"
-        )
+        self.assertEqual(lines[-1]["request"]["code"], "terminal_reconciliation_rejected")
+        self.assertIn("supervisor action", lines[-1]["request"]["message"])
         self.assertNotIn("audit_ref", json.dumps(lines))
 
     def test_service_kernel_valueerror_and_typeerror_use_generic_failure_phase(self) -> None:

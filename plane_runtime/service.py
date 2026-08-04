@@ -33,6 +33,7 @@ from .adapter import (
     CancellationAuthority,
     CancellationSignal,
     LeaseError,
+    TerminalReconciliationRejected,
     TerminalReconciliationError,
     TerminalReconciliationPort,
     execute,
@@ -80,6 +81,7 @@ MAX_SERVICE_REQUEST_BYTES = (
 )
 SERVICE_FRAME_TIMEOUT_SECONDS = 1.0
 SERVICE_FRAME_READ_CHUNK_BYTES = 16 * 1024
+SERVICE_FRAME_TERMINATOR_ALLOWANCE = 2
 
 
 class _ServiceFrameReader:
@@ -175,6 +177,7 @@ class _ServiceFrameReader:
     def read_frame(self) -> str:
         """Read one complete frame, retaining bytes belonging to later frames."""
 
+        frame_limit = MAX_SERVICE_REQUEST_BYTES + SERVICE_FRAME_TERMINATOR_ALLOWANCE
         deadline = time.monotonic() + self._timeout_seconds
         while True:
             newline = self._carry.find(b"\n")
@@ -192,13 +195,13 @@ class _ServiceFrameReader:
                 except UnicodeDecodeError as exc:
                     raise ContractError("service request must be valid UTF-8") from exc
 
-            if len(self._carry) > MAX_SERVICE_REQUEST_BYTES:
+            if len(self._carry) >= frame_limit:
                 raise BoundsError(
                     f"service request exceeds {MAX_SERVICE_REQUEST_BYTES} UTF-8 bytes"
                 )
             raw = self._read_chunk(
                 deadline,
-                MAX_SERVICE_REQUEST_BYTES + 1 - len(self._carry),
+                frame_limit - len(self._carry),
             )
             if not raw:
                 if not self._carry:
@@ -328,6 +331,43 @@ def _handle_terminal_reconciliation_failure(
                     "kind": "failed",
                     "code": "terminal_reconciliation_unavailable",
                     "message": "terminal reconciliation is unavailable; supervisor action is required",
+                    "runId": run.run_id,
+                    "invocationId": invocation.invocation_id,
+                    "finalSequence": collector.last_sequence,
+                },
+            },
+            sort_keys=True,
+        )
+        + "\n"
+    )
+    output.flush()
+    return 1
+
+
+def _handle_terminal_reconciliation_rejection(
+    *,
+    exc: TerminalReconciliationRejected,
+    run: RunSnapshot,
+    invocation: InvocationEnvelope,
+    collector: EventCollector,
+    output: TextIO,
+    internal_failure_hook: InternalFailureHook | None,
+) -> int:
+    """Tell the supervisor about a validated legal rejection, not an outage."""
+
+    if internal_failure_hook is not None:
+        try:
+            internal_failure_hook(exc)
+        except Exception:
+            pass
+    output.write(
+        json.dumps(
+            {
+                "type": "reconciliation_request",
+                "request": {
+                    "kind": "failed",
+                    "code": "terminal_reconciliation_rejected",
+                    "message": "terminal reconciliation was legally rejected; supervisor action is required",
                     "runId": run.run_id,
                     "invocationId": invocation.invocation_id,
                     "finalSequence": collector.last_sequence,
@@ -632,6 +672,15 @@ def serve_once(
         )
         output.flush()
         return 1
+    except TerminalReconciliationRejected as exc:
+        return _handle_terminal_reconciliation_rejection(
+            exc=exc,
+            run=run,
+            invocation=invocation,
+            collector=collector,
+            output=output,
+            internal_failure_hook=internal_failure_hook,
+        )
     except TerminalReconciliationError as exc:
         return _handle_terminal_reconciliation_failure(
             exc=exc,
