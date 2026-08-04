@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from collections import deque
 from threading import Event, RLock
 from typing import Callable, Iterable, Mapping, Protocol
 
@@ -18,15 +19,15 @@ from .contract import (
     BindingError,
     BoundsError,
     ContractError,
-    ConversationPublicationObserved,
     InputRequestObserved,
+    MessageProposal,
+    MessageProposalObserved,
     LeaseError,
     OutcomeSubmissionObserved,
     OutcomeProposal,
     InputRequestProposal,
     ProgressObserved,
     ProductReceipt,
-    PublicationReceipt,
     RuntimeBudget,
     RuntimeEvent,
     RuntimeExit,
@@ -40,7 +41,21 @@ from .contract import (
     UsageObserved,
     RuntimeLease,
     MAX_REFERENCE_LENGTH,
+    MAX_ARTIFACT_PROPOSALS,
+    MAX_ARTIFACT_PROPOSAL_BYTES,
+    MAX_INPUT_PROPOSALS,
+    MAX_INPUT_PROPOSAL_BYTES,
+    MAX_MESSAGE_PROPOSALS,
+    MAX_MESSAGE_PROPOSAL_BYTES,
+    MAX_OUTCOME_PROPOSALS,
+    MAX_OUTCOME_PROPOSAL_BYTES,
+    MAX_TRANSCRIPT_BYTES,
+    MAX_TRANSCRIPT_OBSERVATIONS,
+    MAX_EVENTS_PER_INVOCATION,
+    MAX_EVENT_STREAM_BYTES,
+    MAX_OPTIONAL_EVENT_TAIL,
     MAX_TERMINAL_EVIDENCE,
+    canonical_json_bytes,
     parse_utc_timestamp,
 )
 from .contract import InvocationEnvelope, PROTOCOL
@@ -57,17 +72,14 @@ class CancellationSignal(Protocol):
 
 
 class RuntimeHost(Protocol):
-    """Trusted host action for explicit non-terminal publication only."""
+    """Compatibility marker for non-authoritative host context.
 
-    def publish_transcript(
-        self,
-        *,
-        run_id: str,
-        invocation_id: str,
-        transcript: TranscriptObserved,
-        idempotency_key: str,
-    ) -> PublicationReceipt:
-        ...
+    RuntimeHost intentionally has no callable product operation.  Runtime
+    observations and message proposals cross the event sink only; publication
+    belongs to a later explicit Plane gateway operation.
+    """
+
+    pass
 
 class CancellationAuthority(Protocol):
     """Plane-owned cancellation correlation authority."""
@@ -311,17 +323,81 @@ class EventStream:
         self.invocation_id = invocation_id
         self._sink = sink
         self.expected_correlation_ref = expected_correlation_ref or expected_causation_ref
-        self._events: list[RuntimeEvent] = []
+        self._event_count = 0
+        self._stream_bytes = 0
         self._seen: dict[str, RuntimeEvent] = {}
         self._seen_idempotency: dict[str, RuntimeEvent] = {}
+        self._required_events: dict[str, RuntimeEvent] = {}
+        self._optional_events: deque[RuntimeEvent] = deque(maxlen=MAX_OPTIONAL_EVENT_TAIL)
+        self._category_counts: dict[str, int] = {}
+        self._category_bytes: dict[str, int] = {}
 
     @property
     def events(self) -> tuple[RuntimeEvent, ...]:
-        return tuple(self._events)
+        events = tuple(self._required_events.values()) + tuple(self._optional_events)
+        return tuple(sorted(events, key=lambda item: item.sequence))
 
     @property
     def last_sequence(self) -> int:
-        return self._events[-1].sequence if self._events else 0
+        return max((event.sequence for event in self.events), default=0)
+
+    @property
+    def event_count(self) -> int:
+        return self._event_count
+
+    @property
+    def retained_event_count(self) -> int:
+        return len(self._required_events) + len(self._optional_events)
+
+    @property
+    def stream_bytes(self) -> int:
+        return self._stream_bytes
+
+    @property
+    def retained_sequence_entries(self) -> int:
+        return len(self._seen)
+
+    @property
+    def retained_idempotency_entries(self) -> int:
+        return len(self._seen_idempotency)
+
+    @property
+    def category_counts(self) -> Mapping[str, int]:
+        """Return bounded observation counts by proposal category."""
+
+        return dict(self._category_counts)
+
+    @property
+    def category_bytes(self) -> Mapping[str, int]:
+        """Return bounded canonical event bytes by proposal category."""
+
+        return dict(self._category_bytes)
+
+    @staticmethod
+    def _category(event: RuntimeEvent) -> str:
+        body = event.body
+        if isinstance(body, TranscriptObserved):
+            return "transcript"
+        if isinstance(body, ArtifactObserved):
+            return "artifact"
+        if isinstance(body, InputRequestObserved):
+            return "input"
+        if isinstance(body, OutcomeSubmissionObserved):
+            return "outcome"
+        if isinstance(body, MessageProposalObserved):
+            return "message"
+        return "event"
+
+    @staticmethod
+    def _category_limits(category: str) -> tuple[int | None, int | None]:
+        return {
+            "transcript": (MAX_TRANSCRIPT_OBSERVATIONS, MAX_TRANSCRIPT_BYTES),
+            "artifact": (MAX_ARTIFACT_PROPOSALS, MAX_ARTIFACT_PROPOSAL_BYTES),
+            "input": (MAX_INPUT_PROPOSALS, MAX_INPUT_PROPOSAL_BYTES),
+            "outcome": (MAX_OUTCOME_PROPOSALS, MAX_OUTCOME_PROPOSAL_BYTES),
+            "message": (MAX_MESSAGE_PROPOSALS, MAX_MESSAGE_PROPOSAL_BYTES),
+            "event": (None, None),
+        }[category]
 
     def accept(self, event: RuntimeEvent) -> bool:
         if event.run_id != self.run_id or event.invocation_id != self.invocation_id:
@@ -352,11 +428,43 @@ class EventStream:
             raise SequenceError(
                 f"expected sequence {self.last_sequence + 1}, received {event.sequence}"
             )
+        if self._event_count >= MAX_EVENTS_PER_INVOCATION:
+            raise BoundsError(
+                f"invocation event count exceeds {MAX_EVENTS_PER_INVOCATION}"
+            )
+        event_bytes = len(canonical_json_bytes(event.to_dict()))
+        if self._stream_bytes + event_bytes > MAX_EVENT_STREAM_BYTES:
+            raise BoundsError(
+                f"invocation event stream exceeds {MAX_EVENT_STREAM_BYTES} canonical UTF-8 bytes"
+            )
+        category = self._category(event)
+        category_count, category_limit_bytes = self._category_limits(category)
+        current_count = self._category_counts.get(category, 0)
+        current_bytes = self._category_bytes.get(category, 0)
+        if category_count is not None and current_count >= category_count:
+            raise BoundsError(f"{category} proposal count exceeds {category_count}")
+        if category_limit_bytes is not None and current_bytes + event_bytes > category_limit_bytes:
+            raise BoundsError(f"{category} proposal bytes exceed {category_limit_bytes}")
         if self._sink is not None:
             self._sink(event)
         self._seen[event.event_id] = event
         self._seen_idempotency[event.idempotency_key] = event
-        self._events.append(event)
+        self._event_count += 1
+        self._stream_bytes += event_bytes
+        self._category_counts[category] = current_count + 1
+        self._category_bytes[category] = current_bytes + event_bytes
+        if isinstance(
+            event.body,
+            (
+                ArtifactObserved,
+                InputRequestObserved,
+                OutcomeSubmissionObserved,
+                MessageProposalObserved,
+            ),
+        ):
+            self._required_events[event.event_id] = event
+        else:
+            self._optional_events.append(event)
         return True
 
 
@@ -550,26 +658,6 @@ class FixtureCancellationAuthority:
             return receipt
 
 
-def _validate_publication_receipt(
-    receipt: PublicationReceipt,
-    *,
-    run_id: str,
-    invocation_id: str,
-    transcript_ref: str,
-    idempotency_key: str,
-) -> None:
-    if not isinstance(receipt, PublicationReceipt):
-        raise ContractError("publication operation returned an invalid receipt")
-    if receipt.transcript_ref != transcript_ref:
-        raise BindingError("publication receipt references a different transcript")
-    if (
-        receipt.run_id != run_id
-        or receipt.invocation_id != invocation_id
-        or receipt.idempotency_key != idempotency_key
-    ):
-        raise BindingError("publication receipt is not bound to this invocation")
-
-
 def _validate_product_receipt(
     receipt: ProductReceipt,
     *,
@@ -600,6 +688,7 @@ def _terminal_proposal(
     input_request_proposal: InputRequestProposal | None = None,
     cancellation_receipt: ProductReceipt | None = None,
     artifact_proposals: Iterable[ArtifactProposal] = (),
+    message_proposals: Iterable[MessageProposal] = (),
 ) -> TerminalProposal:
     all_receipt_refs = tuple(
         receipt_ref
@@ -631,10 +720,13 @@ def _terminal_proposal(
         return required_values + optional_values[-room:]
 
     artifacts = tuple(artifact_proposals)
-    artifacts = artifacts[-MAX_TERMINAL_EVIDENCE:]
+    messages = tuple(message_proposals)
     return TerminalProposal(
         run_id=run.run_id,
         invocation_id=invocation.invocation_id,
+        actor_ref=run.actor_ref,
+        workspace_ref=run.workspace_ref,
+        snapshot_digest=run.digest(),
         kind=exit_value.kind,
         final_sequence=exit_value.final_sequence,
         evidence_event_ids=preserve_required(
@@ -647,6 +739,7 @@ def _terminal_proposal(
         input_request_proposal=input_request_proposal,
         cancellation_receipt=cancellation_receipt,
         artifact_proposals=artifacts,
+        message_proposals=messages,
     )
 
 
@@ -666,6 +759,12 @@ def _reconcile_terminal(
         raise TerminalReconciliationError(
             message="terminal reconciliation returned an invalid receipt",
         )
+    try:
+        receipt.to_json()
+    except Exception as exc:
+        raise TerminalReconciliationError(
+            message="terminal reconciliation returned an oversized receipt",
+        ) from exc
     if (
         receipt.run_id != proposal.run_id
         or receipt.invocation_id != proposal.invocation_id
@@ -675,6 +774,63 @@ def _reconcile_terminal(
         raise TerminalReconciliationError(
             message="terminal reconciliation receipt is not bound to this proposal",
         )
+    if not receipt.accepted or not receipt.legal_transition:
+        return receipt
+    if (
+        receipt.actor_ref != proposal.actor_ref
+        or receipt.workspace_ref != proposal.workspace_ref
+        or receipt.snapshot_digest != proposal.snapshot_digest
+        or receipt.terminal_slot != proposal.idempotency_key
+        or receipt.proposal_digest != proposal.digest()
+        or not receipt.operation_ref
+        or not receipt.application_ref
+        or not receipt.gateway_receipt_ref
+        or not receipt.audit_ref
+        or not receipt.product_event_ref
+    ):
+        raise TerminalReconciliationError(
+            message="terminal reconciliation receipt is missing binding or application proof",
+        )
+    expected: list[tuple[str, str]] = []
+    if proposal.kind == "completed":
+        assert proposal.outcome_proposal is not None
+        expected.append(("outcome_submission", proposal.outcome_proposal.submission_ref))
+    elif proposal.kind == "waiting_for_input":
+        assert proposal.input_request_proposal is not None
+        expected.append(("input_request", proposal.input_request_proposal.request_ref))
+    else:
+        expected.append(("terminal_event", receipt.product_event_ref))
+    expected.extend(("artifact", item.artifact_ref) for item in proposal.artifact_proposals)
+    expected.extend(("message", item.message_ref) for item in proposal.message_proposals)
+    if len(receipt.product_receipts) != len(expected):
+        raise TerminalReconciliationError(
+            message="terminal reconciliation receipt has missing or extra product receipts",
+        )
+    seen_receipts: set[str] = set()
+    seen_resources: set[str] = set()
+    for product_receipt, (expected_kind, expected_resource) in zip(
+        receipt.product_receipts, expected
+    ):
+        if product_receipt.receipt_ref in seen_receipts or product_receipt.resource_ref in seen_resources:
+            raise TerminalReconciliationError(
+                message="terminal reconciliation receipt contains duplicate product proof",
+            )
+        seen_receipts.add(product_receipt.receipt_ref)
+        seen_resources.add(product_receipt.resource_ref)
+        if (
+            product_receipt.run_id != proposal.run_id
+            or product_receipt.invocation_id != proposal.invocation_id
+            or product_receipt.kind != expected_kind
+            or product_receipt.resource_ref != expected_resource
+            or product_receipt.actor_ref != proposal.actor_ref
+            or product_receipt.workspace_ref != proposal.workspace_ref
+            or product_receipt.snapshot_digest != proposal.snapshot_digest
+            or product_receipt.terminal_slot != proposal.idempotency_key
+            or product_receipt.proposal_digest != proposal.digest()
+        ):
+            raise TerminalReconciliationError(
+                message="terminal reconciliation receipt contains wrong product proof",
+            )
     return receipt
 
 
@@ -690,11 +846,21 @@ def reconcile_terminal_proposal(
 
 def _validate_terminal_evidence(
     *,
+    run: RunSnapshot,
+    invocation: InvocationEnvelope,
     kind: str,
     proposal: TerminalProposal,
     stream: EventStream,
     cancellation_receipt: ProductReceipt | None,
 ) -> None:
+    if (
+        proposal.run_id != run.run_id
+        or proposal.invocation_id != invocation.invocation_id
+        or proposal.actor_ref != run.actor_ref
+        or proposal.workspace_ref != run.workspace_ref
+        or proposal.snapshot_digest != run.digest()
+    ):
+        raise BindingError("terminal proposal is not bound to the runtime snapshot")
     if proposal.kind != kind:
         raise BindingError("terminal proposal kind does not match the exit")
     if proposal.final_sequence != stream.last_sequence:
@@ -752,6 +918,16 @@ def _validate_terminal_evidence(
             or artifact_event.body.digest != artifact.digest
         ):
             raise ContractError("artifact evidence was forged")
+    for message in proposal.message_proposals:
+        message_event = known_events.get(message.event_id)
+        if message_event is None or not isinstance(message_event.body, MessageProposalObserved):
+            raise ContractError("message proposal does not bind to a message event")
+        if (
+            message_event.body.message_ref != message.message_ref
+            or message_event.body.content != message.content
+            or message_event.body.proposal_receipt_ref != message.proposal_receipt_ref
+        ):
+            raise ContractError("message evidence was forged")
 
 
 def _return_terminal(
@@ -765,6 +941,7 @@ def _return_terminal(
     outcome_proposal: OutcomeProposal | None = None,
     input_request_proposal: InputRequestProposal | None = None,
     artifact_proposals: Iterable[ArtifactProposal] = (),
+    message_proposals: Iterable[MessageProposal] = (),
 ) -> RuntimeExit:
     proposal = _terminal_proposal(
         run=run,
@@ -775,8 +952,11 @@ def _return_terminal(
         input_request_proposal=input_request_proposal,
         cancellation_receipt=cancellation_receipt,
         artifact_proposals=artifact_proposals,
+        message_proposals=message_proposals,
     )
     _validate_terminal_evidence(
+        run=run,
+        invocation=invocation,
         kind=exit_value.kind,
         proposal=proposal,
         stream=stream,
@@ -789,6 +969,52 @@ def _return_terminal(
     if not receipt.accepted or not receipt.legal_transition:
         raise TerminalReconciliationError(receipt)
     return exit_value
+
+
+def _return_terminal_safely(
+    *,
+    port: TerminalReconciliationPort | None,
+    run: RunSnapshot,
+    invocation: InvocationEnvelope,
+    stream: EventStream,
+    exit_value: RuntimeExit,
+    cancellation_receipt: ProductReceipt | None = None,
+    outcome_proposal: OutcomeProposal | None = None,
+    input_request_proposal: InputRequestProposal | None = None,
+    artifact_proposals: Iterable[ArtifactProposal] = (),
+    message_proposals: Iterable[MessageProposal] = (),
+) -> RuntimeExit:
+    """Convert a terminal-wire overflow into one minimal bounded failure."""
+
+    try:
+        return _return_terminal(
+            port=port,
+            run=run,
+            invocation=invocation,
+            stream=stream,
+            exit_value=exit_value,
+            cancellation_receipt=cancellation_receipt,
+            outcome_proposal=outcome_proposal,
+            input_request_proposal=input_request_proposal,
+            artifact_proposals=artifact_proposals,
+            message_proposals=message_proposals,
+        )
+    except BoundsError:
+        return _return_terminal(
+            port=port,
+            run=run,
+            invocation=invocation,
+            stream=stream,
+            exit_value=RuntimeExit(
+                kind="failed",
+                final_sequence=stream.last_sequence,
+                failure=RuntimeFailure(
+                    code="ingestion_bounds",
+                    message="runtime observation limits exceeded; reconciliation is required",
+                    retryable=False,
+                ),
+            ),
+        )
 
 
 def _cancellation_receipt(
@@ -815,7 +1041,7 @@ def execute(
     *,
     run: RunSnapshot,
     invocation: InvocationEnvelope,
-    host: RuntimeHost | None,
+    host: RuntimeHost | None = None,
     emit: EventSink | None = None,
     cancellation: CancellationSignal | None = None,
     cancellation_authority: CancellationAuthority | None = None,
@@ -867,7 +1093,7 @@ def execute(
             run=run,
             invocation=invocation,
         )
-        return _return_terminal(
+        return _return_terminal_safely(
             port=terminal_port,
             run=run,
             invocation=invocation,
@@ -890,15 +1116,17 @@ def execute(
         trigger_kind=invocation.trigger.kind,
     )
     transcripts: dict[str, TranscriptObserved] = {}
+    transcript_bytes = 0
     pending_input_requests: set[str] = set()
     outcome_submissions: set[str] = set()
     artifact_proposals: list[ArtifactProposal] = []
+    message_proposals: list[MessageProposal] = []
     outcome_proposal: OutcomeProposal | None = None
     input_request_proposal: InputRequestProposal | None = None
     used = RuntimeBudget()
 
     def on_observation(observation: KernelObservation) -> None:
-        nonlocal used, outcome_proposal, input_request_proposal
+        nonlocal used, outcome_proposal, input_request_proposal, transcript_bytes
         if cancellation.is_cancelled():
             raise CancellationRequested
         if observation.kind == "progress":
@@ -918,6 +1146,13 @@ def execute(
             if observation.transcript_ref is None or observation.text is None:
                 raise ContractError("transcript observation requires a reference and text")
             transcript = TranscriptObserved(observation.transcript_ref, observation.text)
+            if transcript.transcript_ref not in transcripts:
+                if len(transcripts) >= MAX_TRANSCRIPT_OBSERVATIONS:
+                    raise BoundsError("transcript proposal count exceeded")
+                transcript_size = len(transcript.text.encode("utf-8"))
+                if transcript_bytes + transcript_size > MAX_TRANSCRIPT_BYTES:
+                    raise BoundsError("transcript proposal bytes exceeded")
+                transcript_bytes += transcript_size
             transcripts[transcript.transcript_ref] = transcript
             _next_event(stream, invocation, transcript)
             return
@@ -926,6 +1161,8 @@ def execute(
                 raise ContractError("input request requires a reference and prompt")
             if observation.request_ref in pending_input_requests:
                 raise SequenceError("input request reference was reused in one invocation")
+            if len(pending_input_requests) >= MAX_INPUT_PROPOSALS:
+                raise BoundsError("input proposal count exceeded")
             pending_input_requests.add(observation.request_ref)
             event = _next_event(
                 stream,
@@ -998,36 +1235,35 @@ def execute(
             )
             return
         if observation.kind == "publication_request":
-            if host is None:
-                raise ContractError("explicit publication requires a trusted runtime host")
             if observation.transcript_ref is None:
                 raise ContractError("publication request requires a transcript reference")
             try:
                 transcript = transcripts[observation.transcript_ref]
             except KeyError as exc:
                 raise ContractError("publication request must reference prior transcript evidence") from exc
-            event_id = f"{invocation.invocation_id}:publication:{observation.transcript_ref}"
-            receipt = host.publish_transcript(
-                run_id=run.run_id,
-                invocation_id=invocation.invocation_id,
-                transcript=transcript,
-                idempotency_key=event_id,
-            )
-            _validate_publication_receipt(
-                receipt,
-                run_id=run.run_id,
-                invocation_id=invocation.invocation_id,
-                transcript_ref=transcript.transcript_ref,
-                idempotency_key=event_id,
-            )
-            _next_event(
+            if len(message_proposals) >= MAX_MESSAGE_PROPOSALS:
+                raise BoundsError("message proposal count exceeded")
+            event = _next_event(
                 stream,
                 invocation,
-                ConversationPublicationObserved(
+                MessageProposalObserved(
+                    message_ref=transcript.transcript_ref,
                     transcript_ref=transcript.transcript_ref,
-                    publication_ref=receipt.publication_ref,
-                    receipt_ref=receipt.receipt_ref,
+                    content=transcript.text,
+                    proposal_receipt_ref=(
+                        f"proposal:{invocation.invocation_id}:message:{transcript.transcript_ref}"
+                    ),
                 ),
+            )
+            body = event.body
+            assert isinstance(body, MessageProposalObserved)
+            message_proposals.append(
+                MessageProposal(
+                    message_ref=body.message_ref,
+                    content=body.content,
+                    event_id=event.event_id,
+                    proposal_receipt_ref=body.proposal_receipt_ref,
+                )
             )
             return
         raise ContractError(f"unsupported kernel observation: {observation.kind!r}")
@@ -1040,7 +1276,7 @@ def execute(
             run=run,
             invocation=invocation,
         )
-        return _return_terminal(
+        return _return_terminal_safely(
             port=terminal_port,
             run=run,
             invocation=invocation,
@@ -1048,6 +1284,26 @@ def execute(
             exit_value=RuntimeExit(kind="cancelled", final_sequence=stream.last_sequence),
             cancellation_receipt=cancellation_receipt,
             artifact_proposals=artifact_proposals,
+            message_proposals=message_proposals,
+        )
+    except BoundsError:
+        # Ingestion limits are an invocation failure, not permission to keep
+        # consuming kernel output.  Reconcile one minimal bounded failure
+        # proposal through the same atomic terminal slot.
+        return _return_terminal_safely(
+            port=terminal_port,
+            run=run,
+            invocation=invocation,
+            stream=stream,
+            exit_value=RuntimeExit(
+                kind="failed",
+                final_sequence=stream.last_sequence,
+                failure=RuntimeFailure(
+                    code="ingestion_bounds",
+                    message="runtime observation limits exceeded; reconciliation is required",
+                    retryable=False,
+                ),
+            ),
         )
     if cancellation.is_cancelled():
         cancellation_receipt = _cancellation_receipt(
@@ -1055,7 +1311,7 @@ def execute(
             run=run,
             invocation=invocation,
         )
-        return _return_terminal(
+        return _return_terminal_safely(
             port=terminal_port,
             run=run,
             invocation=invocation,
@@ -1063,6 +1319,7 @@ def execute(
             exit_value=RuntimeExit(kind="cancelled", final_sequence=stream.last_sequence),
             cancellation_receipt=cancellation_receipt,
             artifact_proposals=artifact_proposals,
+            message_proposals=message_proposals,
         )
     if result.terminal_kind == "waiting_for_input" and not pending_input_requests:
         raise ContractError("waiting_for_input requires a visible authorized input request")
@@ -1076,7 +1333,7 @@ def execute(
             run=run,
             invocation=invocation,
         )
-        return _return_terminal(
+        return _return_terminal_safely(
             port=terminal_port,
             run=run,
             invocation=invocation,
@@ -1084,8 +1341,9 @@ def execute(
             exit_value=RuntimeExit(kind="cancelled", final_sequence=stream.last_sequence),
             cancellation_receipt=cancellation_receipt,
             artifact_proposals=artifact_proposals,
+            message_proposals=message_proposals,
         )
-    return _return_terminal(
+    return _return_terminal_safely(
         port=terminal_port,
         run=run,
         invocation=invocation,
@@ -1098,6 +1356,7 @@ def execute(
         outcome_proposal=outcome_proposal,
         input_request_proposal=input_request_proposal,
         artifact_proposals=artifact_proposals,
+        message_proposals=message_proposals,
     )
 
 
@@ -1170,39 +1429,6 @@ class FakeKernel:
         return KernelResult(terminal_kind=self.plan.terminal_kind)
 
 
-class RecordingHost:
-    """Deterministic host for explicit non-terminal transcript publication."""
-
-    def __init__(self) -> None:
-        self.publications: list[tuple[str, str, str]] = []
-        self._receipts: dict[str, PublicationReceipt] = {}
-
-    def publish_transcript(
-        self,
-        *,
-        run_id: str,
-        invocation_id: str,
-        transcript: TranscriptObserved,
-        idempotency_key: str,
-    ) -> PublicationReceipt:
-        prior = self._receipts.get(idempotency_key)
-        if prior is not None:
-            if not isinstance(prior, PublicationReceipt) or prior.transcript_ref != transcript.transcript_ref:
-                raise BindingError("publication idempotency key was reused for another operation")
-            return prior
-        self.publications.append((run_id, invocation_id, idempotency_key))
-        receipt = PublicationReceipt(
-            publication_ref=f"publication:{transcript.transcript_ref}",
-            receipt_ref=f"receipt:{idempotency_key}",
-            transcript_ref=transcript.transcript_ref,
-            run_id=run_id,
-            invocation_id=invocation_id,
-            idempotency_key=idempotency_key,
-        )
-        self._receipts[idempotency_key] = receipt
-        return receipt
-
-
 class FixtureTerminalReconciliationPort:
     """Explicit atomic fixture for tests and the demo service.
 
@@ -1239,11 +1465,24 @@ class FixtureTerminalReconciliationPort:
             accepted=accepted,
             legal_transition=legal_transition,
             operation_ref=f"operation:{key}",
+            application_ref=f"application:{key}",
+            gateway_receipt_ref=f"gateway:{key}",
             product_event_ref=f"product-event:{key}",
             product_receipts=product_receipts,
+            actor_ref=proposal.actor_ref,
+            workspace_ref=proposal.workspace_ref,
+            snapshot_digest=proposal.snapshot_digest,
+            terminal_slot=key,
+            proposal_digest=proposal.digest(),
         )
 
-    def _product_receipt(self, proposal: TerminalProposal, resource_ref: str, suffix: str) -> ProductReceipt:
+    def _product_receipt(
+        self,
+        proposal: TerminalProposal,
+        resource_ref: str,
+        suffix: str,
+        kind: str,
+    ) -> ProductReceipt:
         key = f"{proposal.idempotency_key}:{suffix}"
         return ProductReceipt(
             resource_ref=resource_ref,
@@ -1251,6 +1490,12 @@ class FixtureTerminalReconciliationPort:
             run_id=proposal.run_id,
             invocation_id=proposal.invocation_id,
             idempotency_key=key,
+            kind=kind,
+            actor_ref=proposal.actor_ref,
+            workspace_ref=proposal.workspace_ref,
+            snapshot_digest=proposal.snapshot_digest,
+            terminal_slot=proposal.idempotency_key,
+            proposal_digest=proposal.digest(),
         )
 
     def reconcile_terminal(self, proposal: TerminalProposal) -> TerminalReconciliationReceipt:
@@ -1271,6 +1516,7 @@ class FixtureTerminalReconciliationPort:
                         proposal,
                         proposal.outcome_proposal.submission_ref,
                         "outcome",
+                        "outcome_submission",
                     )
                 )
             elif proposal.kind == "waiting_for_input":
@@ -1280,6 +1526,7 @@ class FixtureTerminalReconciliationPort:
                         proposal,
                         proposal.input_request_proposal.request_ref,
                         "input",
+                        "input_request",
                     )
                 )
             elif proposal.kind == "cancelled":
@@ -1287,20 +1534,30 @@ class FixtureTerminalReconciliationPort:
                 product_receipts.append(
                     self._product_receipt(
                         proposal,
-                        proposal.cancellation_receipt.resource_ref,
+                        f"product-event:{key}",
                         "cancelled",
+                        "terminal_event",
                     )
                 )
             else:
                 product_receipts.append(
-                    self._product_receipt(proposal, f"terminal:{proposal.kind}", proposal.kind)
+                    self._product_receipt(
+                        proposal,
+                        f"product-event:{key}",
+                        proposal.kind,
+                        "terminal_event",
+                    )
                 )
-            artifact_items = proposal.artifact_proposals[-(
-                MAX_TERMINAL_EVIDENCE - len(product_receipts)
-            ):]
+            artifact_items = proposal.artifact_proposals
             product_receipts.extend(
-                self._product_receipt(proposal, item.artifact_ref, f"artifact:{index}")
+                self._product_receipt(
+                    proposal, item.artifact_ref, f"artifact:{index}", "artifact"
+                )
                 for index, item in enumerate(artifact_items)
+            )
+            product_receipts.extend(
+                self._product_receipt(proposal, item.message_ref, f"message:{index}", "message")
+                for index, item in enumerate(proposal.message_proposals)
             )
             product_event_kind = {
                 "completed": "OutcomeSubmission",
@@ -1314,6 +1571,7 @@ class FixtureTerminalReconciliationPort:
                 "runId": proposal.run_id,
                 "invocationId": proposal.invocation_id,
                 "artifactRefs": [item.artifact_ref for item in artifact_items],
+                "messageRefs": [item.message_ref for item in proposal.message_proposals],
             }
             if proposal.outcome_proposal is not None:
                 product_event_payload.update(
@@ -1363,17 +1621,33 @@ def classify_process_death(
 def reconcile_process_death(
     *,
     port: TerminalReconciliationPort,
-    run_id: str,
-    invocation_id: str,
+    run: RunSnapshot | None = None,
+    run_id: str | None = None,
+    invocation_id: str | None = None,
+    actor_ref: str | None = None,
+    workspace_ref: str | None = None,
+    snapshot_digest: str | None = None,
     final_sequence: int,
     reason: str = "runtime process exited before returning an exit",
 ) -> TerminalReconciliationReceipt:
     """Submit trusted supervisor process-death evidence through the Plane port."""
 
+    if run is not None:
+        run_id = run.run_id
+        actor_ref = run.actor_ref
+        workspace_ref = run.workspace_ref
+        snapshot_digest = run.digest()
+    if not all((run_id, invocation_id, actor_ref, workspace_ref, snapshot_digest)):
+        raise ContractError(
+            "process-death reconciliation requires run, invocation, actor, workspace, and snapshot binding"
+        )
     exit_value = classify_process_death(final_sequence=final_sequence, reason=reason)
     proposal = TerminalProposal(
         run_id=run_id,
         invocation_id=invocation_id,
+        actor_ref=actor_ref,
+        workspace_ref=workspace_ref,
+        snapshot_digest=snapshot_digest,
         kind=exit_value.kind,
         final_sequence=exit_value.final_sequence,
         failure=exit_value.failure,

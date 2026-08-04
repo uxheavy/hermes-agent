@@ -25,8 +25,19 @@ from plane_runtime import (
     MAX_INVOCATION_BYTES,
     MAX_NEW_CONTEXT_EVENT_REFS,
     MAX_RUN_SNAPSHOT_BYTES,
+    MAX_EVENTS_PER_INVOCATION,
+    MAX_EVENT_STREAM_BYTES,
+    MAX_TRANSCRIPT_BYTES,
+    MAX_TRANSCRIPT_OBSERVATIONS,
+    MAX_OPTIONAL_EVENT_TAIL,
+    MAX_ARTIFACT_PROPOSALS,
+    MAX_INPUT_PROPOSALS,
+    MAX_MESSAGE_PROPOSALS,
+    MAX_TERMINAL_PROPOSAL_BYTES,
+    MAX_TERMINAL_RECEIPT_BYTES,
     PROTOCOL,
     ArtifactObserved,
+    ArtifactProposal,
     AssignmentSnapshot,
     BindingError,
     BoundsError,
@@ -47,10 +58,11 @@ from plane_runtime import (
     MutableCancellation,
     OperationDescriptor,
     OutcomeProposal,
+    OutcomeSubmissionObserved,
     ProductReceipt,
     ProgressObserved,
-    PublicationReceipt,
-    RecordingHost,
+    MessageProposal,
+    MessageProposalObserved,
     RuntimeBudget,
     RuntimeBudgetPolicy,
     RuntimeEvent,
@@ -90,6 +102,7 @@ def make_snapshot(*, total: RuntimeBudget | None = None) -> RunSnapshot:
             acceptance_criteria=("The result is deterministic",),
         ),
         actor_ref="agent:one",
+        workspace_ref="workspace:one",
         profile_version="profile:v1",
         behavioral_prompt="Use the runtime port.",
         context=(VersionedContextRef("context:one", "sha256:context"),),
@@ -180,7 +193,6 @@ def run_execute(*, snapshot: RunSnapshot, invocation: InvocationEnvelope, **kwar
         )
         kwargs.setdefault("checkpoint_attestation", attestation)
         kwargs.setdefault("checkpoint_authority", FixtureCheckpointAuthority([attestation]))
-    kwargs.setdefault("host", RecordingHost())
     cancellation_receipt = ProductReceipt(
         resource_ref=invocation.cancellation_ref,
         receipt_ref=f"cancel-receipt:{invocation.invocation_id}",
@@ -239,7 +251,7 @@ def serve_fixture(
     status = serve_once(
         json.dumps({"run": snapshot.to_dict(), "invocation": invocation.to_dict()}),
         output,
-        host=host or RecordingHost(),
+        host=host,
         lease_authority=FixtureCanonicalLeaseAuthority([binding], clock=lambda: TRUSTED_NOW),
         lease_binding=binding,
         cancellation=cancellation,
@@ -333,27 +345,77 @@ class ManyEvidenceKernel:
         return KernelResult("completed")
 
 
-class HostValueError(RecordingHost):
-    def publish_transcript(self, **kwargs) -> PublicationReceipt:
-        del kwargs
-        raise ValueError("host provider secret")
+class TenThousandProgressKernel:
+    def __init__(self) -> None:
+        self.attempted = 0
+
+    def dispatch(self, request: KernelRequest, emit, cancellation) -> KernelResult:
+        del request, cancellation
+        for index in range(10_000):
+            self.attempted += 1
+            emit(KernelObservation(kind="progress", message=f"progress:{index}"))
+        return KernelResult("completed")
 
 
-class HostTypeError(RecordingHost):
-    def publish_transcript(self, **kwargs) -> PublicationReceipt:
-        del kwargs
-        raise TypeError("host provider secret")
+class MultibyteTranscriptKernel:
+    def __init__(self) -> None:
+        self.attempted = 0
+
+    def dispatch(self, request: KernelRequest, emit, cancellation) -> KernelResult:
+        del request, cancellation
+        for index in range(100):
+            self.attempted += 1
+            emit(
+                KernelObservation(
+                    kind="transcript",
+                    transcript_ref=f"transcript:{index}",
+                    text="é" * 6_000,
+                )
+            )
+        return KernelResult("completed")
 
 
-class BadPublicationReceiptHost(RecordingHost):
-    def publish_transcript(self, **kwargs) -> PublicationReceipt:
-        receipt = super().publish_transcript(**kwargs)
-        return replace(receipt, invocation_id="invocation:forged")
+class RaisingLeaseAuthority:
+    def validate_lease(self, *, run, invocation, binding) -> None:
+        del run, invocation, binding
+        raise ValueError("lease secret must stay internal")
+
+
+class RaisingCheckpointAuthority:
+    def claim_checkpoint(self, *, run, invocation, attestation) -> None:
+        del run, invocation, attestation
+        raise RuntimeError("checkpoint secret must stay internal")
+
+
+class RaisingCancellationAuthority:
+    def validate_cancellation(self, *, run, invocation) -> ProductReceipt:
+        del run, invocation
+        raise TypeError("cancellation secret must stay internal")
+
+
+class RaisingCancellationSignal:
+    def is_cancelled(self) -> bool:
+        raise ValueError("cancellation signal secret must stay internal")
+
+
+class ForgedReceiptPort:
+    """Return one forged accepted receipt without applying any product mutation."""
+
+    def __init__(self, forge) -> None:
+        self.forge = forge
+        self.calls = 0
+        self.product_events: list[str] = []
+
+    def reconcile_terminal(self, proposal: TerminalProposal) -> TerminalReconciliationReceipt:
+        self.calls += 1
+        receipt = FixtureTerminalReconciliationPort().reconcile_terminal(proposal)
+        return self.forge(receipt)
 
 
 class RejectingTerminalPort:
     def __init__(self) -> None:
         self.proposals: list[TerminalProposal] = []
+        self.product_events: list[str] = []
 
     def reconcile_terminal(self, proposal: TerminalProposal) -> TerminalReconciliationReceipt:
         self.proposals.append(proposal)
@@ -387,6 +449,8 @@ class SharedTerminalPort:
         self.lock = lock if lock is not None else threading.RLock()
         self.accepted = accepted if accepted is not None else []
         self.path = path
+        self.product_events: list[str] = []
+        self.product_receipts: list[ProductReceipt] = []
 
     def reconcile_terminal(self, proposal: TerminalProposal) -> TerminalReconciliationReceipt:
         key = proposal.idempotency_key
@@ -413,22 +477,58 @@ class SharedTerminalPort:
                 return receipt
             self.store[key] = (proposal, receipt)
             self.accepted.append(key)
+            self.product_events.append(receipt.product_event_ref or "")
+            self.product_receipts.extend(receipt.product_receipts)
             return receipt
 
     def _new_receipt(self, proposal: TerminalProposal) -> TerminalReconciliationReceipt:
-        accepted = not (
-            (proposal.kind == "completed" and not proposal.evidence_event_ids)
-            or (proposal.kind == "waiting_for_input" and not proposal.evidence_receipt_refs)
+        key = proposal.idempotency_key
+        product_event_ref = f"product-event:{key}"
+        if proposal.kind == "completed":
+            assert proposal.outcome_proposal is not None
+            required = [("outcome_submission", proposal.outcome_proposal.submission_ref)]
+        elif proposal.kind == "waiting_for_input":
+            assert proposal.input_request_proposal is not None
+            required = [("input_request", proposal.input_request_proposal.request_ref)]
+        else:
+            required = [("terminal_event", product_event_ref)]
+        required.extend(("artifact", item.artifact_ref) for item in proposal.artifact_proposals)
+        required.extend(("message", item.message_ref) for item in proposal.message_proposals)
+        product_receipts = tuple(
+            ProductReceipt(
+                resource_ref=resource_ref,
+                receipt_ref=f"product-receipt:{key}:{index}",
+                run_id=proposal.run_id,
+                invocation_id=proposal.invocation_id,
+                idempotency_key=f"{key}:product:{index}",
+                kind=kind,
+                actor_ref=proposal.actor_ref,
+                workspace_ref=proposal.workspace_ref,
+                snapshot_digest=proposal.snapshot_digest,
+                terminal_slot=key,
+                proposal_digest=proposal.digest(),
+            )
+            for index, (kind, resource_ref) in enumerate(required)
         )
         return TerminalReconciliationReceipt(
-            receipt_ref=f"{'receipt' if accepted else 'rejected'}:{proposal.idempotency_key}",
-            audit_ref=f"audit:{proposal.idempotency_key}",
+            receipt_ref=f"receipt:{key}",
+            audit_ref=f"audit:{key}",
             run_id=proposal.run_id,
             invocation_id=proposal.invocation_id,
             kind=proposal.kind,
-            idempotency_key=proposal.idempotency_key,
-            accepted=accepted,
-            legal_transition=accepted,
+            idempotency_key=key,
+            accepted=True,
+            legal_transition=True,
+            operation_ref=f"operation:{key}",
+            application_ref=f"application:{key}",
+            gateway_receipt_ref=f"gateway:{key}",
+            product_event_ref=product_event_ref,
+            product_receipts=product_receipts,
+            actor_ref=proposal.actor_ref,
+            workspace_ref=proposal.workspace_ref,
+            snapshot_digest=proposal.snapshot_digest,
+            terminal_slot=key,
+            proposal_digest=proposal.digest(),
         )
 
     def _reconcile_file(self, proposal: TerminalProposal) -> TerminalReconciliationReceipt:
@@ -441,7 +541,7 @@ class SharedTerminalPort:
             key = proposal.idempotency_key
             prior = state.get(key)
             if prior is not None:
-                if prior["proposal"] != repr(proposal):
+                if prior["proposal"] != proposal.to_dict():
                     return TerminalReconciliationReceipt(
                         receipt_ref=f"rejected:{key}",
                         audit_ref=f"audit:{key}:conflict",
@@ -452,16 +552,18 @@ class SharedTerminalPort:
                         accepted=False,
                         legal_transition=False,
                     )
-                return TerminalReconciliationReceipt(**prior["receipt"])
+                return TerminalReconciliationReceipt.from_dict(prior["receipt"])
             receipt = self._new_receipt(proposal)
             if receipt.accepted:
-                state[key] = {"proposal": repr(proposal), "receipt": receipt.__dict__}
+                state[key] = {"proposal": proposal.to_dict(), "receipt": receipt.to_dict()}
                 handle.seek(0)
                 handle.truncate()
                 json.dump(state, handle, sort_keys=True)
                 handle.flush()
                 os.fsync(handle.fileno())
                 self.accepted.append(key)
+                self.product_events.append(receipt.product_event_ref or "")
+                self.product_receipts.extend(receipt.product_receipts)
             return receipt
 
 
@@ -519,6 +621,9 @@ class RuntimeContractTests(unittest.TestCase):
         terminal = TerminalProposal(
             snapshot.run_id,
             invocation.invocation_id,
+            snapshot.actor_ref,
+            snapshot.workspace_ref,
+            snapshot.digest(),
             "completed",
             2,
             evidence_event_ids=(outcome.event_id,),
@@ -535,7 +640,14 @@ class RuntimeContractTests(unittest.TestCase):
             True,
             True,
             operation_ref="operation:one",
+            application_ref="application:one",
+            gateway_receipt_ref="gateway:one",
             product_event_ref="product-event:one",
+            actor_ref=snapshot.actor_ref,
+            workspace_ref=snapshot.workspace_ref,
+            snapshot_digest=snapshot.digest(),
+            terminal_slot=terminal.idempotency_key,
+            proposal_digest=terminal.digest(),
             product_receipts=(
                 ProductReceipt(
                     "submission:one",
@@ -543,6 +655,12 @@ class RuntimeContractTests(unittest.TestCase):
                     snapshot.run_id,
                     invocation.invocation_id,
                     "product:one",
+                    kind="outcome_submission",
+                    actor_ref=snapshot.actor_ref,
+                    workspace_ref=snapshot.workspace_ref,
+                    snapshot_digest=snapshot.digest(),
+                    terminal_slot=terminal.idempotency_key,
+                    proposal_digest=terminal.digest(),
                 ),
             ),
         )
@@ -696,6 +814,97 @@ class RuntimeContractTests(unittest.TestCase):
         with self.assertRaises(SequenceError):
             collector.accept(event(sequence=2, event_id="event:one", idempotency_key="idem:changed"))
 
+    def test_event_stream_accepts_maximum_count_then_stops_without_map_growth(self) -> None:
+        collector = EventCollector(
+            run_id="run:one",
+            invocation_id="invocation:one",
+            expected_correlation_ref="cause:one",
+        )
+        for sequence in range(1, MAX_EVENTS_PER_INVOCATION + 1):
+            self.assertTrue(
+                collector.accept(
+                    event(
+                        sequence=sequence,
+                        event_id=f"event:{sequence}",
+                        idempotency_key=f"idem:{sequence}",
+                    )
+                )
+            )
+        with self.assertRaises(BoundsError):
+            collector.accept(
+                event(
+                    sequence=MAX_EVENTS_PER_INVOCATION + 1,
+                    event_id="event:overflow",
+                    idempotency_key="idem:overflow",
+                )
+            )
+        self.assertEqual(collector.event_count, MAX_EVENTS_PER_INVOCATION)
+        self.assertEqual(collector.retained_sequence_entries, MAX_EVENTS_PER_INVOCATION)
+        self.assertEqual(collector.retained_idempotency_entries, MAX_EVENTS_PER_INVOCATION)
+        self.assertLessEqual(collector.retained_event_count, MAX_OPTIONAL_EVENT_TAIL)
+        self.assertLessEqual(collector.stream_bytes, MAX_EVENT_STREAM_BYTES)
+
+    def test_hostile_ingestion_reconciles_once_and_retains_only_bounded_state(self) -> None:
+        snapshot = make_snapshot()
+        invocation = make_invocation(snapshot, invocation_id="invocation:10k-events")
+        collector = EventCollector(
+            run_id=snapshot.run_id,
+            invocation_id=invocation.invocation_id,
+            expected_correlation_ref=invocation.causation_ref,
+        )
+        kernel = TenThousandProgressKernel()
+        port = FixtureTerminalReconciliationPort()
+        exit_value = run_execute(
+            snapshot=snapshot,
+            invocation=invocation,
+            kernel=kernel,
+            emit=collector.emit,
+            terminal_port=port,
+        )
+        self.assertEqual(exit_value.kind, "failed")
+        self.assertEqual(exit_value.failure.code, "ingestion_bounds")  # type: ignore[union-attr]
+        self.assertLess(kernel.attempted, 10_000)
+        self.assertEqual(collector.event_count, MAX_EVENTS_PER_INVOCATION)
+        self.assertLessEqual(collector.retained_event_count, MAX_OPTIONAL_EVENT_TAIL)
+        self.assertLessEqual(collector.retained_sequence_entries, MAX_EVENTS_PER_INVOCATION)
+        self.assertLessEqual(collector.retained_idempotency_entries, MAX_EVENTS_PER_INVOCATION)
+        self.assertLessEqual(collector.stream_bytes, MAX_EVENT_STREAM_BYTES)
+        self.assertEqual(port.product_events, [(port.accepted[0], "failed")])
+        self.assertEqual(len(port.receipts), 1)
+        self.assertEqual(
+            port.receipts[0].product_receipts[0].resource_ref,
+            port.receipts[0].product_event_ref,
+        )
+
+    def test_multibyte_transcript_limit_fails_before_unbounded_retention(self) -> None:
+        snapshot = make_snapshot()
+        invocation = make_invocation(snapshot, invocation_id="invocation:multibyte")
+        collector = EventCollector(
+            run_id=snapshot.run_id,
+            invocation_id=invocation.invocation_id,
+            expected_correlation_ref=invocation.causation_ref,
+        )
+        kernel = MultibyteTranscriptKernel()
+        port = FixtureTerminalReconciliationPort()
+        exit_value = run_execute(
+            snapshot=snapshot,
+            invocation=invocation,
+            kernel=kernel,
+            emit=collector.emit,
+            terminal_port=port,
+        )
+        self.assertEqual(exit_value.kind, "failed")
+        self.assertEqual(exit_value.failure.code, "ingestion_bounds")  # type: ignore[union-attr]
+        self.assertLess(kernel.attempted, 100)
+        self.assertLessEqual(
+            collector.category_counts.get("transcript", 0), MAX_TRANSCRIPT_OBSERVATIONS
+        )
+        self.assertLessEqual(
+            collector.category_bytes.get("transcript", 0), MAX_TRANSCRIPT_BYTES
+        )
+        self.assertLessEqual(collector.stream_bytes, MAX_EVENT_STREAM_BYTES)
+        self.assertEqual(port.product_events, [(port.accepted[0], "failed")])
+
     def test_adapter_rejects_binding_mismatch(self) -> None:
         snapshot = make_snapshot()
         wrong_run = replace(make_invocation(snapshot), run_id="run:other")
@@ -749,7 +958,6 @@ class RuntimeContractTests(unittest.TestCase):
             execute(
                 run=snapshot,
                 invocation=make_invocation(snapshot),
-                host=RecordingHost(),
                 terminal_port=SharedTerminalPort(),
             )
 
@@ -762,7 +970,6 @@ class RuntimeContractTests(unittest.TestCase):
             execute(
                 run=snapshot,
                 invocation=replace(invocation, lease=RuntimeLease("lease:forged", "host:one", invocation.lease.expires_at)),
-                host=RecordingHost(),
                 lease_authority=authority,
                 lease_binding=binding,
                 terminal_port=SharedTerminalPort(),
@@ -786,7 +993,6 @@ class RuntimeContractTests(unittest.TestCase):
             execute(
                 run=snapshot,
                 invocation=continuation,
-                host=RecordingHost(),
                 lease_authority=FixtureCanonicalLeaseAuthority([binding], clock=lambda: TRUSTED_NOW),
                 lease_binding=binding,
                 terminal_port=SharedTerminalPort(),
@@ -921,13 +1127,11 @@ class RuntimeContractTests(unittest.TestCase):
 
     def test_input_requests_are_authorized_receipt_correlated_and_terminally_consistent(self) -> None:
         snapshot = make_snapshot()
-        host = RecordingHost()
         port = FixtureTerminalReconciliationPort()
         events: list[RuntimeEvent] = []
         exit_value = run_execute(
             snapshot=snapshot,
             invocation=make_invocation(snapshot),
-            host=host,
             emit=events.append,
             terminal_port=port,
             kernel=FakeKernel(FakeKernelPlan(terminal_kind="waiting_for_input", input_request="Need one answer")),
@@ -955,13 +1159,11 @@ class RuntimeContractTests(unittest.TestCase):
 
     def test_artifacts_are_authorized_receipt_correlated_and_not_a_second_mutation_path(self) -> None:
         snapshot = make_snapshot()
-        host = RecordingHost()
         port = FixtureTerminalReconciliationPort()
         events: list[RuntimeEvent] = []
         exit_value = run_execute(
             snapshot=snapshot,
             invocation=make_invocation(snapshot),
-            host=host,
             emit=events.append,
             terminal_port=port,
             kernel=ArtifactKernel(),
@@ -979,41 +1181,52 @@ class RuntimeContractTests(unittest.TestCase):
         self.assertEqual(port.product_event_payloads[0]["kind"], "OutcomeSubmission")
         self.assertEqual(port.product_event_payloads[0]["content"], "artifact outcome")
 
-    def test_transcript_is_evidence_and_explicit_publication_requires_correlated_receipt(self) -> None:
-        host = RecordingHost()
+    def test_transcript_and_message_proposals_are_non_product_evidence(self) -> None:
         snapshot = make_snapshot()
         events: list[RuntimeEvent] = []
+        port = FixtureTerminalReconciliationPort()
         exit_value = run_execute(
             snapshot=snapshot,
             invocation=make_invocation(snapshot),
-            host=host,
             emit=events.append,
             kernel=FakeKernel(FakeKernelPlan(publication_requested=False)),
+            terminal_port=port,
         )
         self.assertEqual(exit_value.kind, "completed")
         self.assertTrue(any(isinstance(item.body, TranscriptObserved) for item in events))
         self.assertFalse(any(item.body.to_dict()["kind"] == "conversation_publication" for item in events))
-        self.assertEqual(host.publications, [])
 
         events = []
-        exit_value = run_execute(
-            snapshot=snapshot,
-            invocation=make_invocation(snapshot, invocation_id="invocation:published"),
-            host=host,
-            emit=events.append,
-            kernel=FakeKernel(FakeKernelPlan(publication_requested=True)),
-        )
-        self.assertEqual(exit_value.kind, "completed")
-        publication = [item for item in events if item.body.to_dict()["kind"] == "conversation_publication"]
-        self.assertEqual(len(publication), 1)
-        self.assertTrue(publication[0].body.to_dict()["receiptRef"].startswith("receipt:"))
-        with self.assertRaises(BindingError):
+        port = RejectingTerminalPort()
+        with self.assertRaises(ContractError):
             run_execute(
                 snapshot=snapshot,
-                invocation=make_invocation(snapshot, invocation_id="invocation:bad-publication"),
-                host=BadPublicationReceiptHost(),
+                invocation=make_invocation(snapshot, invocation_id="invocation:published"),
+                emit=events.append,
                 kernel=FakeKernel(FakeKernelPlan(publication_requested=True)),
+                terminal_port=port,
             )
+        publication = [item for item in events if item.body.to_dict()["kind"] == "message_proposal"]
+        self.assertEqual(len(publication), 1)
+        self.assertTrue(publication[0].body.to_dict()["proposalReceiptRef"].startswith("proposal:"))
+        self.assertEqual(len(port.proposals), 1)
+        self.assertEqual(port.product_events, [])
+
+        port = FixtureTerminalReconciliationPort()
+        exit_value = run_execute(
+            snapshot=snapshot,
+            invocation=make_invocation(snapshot, invocation_id="invocation:terminal-message"),
+            kernel=FakeKernel(FakeKernelPlan(publication_requested=True)),
+            terminal_port=port,
+        )
+        self.assertEqual(exit_value.kind, "completed")
+        proposal = port.proposals[0]
+        self.assertEqual(len(proposal.message_proposals), 1)
+        self.assertEqual(
+            [item.resource_ref for item in port.receipts[0].product_receipts],
+            ["submission:fake", "transcript:fake"],
+        )
+        self.assertEqual(port.product_event_payloads[0]["messageRefs"], ["transcript:fake"])
 
     def test_completed_requires_outcome_receipt_not_progress_usage_or_transcript_evidence(self) -> None:
         with self.assertRaises(ContractError):
@@ -1035,13 +1248,13 @@ class RuntimeContractTests(unittest.TestCase):
         self.assertEqual(exit_value.kind, "completed")
         process_death = reconcile_process_death(
             port=port,
-            run_id=snapshot.run_id,
+            run=snapshot,
             invocation_id=invocation.invocation_id,
             final_sequence=exit_value.final_sequence,
         )
         replay = reconcile_process_death(
             port=port,
-            run_id=snapshot.run_id,
+            run=snapshot,
             invocation_id=invocation.invocation_id,
             final_sequence=exit_value.final_sequence,
         )
@@ -1053,6 +1266,9 @@ class RuntimeContractTests(unittest.TestCase):
             TerminalProposal(
                 snapshot.run_id,
                 invocation.invocation_id,
+                snapshot.actor_ref,
+                snapshot.workspace_ref,
+                snapshot.digest(),
                 "failed",
                 exit_value.final_sequence,
                 failure=RuntimeFailure("process_died", "runtime process exited before returning an exit", True),
@@ -1067,7 +1283,7 @@ class RuntimeContractTests(unittest.TestCase):
         port = FixtureTerminalReconciliationPort()
         supervisor_receipt = reconcile_process_death(
             port=port,
-            run_id=snapshot.run_id,
+            run=snapshot,
             invocation_id=invocation.invocation_id,
             final_sequence=0,
         )
@@ -1077,6 +1293,10 @@ class RuntimeContractTests(unittest.TestCase):
         self.assertEqual(port.accepted, ["terminal:run:one:invocation:supervisor-first"])
         self.assertEqual(port.product_events, [(port.accepted[0], "failed")])
         self.assertEqual(len(port.receipts), 1)
+        self.assertEqual(
+            port.receipts[0].product_receipts[0].resource_ref,
+            port.receipts[0].product_event_ref,
+        )
 
     def test_synchronized_runtime_and_supervisor_race_has_one_product_event(self) -> None:
         snapshot = make_snapshot()
@@ -1101,7 +1321,7 @@ class RuntimeContractTests(unittest.TestCase):
                 start.wait(timeout=5)
                 receipt = reconcile_process_death(
                     port=port,
-                    run_id=snapshot.run_id,
+                    run=snapshot,
                     invocation_id=invocation.invocation_id,
                     final_sequence=0,
                 )
@@ -1119,6 +1339,10 @@ class RuntimeContractTests(unittest.TestCase):
         self.assertEqual(sum(accepted for _, accepted in results), 1)
         self.assertEqual(len(port.accepted), 1)
         self.assertEqual(len(port.product_events), 1)
+        self.assertEqual(
+            port.receipts[0].product_receipts[0].resource_ref,
+            port.receipts[0].product_event_ref,
+        )
 
     def test_exact_runtime_replay_returns_the_same_atomic_receipt(self) -> None:
         snapshot = make_snapshot()
@@ -1131,51 +1355,113 @@ class RuntimeContractTests(unittest.TestCase):
         self.assertEqual(len(port.product_events), 1)
         self.assertEqual(port.reconcile_terminal(port.proposals[0]), port.receipts[0])
 
+    def test_accepted_receipt_proof_is_complete_and_exact(self) -> None:
+        def missing_application(receipt: TerminalReconciliationReceipt):
+            object.__setattr__(receipt, "application_ref", None)
+            return receipt
+
+        def wrong_product_kind(receipt: TerminalReconciliationReceipt):
+            product = receipt.product_receipts[0]
+            object.__setattr__(product, "kind", "forged_kind")
+            return receipt
+
+        def extra_product_receipt(receipt: TerminalReconciliationReceipt):
+            object.__setattr__(receipt, "product_receipts", receipt.product_receipts * 2)
+            return receipt
+
+        def wrong_binding(receipt: TerminalReconciliationReceipt):
+            object.__setattr__(receipt, "actor_ref", "agent:forged")
+            return receipt
+
+        def forged_proposal_digest(receipt: TerminalReconciliationReceipt):
+            object.__setattr__(receipt, "proposal_digest", "digest:forged")
+            return receipt
+
+        for index, forge in enumerate(
+            (
+                missing_application,
+                wrong_product_kind,
+                extra_product_receipt,
+                wrong_binding,
+                forged_proposal_digest,
+            )
+        ):
+            with self.subTest(forge=forge.__name__):
+                snapshot = make_snapshot()
+                invocation = make_invocation(snapshot, invocation_id=f"invocation:forged:{index}")
+                port = ForgedReceiptPort(forge)
+                status, lines, _ = serve_fixture(
+                    snapshot,
+                    invocation,
+                    terminal_port=port,
+                )
+                self.assertEqual(status, 1)
+                self.assertEqual(port.calls, 1)
+                self.assertEqual(port.product_events, [])
+                self.assertEqual(lines[-1]["type"], "reconciliation_request")
+
     def test_finalized_terminal_proposal_preserves_required_evidence_under_overflow(self) -> None:
         snapshot = make_snapshot()
         invocation = make_invocation(snapshot, invocation_id="invocation:overflow")
         port = FixtureTerminalReconciliationPort()
+        collector = EventCollector(
+            run_id=snapshot.run_id,
+            invocation_id=invocation.invocation_id,
+            expected_correlation_ref=invocation.causation_ref,
+        )
         self.assertEqual(
             run_execute(
                 snapshot=snapshot,
                 invocation=invocation,
                 terminal_port=port,
                 kernel=ManyEvidenceKernel(),
+                emit=collector.emit,
             ).kind,
-            "completed",
+            "failed",
+        )
+        self.assertTrue(
+            any(isinstance(item.body, OutcomeSubmissionObserved) for item in collector.events)
+        )
+        self.assertLessEqual(
+            collector.retained_event_count,
+            MAX_OPTIONAL_EVENT_TAIL + 1 + MAX_ARTIFACT_PROPOSALS,
         )
         proposal = port.proposals[0]
         self.assertLessEqual(len(proposal.evidence_event_ids), 128)
         self.assertLessEqual(len(proposal.evidence_receipt_refs), 128)
         self.assertLessEqual(len(proposal.artifact_proposals), 128)
-        self.assertIsNotNone(proposal.outcome_proposal)
-        assert proposal.outcome_proposal is not None
-        self.assertIn(proposal.outcome_proposal.event_id, proposal.evidence_event_ids)
-        self.assertIn(proposal.outcome_proposal.proposal_receipt_ref, proposal.evidence_receipt_refs)
-        self.assertEqual(proposal.outcome_proposal.content, "mandatory outcome content")
+        self.assertEqual(proposal.failure.code, "ingestion_bounds")  # type: ignore[union-attr]
         self.assertEqual(len(port.product_event_payloads), 1)
-        self.assertEqual(port.product_event_payloads[0]["kind"], "OutcomeSubmission")
-        self.assertEqual(port.product_event_payloads[0]["content"], "mandatory outcome content")
+        self.assertEqual(port.product_event_payloads[0]["kind"], "TerminalFailure")
         self.assertLessEqual(len(port.receipts[0].product_receipts), 128)
-        self.assertEqual(port.receipts[0].product_receipts[0].resource_ref, "submission:mandatory")
+        self.assertEqual(
+            port.receipts[0].product_receipts[0].resource_ref,
+            port.receipts[0].product_event_ref,
+        )
 
     def test_terminal_proposal_rejects_wrong_kind_and_forged_required_evidence(self) -> None:
         outcome = OutcomeProposal("submission:one", "outcome", "event:outcome", "receipt:outcome")
         with self.assertRaises(ContractError):
             TerminalProposal(
-                "run:one",
-                "invocation:one",
-                "failed",
-                1,
+                run_id="run:one",
+                invocation_id="invocation:one",
+                actor_ref="agent:one",
+                workspace_ref="workspace:one",
+                snapshot_digest="snapshot:one",
+                kind="failed",
+                final_sequence=1,
                 failure=RuntimeFailure("failed", "failure", True),
                 outcome_proposal=outcome,
             )
         with self.assertRaises(ContractError):
             TerminalProposal(
-                "run:one",
-                "invocation:one",
-                "completed",
-                1,
+                run_id="run:one",
+                invocation_id="invocation:one",
+                actor_ref="agent:one",
+                workspace_ref="workspace:one",
+                snapshot_digest="snapshot:one",
+                kind="completed",
+                final_sequence=1,
                 evidence_event_ids=("event:other",),
                 evidence_receipt_refs=("receipt:other",),
                 outcome_proposal=outcome,
@@ -1185,10 +1471,13 @@ class RuntimeContractTests(unittest.TestCase):
         )
         with self.assertRaises(BindingError):
             TerminalProposal(
-                "run:one",
-                "invocation:one",
-                "cancelled",
-                1,
+                run_id="run:one",
+                invocation_id="invocation:one",
+                actor_ref="agent:one",
+                workspace_ref="workspace:one",
+                snapshot_digest="snapshot:one",
+                kind="cancelled",
+                final_sequence=1,
                 evidence_receipt_refs=("receipt:cancel",),
                 cancellation_receipt=forged_cancellation,
             )
@@ -1225,6 +1514,62 @@ class RuntimeContractTests(unittest.TestCase):
         replace(make_invocation(make_snapshot()), new_context_event_refs=refs)
         with self.assertRaises(BoundsError):
             replace(make_invocation(make_snapshot()), new_context_event_refs=refs + ("event:overflow",))
+
+        snapshot = make_snapshot()
+        invocation = make_invocation(snapshot, invocation_id="invocation:wire-boundary")
+        outcome = OutcomeProposal(
+            "submission:wire",
+            "bounded outcome",
+            "event:outcome",
+            "receipt:outcome",
+        )
+        terminal = TerminalProposal(
+            snapshot.run_id,
+            invocation.invocation_id,
+            snapshot.actor_ref,
+            snapshot.workspace_ref,
+            snapshot.digest(),
+            "completed",
+            1,
+            evidence_event_ids=(outcome.event_id,),
+            evidence_receipt_refs=(outcome.proposal_receipt_ref,),
+            outcome_proposal=outcome,
+        )
+        receipt = FixtureTerminalReconciliationPort().reconcile_terminal(terminal)
+        self.assertLessEqual(
+            len(terminal.to_json().encode("utf-8")), MAX_TERMINAL_PROPOSAL_BYTES
+        )
+        self.assertLessEqual(
+            len(receipt.to_json().encode("utf-8")), MAX_TERMINAL_RECEIPT_BYTES
+        )
+        with self.assertRaises(BoundsError):
+            TerminalProposal.from_json("{" + ("é" * MAX_TERMINAL_PROPOSAL_BYTES))
+        with self.assertRaises(BoundsError):
+            TerminalReconciliationReceipt.from_json("{" + ("é" * MAX_TERMINAL_RECEIPT_BYTES))
+        oversized_artifacts = tuple(
+            ArtifactProposal(
+                artifact_ref=f"artifact:{index}:{'x' * 240}",
+                digest="d" * 256,
+                event_id=f"event:{index}:{'x' * 240}",
+            )
+            for index in range(128)
+        )
+        with self.assertRaises(BoundsError):
+            TerminalProposal(
+                snapshot.run_id,
+                invocation.invocation_id,
+                snapshot.actor_ref,
+                snapshot.workspace_ref,
+                snapshot.digest(),
+                "failed",
+                1,
+                evidence_event_ids=tuple(f"event-evidence:{index}:{'x' * 240}" for index in range(128)),
+                evidence_receipt_refs=tuple(
+                    f"receipt-evidence:{index}:{'x' * 240}" for index in range(128)
+                ),
+                failure=RuntimeFailure("oversized", "bounded failure", False),
+                artifact_proposals=oversized_artifacts,
+            )
 
     def test_snapshot_and_invocation_accept_exact_byte_boundary_and_reject_one_byte_over(self) -> None:
         base = make_snapshot()
@@ -1392,14 +1737,14 @@ class RuntimeContractTests(unittest.TestCase):
             port = SharedTerminalPort(path=store_path)
             first_receipt = reconcile_process_death(
                 port=port,
-                run_id=snapshot.run_id,
+                run=snapshot,
                 invocation_id=invocation.invocation_id,
                 final_sequence=stream.last_sequence,
             )
             restarted_port = SharedTerminalPort(path=store_path)
             second_receipt = reconcile_process_death(
                 port=restarted_port,
-                run_id=snapshot.run_id,
+                run=snapshot,
                 invocation_id=invocation.invocation_id,
                 final_sequence=stream.last_sequence,
             )
@@ -1430,7 +1775,6 @@ class RuntimeContractTests(unittest.TestCase):
             execute(
                 run=snapshot,
                 invocation=invocation,
-                host=RecordingHost(),
                 lease_authority=authority,
                 lease_binding=binding,
             )
@@ -1452,6 +1796,14 @@ class RuntimeContractTests(unittest.TestCase):
         self.assertEqual(len(results), 4)
         self.assertTrue(all(item == results[0] for item in results))
         self.assertEqual(len(accepted), 1)
+        self.assertEqual(
+            port.product_events,
+            [f"product-event:terminal:{invocation.run_id}:{invocation.invocation_id}"],
+        )
+        self.assertEqual(
+            [item.resource_ref for item in port.product_receipts],
+            ["submission:fake"],
+        )
 
     def test_process_boundary_sanitizes_unexpected_exception_and_keeps_detail_internal(self) -> None:
         snapshot = make_snapshot()
@@ -1469,7 +1821,6 @@ class RuntimeContractTests(unittest.TestCase):
         status = serve_once(
             json.dumps({"run": snapshot.to_dict(), "invocation": invocation.to_dict()}),
             output,
-            host=RecordingHost(),
             lease_authority=FixtureCanonicalLeaseAuthority([binding], clock=lambda: TRUSTED_NOW),
             lease_binding=binding,
             terminal_port=SharedTerminalPort(),
@@ -1498,13 +1849,13 @@ class RuntimeContractTests(unittest.TestCase):
             invocation.lease.expires_at,
         )
         output = StringIO()
+        port = RejectingTerminalPort()
         status = serve_once(
             json.dumps({"run": snapshot.to_dict(), "invocation": invocation.to_dict()}),
             output,
-            host=RecordingHost(),
             lease_authority=FixtureCanonicalLeaseAuthority([binding], clock=lambda: TRUSTED_NOW),
             lease_binding=binding,
-            terminal_port=RejectingTerminalPort(),
+            terminal_port=port,
             kernel=ExplodingKernel(),
         )
         self.assertEqual(status, 1)
@@ -1514,6 +1865,8 @@ class RuntimeContractTests(unittest.TestCase):
             line["request"]["message"],
             "runtime execution failed; Plane reconciliation is required",
         )
+        self.assertEqual(len(port.proposals), 1)
+        self.assertEqual(port.product_events, [])
 
     def test_service_terminal_port_failure_is_nonzero_without_a_second_mutation_attempt(self) -> None:
         snapshot = make_snapshot()
@@ -1547,19 +1900,163 @@ class RuntimeContractTests(unittest.TestCase):
                 wire = json.dumps(lines)
                 self.assertNotIn("provider secret", wire)
 
-    def test_service_host_callback_valueerror_and_typeerror_are_not_invalid_request(self) -> None:
+    def test_service_dependency_failures_are_execution_failures_not_invalid_requests(self) -> None:
         snapshot = make_snapshot()
-        for host in (HostValueError(), HostTypeError()):
-            with self.subTest(host=type(host).__name__):
-                status, lines, _ = serve_fixture(
-                    snapshot,
-                    make_invocation(snapshot, invocation_id=f"invocation:{type(host).__name__}"),
-                    host=host,
-                    kernel=FakeKernel(FakeKernelPlan(publication_requested=True)),
-                )
-                self.assertEqual(status, 0)
-                self.assertEqual(lines[-1]["type"], "reconciliation")
-                self.assertNotIn("host provider secret", json.dumps(lines))
+
+        binding = CanonicalLeaseBinding(
+            snapshot.run_id,
+            "invocation:raising-lease",
+            "lease:one",
+            "host:one",
+            True,
+            "2099-01-01T00:00:00Z",
+        )
+        invocation = make_invocation(snapshot, invocation_id=binding.invocation_id)
+        output = StringIO()
+        captured: list[Exception] = []
+        status = serve_once(
+            json.dumps({"run": snapshot.to_dict(), "invocation": invocation.to_dict()}),
+            output,
+            lease_authority=RaisingLeaseAuthority(),
+            lease_binding=binding,
+            terminal_port=FixtureTerminalReconciliationPort(),
+            internal_failure_hook=captured.append,
+        )
+        self.assertEqual(status, 0)
+        self.assertEqual(json.loads(output.getvalue())["type"], "reconciliation")
+        self.assertEqual(len(captured), 1)
+        self.assertIn("lease secret", str(captured[0]))
+        self.assertNotIn("lease secret", output.getvalue())
+
+        continuation = make_invocation(
+            snapshot,
+            invocation_id="invocation:raising-checkpoint",
+            trigger=InvocationTrigger("continuation", "event:answer"),
+            checkpoint_ref="checkpoint:one",
+        )
+        continuation_binding = CanonicalLeaseBinding(
+            snapshot.run_id,
+            continuation.invocation_id,
+            "lease:one",
+            "host:one",
+            True,
+            continuation.lease.expires_at,
+        )
+        attestation = CheckpointAttestation(
+            checkpoint_ref="checkpoint:one",
+            source_run_id=snapshot.run_id,
+            source_invocation_id="invocation:source",
+            snapshot_digest=snapshot.digest(),
+            actor_ref=snapshot.actor_ref,
+            profile_version=snapshot.profile_version,
+            continuation_event_ref="event:answer",
+            continuation_trigger_kind="continuation",
+            allowed_target_invocation_id=continuation.invocation_id,
+        )
+        output = StringIO()
+        captured = []
+        status = serve_once(
+            json.dumps({"run": snapshot.to_dict(), "invocation": continuation.to_dict()}),
+            output,
+            lease_authority=FixtureCanonicalLeaseAuthority([continuation_binding], clock=lambda: TRUSTED_NOW),
+            lease_binding=continuation_binding,
+            checkpoint_authority=RaisingCheckpointAuthority(),
+            checkpoint_attestation=attestation,
+            terminal_port=FixtureTerminalReconciliationPort(),
+            internal_failure_hook=captured.append,
+        )
+        self.assertEqual(status, 0)
+        self.assertEqual(json.loads(output.getvalue())["type"], "reconciliation")
+        self.assertEqual(len(captured), 1)
+        self.assertIn("checkpoint secret", str(captured[0]))
+        self.assertNotIn("checkpoint secret", output.getvalue())
+
+        output = StringIO()
+        status = serve_once(
+            json.dumps({"run": snapshot.to_dict(), "invocation": continuation.to_dict()}),
+            output,
+            lease_authority=FixtureCanonicalLeaseAuthority([continuation_binding], clock=lambda: TRUSTED_NOW),
+            lease_binding=continuation_binding,
+            terminal_port=FixtureTerminalReconciliationPort(),
+        )
+        self.assertEqual(status, 1)
+        self.assertEqual(json.loads(output.getvalue())["error"]["code"], "runtime_configuration")
+
+        output = StringIO()
+        captured = []
+        cancellation = MutableCancellation()
+        cancellation.cancel()
+        status = serve_once(
+            json.dumps(
+                {
+                    "run": snapshot.to_dict(),
+                    "invocation": make_invocation(
+                        snapshot, invocation_id="invocation:raising-cancellation-authority"
+                    ).to_dict(),
+                }
+            ),
+            output,
+            lease_authority=FixtureCanonicalLeaseAuthority([CanonicalLeaseBinding(
+                snapshot.run_id,
+                "invocation:raising-cancellation-authority",
+                "lease:one",
+                "host:one",
+                True,
+                "2099-01-01T00:00:00Z",
+            )], clock=lambda: TRUSTED_NOW),
+            lease_binding=CanonicalLeaseBinding(
+                snapshot.run_id,
+                "invocation:raising-cancellation-authority",
+                "lease:one",
+                "host:one",
+                True,
+                "2099-01-01T00:00:00Z",
+            ),
+            cancellation=cancellation,
+            cancellation_authority=RaisingCancellationAuthority(),
+            terminal_port=FixtureTerminalReconciliationPort(),
+            internal_failure_hook=captured.append,
+        )
+        self.assertEqual(status, 0)
+        self.assertEqual(json.loads(output.getvalue())["type"], "reconciliation")
+        self.assertEqual(len(captured), 1)
+        self.assertIn("cancellation secret", str(captured[0]))
+        self.assertNotIn("cancellation secret", output.getvalue())
+
+        signal_invocation = make_invocation(snapshot, invocation_id="invocation:raising-signal")
+        signal_binding = CanonicalLeaseBinding(
+            snapshot.run_id,
+            signal_invocation.invocation_id,
+            "lease:one",
+            "host:one",
+            True,
+            signal_invocation.lease.expires_at,
+        )
+        output = StringIO()
+        captured = []
+        status = serve_once(
+            json.dumps({"run": snapshot.to_dict(), "invocation": signal_invocation.to_dict()}),
+            output,
+            lease_authority=FixtureCanonicalLeaseAuthority([signal_binding], clock=lambda: TRUSTED_NOW),
+            lease_binding=signal_binding,
+            cancellation=RaisingCancellationSignal(),
+            terminal_port=FixtureTerminalReconciliationPort(),
+            internal_failure_hook=captured.append,
+        )
+        self.assertEqual(status, 0)
+        self.assertEqual(json.loads(output.getvalue())["type"], "reconciliation")
+        self.assertEqual(len(captured), 1)
+        self.assertIn("cancellation signal", str(captured[0]))
+        self.assertNotIn("cancellation signal", output.getvalue())
+
+        output = StringIO()
+        status = serve_once(
+            json.dumps({"run": snapshot.to_dict(), "invocation": make_invocation(snapshot).to_dict()}),
+            output,
+        )
+        self.assertEqual(status, 1)
+        self.assertEqual(json.loads(output.getvalue())["error"]["code"], "runtime_configuration")
+        self.assertNotEqual(json.loads(output.getvalue())["error"]["code"], "invalid_request")
 
     def test_service_pre_dispatch_cancellation_uses_signal_and_independent_authority(self) -> None:
         snapshot = make_snapshot()
@@ -1687,7 +2184,6 @@ class RuntimeContractTests(unittest.TestCase):
         status = serve_once(
             json.dumps({"run": snapshot.to_dict(), "invocation": continuation.to_dict()}),
             output,
-            host=RecordingHost(),
             lease_authority=FixtureCanonicalLeaseAuthority([binding], clock=lambda: TRUSTED_NOW),
             lease_binding=binding,
             checkpoint_authority=FixtureCheckpointAuthority([forged_attestation]),

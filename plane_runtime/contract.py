@@ -28,6 +28,22 @@ MAX_NEW_CONTEXT_EVENT_REFS = 128
 MAX_RUN_SNAPSHOT_BYTES = 128 * 1024
 MAX_INVOCATION_BYTES = 16 * 1024
 MAX_TERMINAL_EVIDENCE = 128
+MAX_TERMINAL_PRODUCT_RECEIPTS = 256
+MAX_EVENTS_PER_INVOCATION = 512
+MAX_EVENT_STREAM_BYTES = 256 * 1024
+MAX_OPTIONAL_EVENT_TAIL = 256
+MAX_TRANSCRIPT_OBSERVATIONS = 64
+MAX_TRANSCRIPT_BYTES = 64 * 1024
+MAX_ARTIFACT_PROPOSALS = 128
+MAX_ARTIFACT_PROPOSAL_BYTES = 64 * 1024
+MAX_INPUT_PROPOSALS = 16
+MAX_INPUT_PROPOSAL_BYTES = 64 * 1024
+MAX_OUTCOME_PROPOSALS = 1
+MAX_OUTCOME_PROPOSAL_BYTES = 64 * 1024
+MAX_MESSAGE_PROPOSALS = 64
+MAX_MESSAGE_PROPOSAL_BYTES = 64 * 1024
+MAX_TERMINAL_PROPOSAL_BYTES = 128 * 1024
+MAX_TERMINAL_RECEIPT_BYTES = 128 * 1024
 
 
 class ContractError(ValueError):
@@ -132,6 +148,12 @@ def _canonical_json(value: Mapping[str, Any]) -> bytes:
     ).encode("utf-8")
 
 
+def canonical_json_bytes(value: Mapping[str, Any]) -> bytes:
+    """Return the canonical UTF-8 representation used by every wire bound."""
+
+    return _canonical_json(value)
+
+
 def _digest(value: Mapping[str, Any]) -> str:
     return hashlib.sha256(_canonical_json(value)).hexdigest()
 
@@ -161,9 +183,18 @@ def _canonical_utc_timestamp(value: Any, name: str) -> str:
 
 
 def _check_wire_size(value: Mapping[str, Any], name: str, maximum: int) -> None:
-    size = len(_canonical_json(value))
+    size = len(canonical_json_bytes(value))
     if size > maximum:
         raise BoundsError(f"{name} exceeds {maximum} canonical JSON bytes (got {size})")
+
+
+def _check_raw_wire_size(raw: Any, name: str, maximum: int) -> str:
+    if not isinstance(raw, str):
+        raise ContractError(f"{name} JSON must be a string")
+    size = len(raw.encode("utf-8"))
+    if size > maximum:
+        raise BoundsError(f"{name} JSON exceeds {maximum} UTF-8 bytes (got {size})")
+    return raw
 
 
 @dataclass(frozen=True)
@@ -408,6 +439,7 @@ class RunSnapshot:
     run_id: str
     assignment: AssignmentSnapshot
     actor_ref: str
+    workspace_ref: str
     profile_version: str
     behavioral_prompt: str
     context: tuple[VersionedContextRef, ...]
@@ -421,6 +453,7 @@ class RunSnapshot:
             raise ContractError(f"unsupported protocol: {self.protocol!r}")
         object.__setattr__(self, "run_id", _require_text(self.run_id, "runId"))
         object.__setattr__(self, "actor_ref", _require_text(self.actor_ref, "actorRef"))
+        object.__setattr__(self, "workspace_ref", _require_text(self.workspace_ref, "workspaceRef"))
         object.__setattr__(self, "profile_version", _require_text(self.profile_version, "profileVersion"))
         object.__setattr__(
             self,
@@ -438,6 +471,7 @@ class RunSnapshot:
             "runId": self.run_id,
             "assignment": self.assignment.to_dict(),
             "actorRef": self.actor_ref,
+            "workspaceRef": self.workspace_ref,
             "profileVersion": self.profile_version,
             "behavioralPrompt": self.behavioral_prompt,
             "context": [item.to_dict() for item in self.context],
@@ -463,6 +497,7 @@ class RunSnapshot:
                 "runId",
                 "assignment",
                 "actorRef",
+                "workspaceRef",
                 "profileVersion",
                 "behavioralPrompt",
                 "context",
@@ -481,6 +516,7 @@ class RunSnapshot:
             run_id=_require_text(data.get("runId"), "runId"),
             assignment=AssignmentSnapshot.from_dict(data.get("assignment")),
             actor_ref=_require_text(data.get("actorRef"), "actorRef"),
+            workspace_ref=_require_text(data.get("workspaceRef"), "workspaceRef"),
             profile_version=_require_text(data.get("profileVersion"), "profileVersion"),
             behavioral_prompt=_require_text(
                 data.get("behavioralPrompt"), "behavioralPrompt", max_length=MAX_TEXT_LENGTH
@@ -732,22 +768,35 @@ class TranscriptObserved:
 
 
 @dataclass(frozen=True)
-class ConversationPublicationObserved:
+class MessageProposalObserved:
+    """A bounded message proposal; it is never a product mutation."""
+
+    message_ref: str
     transcript_ref: str
-    publication_ref: str
-    receipt_ref: str
+    content: str
+    proposal_receipt_ref: str
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "transcript_ref", _require_text(self.transcript_ref, "publication.transcriptRef"))
-        object.__setattr__(self, "publication_ref", _require_text(self.publication_ref, "publication.publicationRef"))
-        object.__setattr__(self, "receipt_ref", _require_text(self.receipt_ref, "publication.receiptRef"))
+        object.__setattr__(self, "message_ref", _require_text(self.message_ref, "message.messageRef"))
+        object.__setattr__(self, "transcript_ref", _require_text(self.transcript_ref, "message.transcriptRef"))
+        object.__setattr__(
+            self,
+            "content",
+            _require_text(self.content, "message.content", max_length=MAX_TEXT_LENGTH),
+        )
+        object.__setattr__(
+            self,
+            "proposal_receipt_ref",
+            _require_text(self.proposal_receipt_ref, "message.proposalReceiptRef"),
+        )
 
     def to_dict(self) -> dict[str, str]:
         return {
-            "kind": "conversation_publication",
+            "kind": "message_proposal",
+            "messageRef": self.message_ref,
             "transcriptRef": self.transcript_ref,
-            "publicationRef": self.publication_ref,
-            "receiptRef": self.receipt_ref,
+            "content": self.content,
+            "proposalReceiptRef": self.proposal_receipt_ref,
         }
 
 
@@ -856,7 +905,7 @@ class BlockerObserved:
 EventBody = Union[
     ProgressObserved,
     TranscriptObserved,
-    ConversationPublicationObserved,
+    MessageProposalObserved,
     InputRequestObserved,
     ArtifactObserved,
     UsageObserved,
@@ -869,7 +918,7 @@ EventBody = Union[
 _EVENT_BODY_TYPES: dict[str, type[EventBody]] = {
     "progress": ProgressObserved,
     "transcript": TranscriptObserved,
-    "conversation_publication": ConversationPublicationObserved,
+    "message_proposal": MessageProposalObserved,
     "input_request": InputRequestObserved,
     "artifact": ArtifactObserved,
     "usage": UsageObserved,
@@ -892,14 +941,17 @@ def _event_body_from_dict(raw: Any) -> EventBody:
     if kind == "transcript":
         _reject_unknown(data, {"kind", "transcriptRef", "text"}, "event.body.transcript")
         return TranscriptObserved(data.get("transcriptRef"), data.get("text"))
-    if kind == "conversation_publication":
+    if kind == "message_proposal":
         _reject_unknown(
             data,
-            {"kind", "transcriptRef", "publicationRef", "receiptRef"},
-            "event.body.conversation_publication",
+            {"kind", "messageRef", "transcriptRef", "content", "proposalReceiptRef"},
+            "event.body.message_proposal",
         )
-        return ConversationPublicationObserved(
-            data.get("transcriptRef"), data.get("publicationRef"), data.get("receiptRef")
+        return MessageProposalObserved(
+            data.get("messageRef"),
+            data.get("transcriptRef"),
+            data.get("content"),
+            data.get("proposalReceiptRef"),
         )
     if kind == "input_request":
         _reject_unknown(data, {"kind", "requestRef", "prompt", "receiptRef"}, "event.body.input_request")
@@ -1007,6 +1059,7 @@ class RuntimeEvent:
     @classmethod
     def from_json(cls, raw: str) -> "RuntimeEvent":
         try:
+            raw = _check_raw_wire_size(raw, "runtimeEvent", MAX_EVENT_BYTES)
             return cls.from_dict(json.loads(raw))
         except (TypeError, ValueError, json.JSONDecodeError) as exc:
             if isinstance(exc, ContractError):
@@ -1064,24 +1117,6 @@ class RuntimeExit:
 
 
 @dataclass(frozen=True)
-class PublicationReceipt:
-    publication_ref: str
-    receipt_ref: str
-    transcript_ref: str
-    run_id: str | None = None
-    invocation_id: str | None = None
-    idempotency_key: str | None = None
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "publication_ref", _require_text(self.publication_ref, "receipt.publicationRef"))
-        object.__setattr__(self, "receipt_ref", _require_text(self.receipt_ref, "receipt.receiptRef"))
-        object.__setattr__(self, "transcript_ref", _require_text(self.transcript_ref, "receipt.transcriptRef"))
-        object.__setattr__(self, "run_id", _require_optional_text(self.run_id, "receipt.runId"))
-        object.__setattr__(self, "invocation_id", _require_optional_text(self.invocation_id, "receipt.invocationId"))
-        object.__setattr__(self, "idempotency_key", _require_optional_text(self.idempotency_key, "receipt.idempotencyKey"))
-
-
-@dataclass(frozen=True)
 class ProductReceipt:
     """Receipt returned by one narrow, host-authorized product operation."""
 
@@ -1090,6 +1125,12 @@ class ProductReceipt:
     run_id: str
     invocation_id: str
     idempotency_key: str
+    kind: str = "generic"
+    actor_ref: str | None = None
+    workspace_ref: str | None = None
+    snapshot_digest: str | None = None
+    terminal_slot: str | None = None
+    proposal_digest: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "resource_ref", _require_text(self.resource_ref, "receipt.resourceRef"))
@@ -1097,6 +1138,13 @@ class ProductReceipt:
         object.__setattr__(self, "run_id", _require_text(self.run_id, "receipt.runId"))
         object.__setattr__(self, "invocation_id", _require_text(self.invocation_id, "receipt.invocationId"))
         object.__setattr__(self, "idempotency_key", _require_text(self.idempotency_key, "receipt.idempotencyKey"))
+        object.__setattr__(self, "kind", _require_text(self.kind, "receipt.kind"))
+        for name in ("actor_ref", "workspace_ref", "snapshot_digest", "terminal_slot", "proposal_digest"):
+            object.__setattr__(
+                self,
+                name,
+                _require_optional_text(getattr(self, name), f"receipt.{name}"),
+            )
 
     def to_dict(self) -> dict[str, str]:
         return {
@@ -1105,6 +1153,12 @@ class ProductReceipt:
             "runId": self.run_id,
             "invocationId": self.invocation_id,
             "idempotencyKey": self.idempotency_key,
+            "kind": self.kind,
+            "actorRef": self.actor_ref,
+            "workspaceRef": self.workspace_ref,
+            "snapshotDigest": self.snapshot_digest,
+            "terminalSlot": self.terminal_slot,
+            "proposalDigest": self.proposal_digest,
         }
 
     @classmethod
@@ -1112,7 +1166,19 @@ class ProductReceipt:
         data = _mapping(raw, "productReceipt")
         _reject_unknown(
             data,
-            {"resourceRef", "receiptRef", "runId", "invocationId", "idempotencyKey"},
+            {
+                "resourceRef",
+                "receiptRef",
+                "runId",
+                "invocationId",
+                "idempotencyKey",
+                "kind",
+                "actorRef",
+                "workspaceRef",
+                "snapshotDigest",
+                "terminalSlot",
+                "proposalDigest",
+            },
             "productReceipt",
         )
         return cls(
@@ -1121,6 +1187,12 @@ class ProductReceipt:
             run_id=_require_text(data.get("runId"), "receipt.runId"),
             invocation_id=_require_text(data.get("invocationId"), "receipt.invocationId"),
             idempotency_key=_require_text(data.get("idempotencyKey"), "receipt.idempotencyKey"),
+            kind=_require_text(data.get("kind", "generic"), "receipt.kind"),
+            actor_ref=_require_optional_text(data.get("actorRef"), "receipt.actorRef"),
+            workspace_ref=_require_optional_text(data.get("workspaceRef"), "receipt.workspaceRef"),
+            snapshot_digest=_require_optional_text(data.get("snapshotDigest"), "receipt.snapshotDigest"),
+            terminal_slot=_require_optional_text(data.get("terminalSlot"), "receipt.terminalSlot"),
+            proposal_digest=_require_optional_text(data.get("proposalDigest"), "receipt.proposalDigest"),
         )
 
 
@@ -1247,6 +1319,49 @@ class InputRequestProposal:
 
 
 @dataclass(frozen=True)
+class MessageProposal:
+    """Optional visible message evidence applied only by terminal reconciliation."""
+
+    message_ref: str
+    content: str
+    event_id: str
+    proposal_receipt_ref: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "message_ref", _require_text(self.message_ref, "message.messageRef"))
+        object.__setattr__(self, "content", _require_text(self.content, "message.content", max_length=MAX_TEXT_LENGTH))
+        object.__setattr__(self, "event_id", _require_text(self.event_id, "message.eventId"))
+        object.__setattr__(
+            self,
+            "proposal_receipt_ref",
+            _require_text(self.proposal_receipt_ref, "message.proposalReceiptRef"),
+        )
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "messageRef": self.message_ref,
+            "content": self.content,
+            "eventId": self.event_id,
+            "proposalReceiptRef": self.proposal_receipt_ref,
+        }
+
+    @classmethod
+    def from_dict(cls, raw: Any) -> "MessageProposal":
+        data = _mapping(raw, "messageProposal")
+        _reject_unknown(
+            data,
+            {"messageRef", "content", "eventId", "proposalReceiptRef"},
+            "messageProposal",
+        )
+        return cls(
+            data.get("messageRef"),
+            data.get("content"),
+            data.get("eventId"),
+            data.get("proposalReceiptRef"),
+        )
+
+
+@dataclass(frozen=True)
 class TerminalProposal:
     """A terminal observation submitted to Plane for lifecycle reconciliation.
 
@@ -1258,6 +1373,9 @@ class TerminalProposal:
 
     run_id: str
     invocation_id: str
+    actor_ref: str
+    workspace_ref: str
+    snapshot_digest: str
     kind: str
     final_sequence: int
     evidence_event_ids: tuple[str, ...] = ()
@@ -1268,11 +1386,19 @@ class TerminalProposal:
     input_request_proposal: InputRequestProposal | None = None
     cancellation_receipt: ProductReceipt | None = None
     artifact_proposals: tuple[ArtifactProposal, ...] = ()
+    message_proposals: tuple[MessageProposal, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "run_id", _require_text(self.run_id, "terminal.runId"))
         object.__setattr__(
             self, "invocation_id", _require_text(self.invocation_id, "terminal.invocationId")
+        )
+        object.__setattr__(self, "actor_ref", _require_text(self.actor_ref, "terminal.actorRef"))
+        object.__setattr__(self, "workspace_ref", _require_text(self.workspace_ref, "terminal.workspaceRef"))
+        object.__setattr__(
+            self,
+            "snapshot_digest",
+            _require_text(self.snapshot_digest, "terminal.snapshotDigest"),
         )
         if self.kind not in TERMINAL_KINDS:
             raise ContractError(f"unsupported terminal proposal kind: {self.kind!r}")
@@ -1303,15 +1429,29 @@ class TerminalProposal:
         object.__setattr__(self, "evidence_event_ids", event_ids)
         object.__setattr__(self, "evidence_receipt_refs", receipt_refs)
         artifacts = tuple(self.artifact_proposals)
-        if len(artifacts) > MAX_TERMINAL_EVIDENCE:
+        if len(artifacts) > MAX_ARTIFACT_PROPOSALS:
             raise BoundsError(
-                f"terminal.artifactProposals exceeds {MAX_TERMINAL_EVIDENCE} items"
+                f"terminal.artifactProposals exceeds {MAX_ARTIFACT_PROPOSALS} items"
             )
         if not all(isinstance(item, ArtifactProposal) for item in artifacts):
             raise ContractError("terminal.artifactProposals contains an unsupported value")
         if len({item.artifact_ref for item in artifacts}) != len(artifacts):
             raise ContractError("terminal.artifactProposals must contain unique artifact references")
         object.__setattr__(self, "artifact_proposals", artifacts)
+        messages = tuple(self.message_proposals)
+        if len(messages) > MAX_MESSAGE_PROPOSALS:
+            raise BoundsError(
+                f"terminal.messageProposals exceeds {MAX_MESSAGE_PROPOSALS} items"
+            )
+        if not all(isinstance(item, MessageProposal) for item in messages):
+            raise ContractError("terminal.messageProposals contains an unsupported value")
+        if len({item.message_ref for item in messages}) != len(messages):
+            raise ContractError("terminal.messageProposals must contain unique message references")
+        object.__setattr__(self, "message_proposals", messages)
+        if 1 + len(artifacts) + len(messages) > MAX_TERMINAL_PRODUCT_RECEIPTS:
+            raise BoundsError(
+                "terminal product proposal count exceeds the bounded receipt surface"
+            )
         if self.kind in {"failed", "blocked"} and self.failure is None:
             raise ContractError(f"{self.kind} terminal proposal requires failure details")
         if self.kind not in {"failed", "blocked"} and self.failure is not None:
@@ -1356,11 +1496,15 @@ class TerminalProposal:
         ):
             raise ContractError("supervisor terminal proposals must synthesize process death")
         object.__setattr__(self, "source", self.source)
+        _check_wire_size(self.to_dict(), "terminalProposal", MAX_TERMINAL_PROPOSAL_BYTES)
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "runId": self.run_id,
             "invocationId": self.invocation_id,
+            "actorRef": self.actor_ref,
+            "workspaceRef": self.workspace_ref,
+            "snapshotDigest": self.snapshot_digest,
             "kind": self.kind,
             "finalSequence": self.final_sequence,
             "evidenceEventIds": list(self.evidence_event_ids),
@@ -1383,6 +1527,7 @@ class TerminalProposal:
                 else None
             ),
             "artifactProposals": [item.to_dict() for item in self.artifact_proposals],
+            "messageProposals": [item.to_dict() for item in self.message_proposals],
         }
 
     @classmethod
@@ -1393,6 +1538,9 @@ class TerminalProposal:
             {
                 "runId",
                 "invocationId",
+                "actorRef",
+                "workspaceRef",
+                "snapshotDigest",
                 "kind",
                 "finalSequence",
                 "evidenceEventIds",
@@ -1403,6 +1551,7 @@ class TerminalProposal:
                 "inputRequestProposal",
                 "cancellationReceipt",
                 "artifactProposals",
+                "messageProposals",
             },
             "terminalProposal",
         )
@@ -1411,6 +1560,9 @@ class TerminalProposal:
         return cls(
             run_id=_require_text(data.get("runId"), "terminal.runId"),
             invocation_id=_require_text(data.get("invocationId"), "terminal.invocationId"),
+            actor_ref=_require_text(data.get("actorRef"), "terminal.actorRef"),
+            workspace_ref=_require_text(data.get("workspaceRef"), "terminal.workspaceRef"),
+            snapshot_digest=_require_text(data.get("snapshotDigest"), "terminal.snapshotDigest"),
             kind=_require_text(data.get("kind"), "terminal.kind"),
             final_sequence=_require_int(data.get("finalSequence"), "terminal.finalSequence"),
             evidence_event_ids=tuple(
@@ -1454,14 +1606,28 @@ class TerminalProposal:
                     maximum=MAX_TERMINAL_EVIDENCE,
                 )
             ),
+            message_proposals=tuple(
+                MessageProposal.from_dict(item)
+                for item in _sequence(
+                    data.get("messageProposals"),
+                    "terminal.messageProposals",
+                    maximum=MAX_MESSAGE_PROPOSALS,
+                )
+            ),
         )
 
     def to_json(self) -> str:
-        return json.dumps(self.to_dict(), sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        payload = self.to_dict()
+        _check_wire_size(payload, "terminalProposal", MAX_TERMINAL_PROPOSAL_BYTES)
+        return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+    def digest(self) -> str:
+        return _digest(self.to_dict())
 
     @classmethod
     def from_json(cls, raw: str) -> "TerminalProposal":
         try:
+            raw = _check_raw_wire_size(raw, "terminalProposal", MAX_TERMINAL_PROPOSAL_BYTES)
             return cls.from_dict(json.loads(raw))
         except (TypeError, ValueError, json.JSONDecodeError) as exc:
             if isinstance(exc, ContractError):
@@ -1494,8 +1660,15 @@ class TerminalReconciliationReceipt:
     accepted: bool
     legal_transition: bool
     operation_ref: str | None = None
+    application_ref: str | None = None
+    gateway_receipt_ref: str | None = None
     product_event_ref: str | None = None
     product_receipts: tuple[ProductReceipt, ...] = ()
+    actor_ref: str | None = None
+    workspace_ref: str | None = None
+    snapshot_digest: str | None = None
+    terminal_slot: str | None = None
+    proposal_digest: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "receipt_ref", _require_text(self.receipt_ref, "terminalReceipt.receiptRef"))
@@ -1518,13 +1691,23 @@ class TerminalReconciliationReceipt:
         object.__setattr__(self, "operation_ref", _require_optional_text(self.operation_ref, "terminalReceipt.operationRef"))
         object.__setattr__(
             self,
+            "application_ref",
+            _require_optional_text(self.application_ref, "terminalReceipt.applicationRef"),
+        )
+        object.__setattr__(
+            self,
+            "gateway_receipt_ref",
+            _require_optional_text(self.gateway_receipt_ref, "terminalReceipt.gatewayReceiptRef"),
+        )
+        object.__setattr__(
+            self,
             "product_event_ref",
             _require_optional_text(self.product_event_ref, "terminalReceipt.productEventRef"),
         )
         product_receipts = tuple(self.product_receipts)
-        if len(product_receipts) > MAX_TERMINAL_EVIDENCE:
+        if len(product_receipts) > MAX_TERMINAL_PRODUCT_RECEIPTS:
             raise BoundsError(
-                f"terminalReceipt.productReceipts exceeds {MAX_TERMINAL_EVIDENCE} items"
+                f"terminalReceipt.productReceipts exceeds {MAX_TERMINAL_PRODUCT_RECEIPTS} items"
             )
         if not all(isinstance(item, ProductReceipt) for item in product_receipts):
             raise ContractError("terminalReceipt.productReceipts contains an unsupported value")
@@ -1534,6 +1717,31 @@ class TerminalReconciliationReceipt:
         ):
             raise BindingError("terminal product receipt is not bound to the terminal slot")
         object.__setattr__(self, "product_receipts", product_receipts)
+        for name in ("actor_ref", "workspace_ref", "snapshot_digest", "terminal_slot", "proposal_digest"):
+            object.__setattr__(
+                self,
+                name,
+                _require_optional_text(getattr(self, name), f"terminalReceipt.{name}"),
+            )
+        if self.accepted and self.legal_transition:
+            for name in (
+                "operation_ref",
+                "application_ref",
+                "gateway_receipt_ref",
+                "product_event_ref",
+                "actor_ref",
+                "workspace_ref",
+                "snapshot_digest",
+                "terminal_slot",
+                "proposal_digest",
+            ):
+                if getattr(self, name) is None:
+                    raise ContractError(
+                        f"accepted terminal receipt requires {name} proof"
+                    )
+            if not product_receipts:
+                raise ContractError("accepted terminal receipt requires product receipts")
+        _check_wire_size(self.to_dict(), "terminalReceipt", MAX_TERMINAL_RECEIPT_BYTES)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -1546,8 +1754,15 @@ class TerminalReconciliationReceipt:
             "accepted": self.accepted,
             "legalTransition": self.legal_transition,
             "operationRef": self.operation_ref,
+            "applicationRef": self.application_ref,
+            "gatewayReceiptRef": self.gateway_receipt_ref,
             "productEventRef": self.product_event_ref,
             "productReceipts": [item.to_dict() for item in self.product_receipts],
+            "actorRef": self.actor_ref,
+            "workspaceRef": self.workspace_ref,
+            "snapshotDigest": self.snapshot_digest,
+            "terminalSlot": self.terminal_slot,
+            "proposalDigest": self.proposal_digest,
         }
 
     @classmethod
@@ -1565,8 +1780,15 @@ class TerminalReconciliationReceipt:
                 "accepted",
                 "legalTransition",
                 "operationRef",
+                "applicationRef",
+                "gatewayReceiptRef",
                 "productEventRef",
                 "productReceipts",
+                "actorRef",
+                "workspaceRef",
+                "snapshotDigest",
+                "terminalSlot",
+                "proposalDigest",
             },
             "terminalReceipt",
         )
@@ -1580,6 +1802,12 @@ class TerminalReconciliationReceipt:
             accepted=data.get("accepted"),
             legal_transition=data.get("legalTransition"),
             operation_ref=_require_optional_text(data.get("operationRef"), "terminalReceipt.operationRef"),
+            application_ref=_require_optional_text(
+                data.get("applicationRef"), "terminalReceipt.applicationRef"
+            ),
+            gateway_receipt_ref=_require_optional_text(
+                data.get("gatewayReceiptRef"), "terminalReceipt.gatewayReceiptRef"
+            ),
             product_event_ref=_require_optional_text(
                 data.get("productEventRef"), "terminalReceipt.productEventRef"
             ),
@@ -1588,17 +1816,29 @@ class TerminalReconciliationReceipt:
                 for item in _sequence(
                     data.get("productReceipts"),
                     "terminalReceipt.productReceipts",
-                    maximum=MAX_TERMINAL_EVIDENCE,
+                    maximum=MAX_TERMINAL_PRODUCT_RECEIPTS,
                 )
+            ),
+            actor_ref=_require_optional_text(data.get("actorRef"), "terminalReceipt.actorRef"),
+            workspace_ref=_require_optional_text(data.get("workspaceRef"), "terminalReceipt.workspaceRef"),
+            snapshot_digest=_require_optional_text(
+                data.get("snapshotDigest"), "terminalReceipt.snapshotDigest"
+            ),
+            terminal_slot=_require_optional_text(data.get("terminalSlot"), "terminalReceipt.terminalSlot"),
+            proposal_digest=_require_optional_text(
+                data.get("proposalDigest"), "terminalReceipt.proposalDigest"
             ),
         )
 
     def to_json(self) -> str:
-        return json.dumps(self.to_dict(), sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        payload = self.to_dict()
+        _check_wire_size(payload, "terminalReceipt", MAX_TERMINAL_RECEIPT_BYTES)
+        return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
     @classmethod
     def from_json(cls, raw: str) -> "TerminalReconciliationReceipt":
         try:
+            raw = _check_raw_wire_size(raw, "terminalReceipt", MAX_TERMINAL_RECEIPT_BYTES)
             return cls.from_dict(json.loads(raw))
         except (TypeError, ValueError, json.JSONDecodeError) as exc:
             if isinstance(exc, ContractError):

@@ -28,16 +28,29 @@ The v1 contract contains immutable `RunSnapshot` and `InvocationEnvelope`
 values, bounded `RuntimeEvent` observations/proposals, typed `TerminalProposal`
 values, and one `RuntimeExit`.
 Later Plane input is represented only by event references in an invocation;
-budgets are supplied as remaining cumulative values. Transcript evidence is
-not publication: a publication observation is emitted only after a trusted
-host returns a receipt for an explicit non-terminal publication action.
-Terminal product mutations never use that host seam.
+budgets are supplied as remaining cumulative values. Transcript and message
+proposal observations are operational evidence only: this adapter has no
+product-publication host method. A typed message proposal may cross the
+terminal proposal boundary, where the atomic terminal port applies it only as
+part of an accepted terminal transition; any future non-terminal publication
+is an explicit Plane gateway operation outside this adapter.
+Terminal product mutations never use a runtime host seam.
 
 The wire limits are deliberately finite: acceptance criteria are capped at 64
 items, context/eager-operation/new-event-reference lists at 128 items, event
 JSON at 16 KiB, invocation JSON at 16 KiB, and snapshot JSON at 128 KiB. The
 snapshot and invocation limits measure canonical UTF-8 JSON bytes, so the
 boundary is stable across transport implementations.
+
+Per invocation, event ingestion is capped at 512 events and 256 KiB of
+canonical event bytes. Transcript, artifact, input, outcome, and message
+proposal categories each have bounded counts and bytes; sequence and
+idempotency indexes and the optional observation tail are bounded as well.
+Terminal proposals and reconciliation receipts are each capped at 128 KiB.
+An accepted receipt must prove the operation, application, gateway, audit,
+terminal product event, and the exact kind-specific product receipts bound to
+the run, invocation, actor, workspace, snapshot, terminal slot, and proposal
+digest.
 
 `adapter.py` exposes the narrow `KernelPort` seam. `FakeKernel` is a
 deterministic implementation for contract tests; a real Hermes implementation

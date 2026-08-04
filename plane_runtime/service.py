@@ -26,10 +26,9 @@ from .adapter import (
     FakeKernel,
     FakeKernelPlan,
     KernelPort,
-    RecordingHost,
-    RuntimeHost,
     CancellationAuthority,
     CancellationSignal,
+    LeaseError,
     TerminalReconciliationError,
     TerminalReconciliationPort,
     execute,
@@ -82,6 +81,9 @@ def _handle_runtime_failure(
     proposal = TerminalProposal(
         run_id=run.run_id,
         invocation_id=invocation.invocation_id,
+        actor_ref=run.actor_ref,
+        workspace_ref=run.workspace_ref,
+        snapshot_digest=run.digest(),
         kind="failed",
         final_sequence=collector.last_sequence,
         evidence_event_ids=tuple(
@@ -198,6 +200,7 @@ def _demo_snapshot() -> RunSnapshot:
             acceptance_criteria=("The result is deterministic",),
         ),
         actor_ref="agent:one",
+        workspace_ref="workspace:one",
         profile_version="profile:v1",
         behavioral_prompt="Use the runtime port.",
         context=(VersionedContextRef("context:one", "sha256:context"),),
@@ -319,7 +322,7 @@ def serve_once(
     request_line: str,
     output: TextIO,
     *,
-    host: RuntimeHost | None = None,
+    host: object | None = None,
     lease_authority: CanonicalLeaseAuthority | None = None,
     lease_binding: CanonicalLeaseBinding | None = None,
     checkpoint_authority: CheckpointAuthority | None = None,
@@ -345,17 +348,31 @@ def serve_once(
         run = RunSnapshot.from_dict(request.get("run"))
         invocation = InvocationEnvelope.from_dict(request.get("invocation"))
         plan = _fake_plan(request.get("fakePlan"))
+        checkpoint_configuration_missing = invocation.checkpoint_ref is not None and (
+            checkpoint_authority is None or checkpoint_attestation is None
+        )
         if (
-            host is None
-            or lease_authority is None
+            lease_authority is None
             or lease_binding is None
             or terminal_port is None
+            or checkpoint_configuration_missing
         ):
-            raise ContractError(
-                "service requires separately injected host, canonical lease authority/binding, "
-                "and terminal reconciliation port"
+            output.write(
+                json.dumps(
+                    {
+                        "type": "error",
+                        "error": {
+                            "code": "runtime_configuration",
+                            "message": "runtime dependencies are not configured",
+                        },
+                    },
+                    sort_keys=True,
+                )
+                + "\n"
             )
-    except (ContractError, TypeError, ValueError, json.JSONDecodeError):
+            output.flush()
+            return 1
+    except (ContractError, TypeError, json.JSONDecodeError):
         output.write(
             json.dumps(
                 {"type": "error", "error": {"code": "invalid_request", "message": "invalid runtime request"}},
@@ -385,7 +402,6 @@ def serve_once(
         exit_value = execute(
             run=run,
             invocation=invocation,
-            host=host,
             emit=emit,
             cancellation=cancellation,
             cancellation_authority=cancellation_authority,
@@ -400,7 +416,7 @@ def serve_once(
         output.write(json.dumps({"type": "exit", "exit": exit_value.to_dict()}, sort_keys=True) + "\n")
         output.flush()
         return 0
-    except BindingError:
+    except (BindingError, LeaseError):
         output.write(
             json.dumps(
                 {"type": "error", "error": {"code": "binding_rejected", "message": "runtime binding rejected"}},
@@ -420,19 +436,6 @@ def serve_once(
             internal_failure_hook=internal_failure_hook,
         )
     except (ContractError, TypeError, ValueError) as exc:
-        if not phase.execution_started:
-            output.write(
-                json.dumps(
-                    {
-                        "type": "error",
-                        "error": {"code": "binding_rejected", "message": "runtime binding rejected"},
-                    },
-                    sort_keys=True,
-                )
-                + "\n"
-            )
-            output.flush()
-            return 1
         return _handle_runtime_failure(
             exc=exc,
             run=run,
@@ -481,7 +484,6 @@ def main(argv: list[str] | None = None) -> int:
         return serve_once(
             request_line,
             sys.stdout,
-            host=RecordingHost(),
             lease_authority=lease_authority,
             lease_binding=lease_binding,
             checkpoint_authority=checkpoint_authority,
