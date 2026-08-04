@@ -14,6 +14,8 @@ import unittest
 from datetime import datetime, timezone
 from unittest.mock import patch
 
+import plane_runtime.invocation_supervisor as supervisor_module
+
 from plane_runtime import (
     AssignmentSnapshot,
     CanonicalCancellationAuthority,
@@ -518,6 +520,116 @@ class SupervisorTests(unittest.TestCase):
         self.assertEqual(launch_calls, 0)
         self.assertEqual(port.proposals, [])
 
+    def test_object_setattr_results_replacement_and_forged_subclass_are_ignored(self) -> None:
+        port = FixtureTerminalReconciliationPort()
+        supervisor, _runner = self.make_supervisor(
+            proposal_output(self.snapshot, self.invocation),
+            port=port,
+        )
+        first = supervisor.run_once(self.snapshot, self.invocation)
+
+        class ForgedResult(supervisor_module._EXACT_INVOCATION_RESULT):
+            @property
+            def production_completed(self):
+                return True
+
+        forged = ForgedResult(
+            status="completed",
+            container_name=first.container_name,
+            enforcement=EnforcementAttestation(
+                "production",
+                "0" * 64,
+                first.container_name,
+                ("forged",),
+            ),
+        )
+        object.__setattr__(supervisor, "_results", {
+            (self.snapshot.run_id, self.invocation.invocation_id): forged,
+        })
+        second = supervisor.run_once(self.snapshot, self.invocation)
+        self.assertEqual(type(second), supervisor_module._EXACT_INVOCATION_RESULT)
+        self.assertFalse(second.production_completed)
+        self.assertEqual(second, first)
+        self.assertEqual(len(port.proposals), 1)
+
+    def test_module_result_symbol_replacement_before_and_after_construction_is_ignored(self) -> None:
+        class PatchedResult(supervisor_module._EXACT_INVOCATION_RESULT):
+            @property
+            def production_completed(self):
+                return True
+
+        before_port = FixtureTerminalReconciliationPort()
+        before_supervisor, _runner = self.make_supervisor(
+            proposal_output(self.snapshot, self.invocation),
+            port=before_port,
+        )
+        with patch.object(supervisor_module, "InvocationResult", PatchedResult):
+            after = before_supervisor.run_once(self.snapshot, self.invocation)
+        self.assertEqual(type(after), supervisor_module._EXACT_INVOCATION_RESULT)
+        self.assertFalse(after.production_completed)
+        self.assertEqual(len(before_port.proposals), 1)
+
+        inside_port = FixtureTerminalReconciliationPort()
+        with patch.object(supervisor_module, "InvocationResult", PatchedResult):
+            inside_supervisor, _runner = self.make_supervisor(
+                proposal_output(self.snapshot, self.invocation),
+                port=inside_port,
+            )
+            before = inside_supervisor.run_once(self.snapshot, self.invocation)
+        self.assertEqual(type(before), supervisor_module._EXACT_INVOCATION_RESULT)
+        self.assertFalse(before.production_completed)
+        self.assertEqual(len(inside_port.proposals), 1)
+
+    def test_malformed_or_production_canonical_records_fail_closed_without_reconciliation(self) -> None:
+        for mutation in ("production", "malformed", "binding"):
+            with self.subTest(mutation=mutation):
+                port = FixtureTerminalReconciliationPort()
+                supervisor, _runner = self.make_supervisor(
+                    proposal_output(self.snapshot, self.invocation),
+                    port=port,
+                )
+                first = supervisor.run_once(self.snapshot, self.invocation)
+                key = (self.snapshot.run_id, self.invocation.invocation_id)
+                canonical = supervisor._results[key]
+                if mutation == "production":
+                    object.__setattr__(
+                        canonical,
+                        "enforcement",
+                        ("production", "0" * 64, first.container_name, ("forged",)),
+                    )
+                elif mutation == "malformed":
+                    object.__setattr__(canonical, "evidence", [])
+                else:
+                    object.__setattr__(
+                        canonical,
+                        "enforcement",
+                        ("test", "0" * 64, first.container_name, ("forged",)),
+                    )
+                second = supervisor.run_once(self.snapshot, self.invocation)
+                self.assertEqual(second.status, "supervisor_action_required")
+                self.assertFalse(second.production_completed)
+                self.assertIn("retained_result_invalid", second.evidence)
+                self.assertEqual(len(port.proposals), 1)
+
+    def test_returned_result_mutation_cannot_change_retained_nonproduction_truth(self) -> None:
+        port = FixtureTerminalReconciliationPort()
+        supervisor, _runner = self.make_supervisor(
+            proposal_output(self.snapshot, self.invocation),
+            port=port,
+        )
+        first = supervisor.run_once(self.snapshot, self.invocation)
+        object.__setattr__(first, "enforcement", EnforcementAttestation(
+            "production",
+            "0" * 64,
+            first.container_name,
+            ("forged",),
+        ))
+        second = supervisor.run_once(self.snapshot, self.invocation)
+        self.assertFalse(first.production_completed)
+        self.assertFalse(second.production_completed)
+        self.assertEqual(second.enforcement.classification, "test")  # type: ignore[union-attr]
+        self.assertEqual(len(port.proposals), 1)
+
     def test_child_cancellation_receipt_is_rejected_without_host_mutation(self) -> None:
         forged = CancellationAuthorityReceipt(
             resource_ref=self.invocation.cancellation_ref,
@@ -597,7 +709,9 @@ class SupervisorTests(unittest.TestCase):
         first = supervisor.run_once(self.snapshot, self.invocation, cancellation=cancellation)
         second = supervisor.run_once(self.snapshot, self.invocation, cancellation=cancellation)
         self.assertEqual(first.status, "cancelled")
-        self.assertIs(first, second)
+        # Public results are fresh views; idempotency is the single host event.
+        self.assertEqual(first, second)
+        self.assertIsNot(first, second)
         self.assertEqual(runner.launch_calls, 0)
         self.assertEqual(port.product_events, [("terminal:run:supervisor:invocation:one", "cancelled")])
         self.assertEqual(len(port.proposals), 1)
@@ -641,7 +755,7 @@ class SupervisorTests(unittest.TestCase):
             supervisor._results,
         )
         self.assertEqual(len(supervisor._results), _MAX_RETAINED_INVOCATIONS)
-        self.assertIs(
+        self.assertEqual(
             supervisor.run_once(self.snapshot, make_invocation(self.snapshot, "invocation:hostile-0")),
             retained[0],
         )
@@ -756,7 +870,8 @@ class SupervisorTests(unittest.TestCase):
         for thread in threads:
             thread.join(timeout=5)
         self.assertEqual(len(results), 20)
-        self.assertTrue(all(item is results[0] for item in results))
+        self.assertTrue(all(item == results[0] for item in results))
+        self.assertTrue(all(item is not results[0] for item in results[1:]))
         self.assertEqual(len(port.proposals), 1)
 
     def test_proposal_only_service_accepts_arbitrary_ids_and_emits_no_receipt(self) -> None:

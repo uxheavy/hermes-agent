@@ -105,9 +105,12 @@ binding exists. Caller-owned runners are explicit test seams and cannot
 produce a `production_completed` result; there is deliberately no mutable
 closed-runner production path to replace. The attach client is terminated,
 killed if necessary, and reaped on every collector exit before container
-cleanup. Results are retained under a fixed bound, with overflow returned as
-supervisor action required without inserting past the cap. Cleanup proves
-deterministic container absence after stop/kill/remove-volume attempts.
+cleanup. Results are retained under a fixed bound only as validated private
+canonical snapshots; caller-supplied or mutated result objects are never
+trusted, and each lookup reconstructs a fresh exact non-production result.
+Overflow is returned as supervisor action required without inserting past the
+cap. Cleanup proves deterministic container absence after stop/kill/remove-volume
+attempts.
 
 The package does not claim a real Hermes `KernelPort`, provider credentials,
 Operation Gateway, deployment, checkpoint service, or generated TypeScript
