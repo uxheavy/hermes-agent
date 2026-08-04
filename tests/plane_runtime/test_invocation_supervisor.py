@@ -463,6 +463,61 @@ class SupervisorTests(unittest.TestCase):
         self.assertTrue(fake_result.completed)
         self.assertFalse(fake_result.production_completed)
 
+    def test_supervisor_state_and_runner_class_monkeypatches_have_no_production_path(self) -> None:
+        def production_claim(argv, *, client_env):
+            del client_env
+            digest = hashlib.sha256(b"\0".join(item.encode() for item in argv)).hexdigest()
+            return EnforcementAttestation(
+                "production",
+                digest,
+                argv[argv.index("--name") + 1],
+                ("forged-inspection", "forged-child", "forged-cleanup"),
+            )
+
+        lease_binding = make_binding(self.snapshot, self.invocation)
+        port = FixtureTerminalReconciliationPort()
+        unconfigured = InvocationSupervisor(
+            policy=self.policy,
+            runner=None,
+            terminal_port=port,
+            lease_authority=FixtureCanonicalLeaseAuthority([lease_binding], clock=lambda: NOW),
+            lease_binding=lease_binding,
+        )
+        # These were the rejected design's production switches. Adding them
+        # back to the instance must not create a path that the supervisor uses.
+        object.__setattr__(unconfigured, "_production_runner", object())
+        object.__setattr__(unconfigured, "_runner_is_injected", False)
+        result = unconfigured.run_once(self.snapshot, self.invocation)
+        self.assertEqual(result.status, "rejected")
+        self.assertFalse(result.production_completed)
+        self.assertIn("enforcement_unproven", result.evidence)
+        self.assertEqual(port.proposals, [])
+
+        launch_calls = 0
+
+        def forbidden_launch(*args, **kwargs):
+            nonlocal launch_calls
+            del args, kwargs
+            launch_calls += 1
+            raise AssertionError("a rejected production claim must not launch")
+
+        with (
+            patch.object(SubprocessDockerRunner, "attest_invocation", staticmethod(production_claim)),
+            patch.object(SubprocessDockerRunner, "launch", forbidden_launch),
+        ):
+            patched_runner = SubprocessDockerRunner()
+            patched_supervisor, _runner = self.make_supervisor(
+                proposal_output(self.snapshot, self.invocation),
+                runner=patched_runner,
+                port=port,
+            )
+            patched_result = patched_supervisor.run_once(self.snapshot, self.invocation)
+
+        self.assertEqual(patched_result.status, "rejected")
+        self.assertFalse(patched_result.production_completed)
+        self.assertEqual(launch_calls, 0)
+        self.assertEqual(port.proposals, [])
+
     def test_child_cancellation_receipt_is_rejected_without_host_mutation(self) -> None:
         forged = CancellationAuthorityReceipt(
             resource_ref=self.invocation.cancellation_ref,

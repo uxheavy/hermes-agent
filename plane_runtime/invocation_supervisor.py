@@ -6,10 +6,11 @@ in the trusted host and is the only place that may submit the proposal through
 the injected :class:`TerminalReconciliationPort`.
 
 The Docker implementation is deliberately strict and conservative.  It uses
-only fixed argv controls, performs bounded Docker JSON inspection before and
-after launch, and refuses to claim production enforcement when inspection is
-ambiguous or unavailable.  Fake runners are supported as explicit test seams
-and are marked as such in their enforcement attestation.
+only fixed argv controls and performs bounded Docker JSON inspection before
+and after launch.  This package does not yet contain a trusted production
+entrypoint: Docker evidence and injected runners are explicitly test-only
+until a real kernel/service binding is installed.  A production-shaped
+attestation is rejected rather than treated as proof.
 """
 
 from __future__ import annotations
@@ -325,7 +326,12 @@ class DockerRunnerCapabilities:
 
 @dataclass(frozen=True)
 class EnforcementAttestation:
-    """Evidence that a runner enforced the fixed invocation policy."""
+    """Bounded runner evidence; the current supervisor accepts test evidence only.
+
+    ``production`` remains a parseable legacy value so hostile or stale
+    adapters fail at the supervisor seam instead of failing during decoding.
+    It is never an accepted classification for a current invocation.
+    """
 
     classification: str
     argv_digest: str
@@ -443,7 +449,14 @@ class InvocationResult:
 
     @property
     def production_completed(self) -> bool:
-        return self.completed and self.enforcement is not None and self.enforcement.is_production
+        """Whether this result is a trusted production completion.
+
+        The L9 foundation has no trusted production entrypoint yet.  Keeping
+        this compatibility property permanently false prevents a caller-owned
+        result or attestation from becoming a product completion claim.
+        """
+
+        return False
 
 
 def _argv_digest(argv: Sequence[str]) -> str:
@@ -959,7 +972,7 @@ class SubprocessDockerRunner:
     @classmethod
     def _assert_fixed_argv_shape(cls, argv: Sequence[str]) -> None:
         if tuple(argv[:2]) != ("docker", "create"):
-            raise ContractError("production runner accepts only fixed docker create argv")
+            raise ContractError("Docker runner accepts only fixed docker create argv")
         allowed_flags = {
             "--name", "--label", "--pull", "--network", "--read-only",
             "--security-opt", "--cap-drop", "--user", "--cpus", "--memory",
@@ -998,7 +1011,7 @@ class SubprocessDockerRunner:
 
     def _preflight(self, argv: Sequence[str], *, timeout_seconds: float) -> None:
         if tuple(argv[:2]) != ("docker", "create"):
-            raise ContractError("production runner accepts only fixed docker create argv")
+            raise ContractError("Docker runner accepts only fixed docker create argv")
         info = self._run_json(("docker", "info", "--format", "{{json .}}"), timeout_seconds=timeout_seconds, label="daemon")
         if info.get("OSType") != "linux" or not isinstance(info.get("Driver"), str):
             raise RuntimeConfigurationError("Docker daemon platform or storage driver is ambiguous")
@@ -1068,10 +1081,16 @@ class SubprocessDockerRunner:
         self._assert_fixed_argv_shape(argv)
         self._preflight(argv, timeout_seconds=5.0)
         attestation = EnforcementAttestation(
-            classification="production",
+            classification="test",
             argv_digest=_argv_digest(argv),
             container_name=name,
-            evidence=("daemon_inspected", "image_digest_inspected", "image_config_inspected", "fixed_argv"),
+            evidence=(
+                "daemon_inspected",
+                "image_digest_inspected",
+                "image_config_inspected",
+                "fixed_argv",
+                "production_path_unavailable",
+            ),
         )
         self._attestation = attestation
         return attestation
@@ -1286,63 +1305,6 @@ class SubprocessDockerRunner:
             raise RuntimeConfigurationError("Docker cleanup command failed")
 
 
-class _ClosedProductionRunner:
-    """The only runner path that may produce a production attestation.
-
-    The supervisor never accepts this object from a caller.  Its entrypoints
-    are captured from the concrete Docker adapter at module construction time,
-    and the adapter itself must obtain the attestation from bounded Docker
-    daemon/image inspection before it can create or attach to a container.
-    Caller-owned runners therefore remain test seams even when they imitate
-    the concrete adapter or return a production-shaped value.
-    """
-
-    _ATTEST = SubprocessDockerRunner.attest_invocation
-    _LAUNCH = SubprocessDockerRunner.launch
-    _CLEANUP = SubprocessDockerRunner.cleanup
-
-    def __init__(self) -> None:
-        self._implementation = SubprocessDockerRunner()
-
-    def attest_invocation(
-        self,
-        argv: Sequence[str],
-        *,
-        client_env: Mapping[str, str],
-    ) -> EnforcementAttestation:
-        return self._ATTEST(self._implementation, argv, client_env=client_env)
-
-    def launch(
-        self,
-        argv: Sequence[str],
-        *,
-        client_env: Mapping[str, str],
-        input_bytes: bytes,
-    ) -> InvocationProcess:
-        return self._LAUNCH(
-            self._implementation,
-            argv,
-            client_env=client_env,
-            input_bytes=input_bytes,
-        )
-
-    def cleanup(
-        self,
-        container_name: str,
-        *,
-        stop_timeout_seconds: float,
-        kill_timeout_seconds: float,
-        remove_timeout_seconds: float,
-    ) -> CleanupReport:
-        return self._CLEANUP(
-            self._implementation,
-            container_name,
-            stop_timeout_seconds=stop_timeout_seconds,
-            kill_timeout_seconds=kill_timeout_seconds,
-            remove_timeout_seconds=remove_timeout_seconds,
-        )
-
-
 class InvocationSupervisor:
     """Run, bound, reconcile, and dispose of exactly one invocation."""
 
@@ -1364,8 +1326,6 @@ class InvocationSupervisor:
             raise RuntimeConfigurationError("invocation supervisor requires host lease authority")
         self.policy = policy
         self.runner = runner
-        self._runner_is_injected = runner is not None
-        self._production_runner = _ClosedProductionRunner() if runner is None else None
         self.terminal_port = terminal_port
         self.lease_authority = lease_authority
         self.lease_binding = lease_binding
@@ -1384,38 +1344,35 @@ class InvocationSupervisor:
         self._death_receipts: dict[tuple[str, str], TerminalReconciliationReceipt | None] = {}
 
     def _attest(self, argv: Sequence[str]) -> EnforcementAttestation:
-        runner = self.runner if self._runner_is_injected else self._production_runner
+        runner = self.runner
         attest = getattr(runner, "attest_invocation", None)
         if not callable(attest):
-            raise RuntimeConfigurationError("runner has no evidence-based enforcement attestation")
+            raise RuntimeConfigurationError(
+                "production enforcement path is unavailable; runner evidence is not configured"
+            )
         result = attest(argv, client_env=dict(_DOCKER_CLIENT_ENV))
-        if not isinstance(result, EnforcementAttestation):
+        if type(result) is not EnforcementAttestation:
             raise RuntimeConfigurationError("runner returned an invalid enforcement attestation")
         expected_name = self._container_name_from_argv(argv)
         if result.argv_digest != _argv_digest(argv) or result.container_name != expected_name:
             raise BindingError("runner enforcement attestation is not bound to exact argv")
-        if self._runner_is_injected:
-            if result.is_production:
-                raise RuntimeConfigurationError(
-                    "caller-supplied runners are test-classified and cannot attest production enforcement"
-                )
-        else:
-            required_evidence = {
-                "daemon_inspected",
-                "image_digest_inspected",
-                "image_config_inspected",
-                "fixed_argv",
-            }
-            if not result.is_production or not required_evidence.issubset(result.evidence):
-                raise RuntimeConfigurationError(
-                    "closed production runner did not prove concrete Docker enforcement"
-                )
-        return result
+        if result.classification != "test":
+            raise RuntimeConfigurationError(
+                "production enforcement path is unavailable; runner attestations are test-only"
+            )
+        return EnforcementAttestation(
+            classification="test",
+            argv_digest=_argv_digest(argv),
+            container_name=expected_name,
+            evidence=tuple(dict.fromkeys((*result.evidence, "production_path_unavailable"))),
+        )
 
     def _active_runner(self) -> DockerRunner:
-        runner = self.runner if self._runner_is_injected else self._production_runner
+        runner = self.runner
         if runner is None:  # pragma: no cover - constructor establishes this invariant
-            raise RuntimeConfigurationError("invocation runner is not configured")
+            raise RuntimeConfigurationError(
+                "production enforcement path is unavailable; runner is not configured"
+            )
         return runner
 
     @staticmethod

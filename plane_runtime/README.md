@@ -92,15 +92,18 @@ terminal proposal, and one exit; it never emits a reconciliation receipt or
 Plane proof. The trusted supervisor validates the exact run, invocation,
 snapshot, lease, sequence, and proposal bindings, then submits the proposal
 once through its injected `TerminalReconciliationPort`. Product status is
-derived only from the accepted host receipt.
+derived only from the accepted host receipt. The current foundation has no
+trusted production entrypoint, so every accepted runner attestation is
+explicitly test-only and `production_completed` is permanently false.
 
 The fixed child command uses `docker create`, `start`, and `attach` with
 module-private network, namespace, privilege, mount, environment, logging,
 storage, and cleanup controls. `SubprocessDockerRunner` performs bounded
-daemon, image, and post-launch inspections and rejects ambiguity. Caller-owned
-runners are explicit test seams and cannot produce a `production_completed`
-result; the only production path is an internal closed runner whose concrete
-Docker evidence is inspected before launch. The attach client is terminated,
+daemon, image, and post-launch inspections and rejects ambiguity, but those
+checks are test/integration evidence only until the real kernel/service
+binding exists. Caller-owned runners are explicit test seams and cannot
+produce a `production_completed` result; there is deliberately no mutable
+closed-runner production path to replace. The attach client is terminated,
 killed if necessary, and reaped on every collector exit before container
 cleanup. Results are retained under a fixed bound, with overflow returned as
 supervisor action required without inserting past the cap. Cleanup proves
@@ -110,10 +113,13 @@ The package does not claim a real Hermes `KernelPort`, provider credentials,
 Operation Gateway, deployment, checkpoint service, or generated TypeScript
 isolation. Real Docker enforcement is unproven unless a local daemon and
 already-present digest-pinned image pass the inspection path; this slice does
-not pull images or contact a registry. The production CLI fails closed until a
-real kernel binding is installed. The trusted `serve_once` function remains a
-host/test convenience; fixture/demo authorities are not command-line runtime
-entrypoints.
+not pull images or contact a registry. More importantly, a passing Docker
+inspection alone is not the missing production entrypoint: a real Hermes
+kernel/service binding and its trusted host-owned evidence path are still
+absent. Current supervisor executions remain explicitly non-production and
+fail closed on production-shaped runner attestations. The trusted
+`serve_once` function remains a host/test convenience; fixture/demo
+authorities are not command-line runtime entrypoints.
 
 Verify the package from the repository root:
 
