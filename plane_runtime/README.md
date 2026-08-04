@@ -47,15 +47,20 @@ canonical event bytes. Transcript, artifact, input, outcome, and message
 proposal categories each have bounded counts and bytes; sequence and
 idempotency indexes and the optional observation tail are bounded as well.
 Terminal proposals and reconciliation receipts are each capped at 128 KiB.
-An accepted receipt must prove the operation, application, gateway, audit,
-terminal product event, and the exact kind-specific product receipts bound to
-the run, invocation, actor, workspace, snapshot, terminal slot, and proposal
-digest.
+An accepted receipt carries exactly five typed `TerminalProof` values—operation
+attempt, application, gateway, audit, and terminal product event. Each proof
+binds its kind/resource and proof identity to the exact run, invocation, actor,
+workspace, snapshot, terminal slot, terminal kind, and proposal digest. The
+receipt also carries exact kind-specific product receipts with the same
+binding. Cancellation uses a dedicated `CancellationAuthorityReceipt`; its
+resource, principal, snapshot, idempotency, gateway, and audit fields are
+serialized losslessly and validated before the terminal slot is reconciled.
 
 `adapter.py` exposes the narrow `KernelPort` seam. `FakeKernel` is a
 deterministic implementation for contract tests; a real Hermes implementation
 can be added behind the same seam without changing Hermes core modules.
-`service.py` provides a deliberately minimal one-invocation JSON-lines host and
+`service.py` provides a deliberately minimal one-invocation JSON-lines host,
+with a finite composite request bound and a bounded byte/frame reader, and
 accepts an injected cancellation signal plus an independent canonical
 cancellation authority. The signal is never treated as authority.
 Unexpected internal exceptions are retained only by the protected failure hook

@@ -41,6 +41,7 @@ from plane_runtime import (
     AssignmentSnapshot,
     BindingError,
     BoundsError,
+    CancellationAuthorityReceipt,
     CanonicalLeaseBinding,
     CheckpointAttestation,
     ContractDigests,
@@ -73,6 +74,7 @@ from plane_runtime import (
     RunSnapshot,
     SequenceError,
     TerminalProposal,
+    TerminalProof,
     TerminalReconciliationReceipt,
     ToolPresentation,
     TranscriptObserved,
@@ -84,7 +86,12 @@ from plane_runtime import (
     reconcile_process_death,
 )
 from plane_runtime.adapter import KernelObservation, KernelRequest, KernelResult
-from plane_runtime.service import main as service_main, serve_once
+from plane_runtime.service import (
+    MAX_SERVICE_REQUEST_BYTES,
+    _read_bounded_request_line,
+    main as service_main,
+    serve_once,
+)
 
 
 TRUSTED_NOW = datetime(2026, 8, 4, tzinfo=timezone.utc)
@@ -137,6 +144,54 @@ def make_invocation(
         lease=RuntimeLease("lease:one", "host:one", "2099-01-01T00:00:00Z"),
         causation_ref="cause:one",
         cancellation_ref="cancel:one",
+    )
+
+
+def product_event_resource(receipt: TerminalReconciliationReceipt) -> str:
+    return next(
+        item.resource_ref for item in receipt.proofs if item.proof_kind == "product_event"
+    )
+
+
+def typed_terminal_proofs(proposal: TerminalProposal) -> tuple[TerminalProof, ...]:
+    prefixes = {
+        "operation_attempt": "operation",
+        "application": "application",
+        "gateway": "gateway",
+        "audit": "audit",
+        "product_event": "product-event",
+    }
+    return tuple(
+        TerminalProof(
+            proof_kind=proof_kind,
+            proof_ref=f"terminal-proof:{proof_kind}:{proposal.idempotency_key}",
+            resource_ref=f"{prefix}:{proposal.idempotency_key}",
+            run_id=proposal.run_id,
+            invocation_id=proposal.invocation_id,
+            actor_ref=proposal.actor_ref,
+            workspace_ref=proposal.workspace_ref,
+            snapshot_digest=proposal.snapshot_digest,
+            terminal_slot=proposal.idempotency_key,
+            terminal_kind=proposal.kind,
+            proposal_digest=proposal.digest(),
+        )
+        for proof_kind, prefix in prefixes.items()
+    )
+
+
+def cancellation_receipt(snapshot: RunSnapshot, invocation: InvocationEnvelope) -> CancellationAuthorityReceipt:
+    idempotency_key = f"cancel:{snapshot.run_id}:{invocation.invocation_id}"
+    return CancellationAuthorityReceipt(
+        resource_ref=invocation.cancellation_ref,
+        receipt_ref=f"cancel-receipt:{invocation.invocation_id}",
+        run_id=snapshot.run_id,
+        invocation_id=invocation.invocation_id,
+        actor_ref=snapshot.actor_ref,
+        workspace_ref=snapshot.workspace_ref,
+        snapshot_digest=snapshot.digest(),
+        idempotency_key=idempotency_key,
+        gateway_receipt_ref=f"gateway:{idempotency_key}",
+        audit_ref=f"audit:{idempotency_key}",
     )
 
 
@@ -193,12 +248,17 @@ def run_execute(*, snapshot: RunSnapshot, invocation: InvocationEnvelope, **kwar
         )
         kwargs.setdefault("checkpoint_attestation", attestation)
         kwargs.setdefault("checkpoint_authority", FixtureCheckpointAuthority([attestation]))
-    cancellation_receipt = ProductReceipt(
+    cancellation_receipt = CancellationAuthorityReceipt(
         resource_ref=invocation.cancellation_ref,
         receipt_ref=f"cancel-receipt:{invocation.invocation_id}",
         run_id=snapshot.run_id,
         invocation_id=invocation.invocation_id,
+        actor_ref=snapshot.actor_ref,
+        workspace_ref=snapshot.workspace_ref,
+        snapshot_digest=snapshot.digest(),
         idempotency_key=f"cancel:{snapshot.run_id}:{invocation.invocation_id}",
+        gateway_receipt_ref=f"gateway:cancel:{snapshot.run_id}:{invocation.invocation_id}",
+        audit_ref=f"audit:cancel:{snapshot.run_id}:{invocation.invocation_id}",
     )
     kwargs.setdefault(
         "cancellation_authority",
@@ -239,12 +299,17 @@ def serve_fixture(
         invocation.lease.expires_at,
     )
     if cancellation_authority is None:
-        cancellation_receipt = ProductReceipt(
+        cancellation_receipt = CancellationAuthorityReceipt(
             resource_ref=invocation.cancellation_ref,
             receipt_ref=f"cancel-receipt:{invocation.invocation_id}",
             run_id=snapshot.run_id,
             invocation_id=invocation.invocation_id,
+            actor_ref=snapshot.actor_ref,
+            workspace_ref=snapshot.workspace_ref,
+            snapshot_digest=snapshot.digest(),
             idempotency_key=f"cancel:{snapshot.run_id}:{invocation.invocation_id}",
+            gateway_receipt_ref=f"gateway:cancel:{snapshot.run_id}:{invocation.invocation_id}",
+            audit_ref=f"audit:cancel:{snapshot.run_id}:{invocation.invocation_id}",
         )
         cancellation_authority = FixtureCancellationAuthority([cancellation_receipt])
     output = StringIO()
@@ -398,6 +463,38 @@ class RaisingCancellationSignal:
         raise ValueError("cancellation signal secret must stay internal")
 
 
+class CountingLeaseAuthority:
+    def __init__(self, delegate) -> None:
+        self.delegate = delegate
+        self.calls = 0
+
+    def validate_lease(self, *, run, invocation, binding) -> None:
+        self.calls += 1
+        self.delegate.validate_lease(run=run, invocation=invocation, binding=binding)
+
+
+class CountingCheckpointAuthority:
+    def __init__(self, delegate) -> None:
+        self.delegate = delegate
+        self.calls = 0
+
+    def claim_checkpoint(self, *, run, invocation, attestation) -> None:
+        self.calls += 1
+        self.delegate.claim_checkpoint(
+            run=run, invocation=invocation, attestation=attestation
+        )
+
+
+class CountingCancellationAuthority:
+    def __init__(self, delegate) -> None:
+        self.delegate = delegate
+        self.calls = 0
+
+    def validate_cancellation(self, *, run, invocation):
+        self.calls += 1
+        return self.delegate.validate_cancellation(run=run, invocation=invocation)
+
+
 class ForgedReceiptPort:
     """Return one forged accepted receipt without applying any product mutation."""
 
@@ -463,7 +560,6 @@ class SharedTerminalPort:
                 if prior_proposal != proposal:
                     return TerminalReconciliationReceipt(
                         receipt_ref=f"rejected:{key}",
-                        audit_ref=f"audit:{key}:conflict",
                         run_id=proposal.run_id,
                         invocation_id=proposal.invocation_id,
                         kind=proposal.kind,
@@ -477,7 +573,7 @@ class SharedTerminalPort:
                 return receipt
             self.store[key] = (proposal, receipt)
             self.accepted.append(key)
-            self.product_events.append(receipt.product_event_ref or "")
+            self.product_events.append(product_event_resource(receipt))
             self.product_receipts.extend(receipt.product_receipts)
             return receipt
 
@@ -507,28 +603,20 @@ class SharedTerminalPort:
                 snapshot_digest=proposal.snapshot_digest,
                 terminal_slot=key,
                 proposal_digest=proposal.digest(),
+                terminal_kind=proposal.kind,
             )
             for index, (kind, resource_ref) in enumerate(required)
         )
         return TerminalReconciliationReceipt(
             receipt_ref=f"receipt:{key}",
-            audit_ref=f"audit:{key}",
             run_id=proposal.run_id,
             invocation_id=proposal.invocation_id,
             kind=proposal.kind,
             idempotency_key=key,
             accepted=True,
             legal_transition=True,
-            operation_ref=f"operation:{key}",
-            application_ref=f"application:{key}",
-            gateway_receipt_ref=f"gateway:{key}",
-            product_event_ref=product_event_ref,
+            proofs=typed_terminal_proofs(proposal),
             product_receipts=product_receipts,
-            actor_ref=proposal.actor_ref,
-            workspace_ref=proposal.workspace_ref,
-            snapshot_digest=proposal.snapshot_digest,
-            terminal_slot=key,
-            proposal_digest=proposal.digest(),
         )
 
     def _reconcile_file(self, proposal: TerminalProposal) -> TerminalReconciliationReceipt:
@@ -544,7 +632,6 @@ class SharedTerminalPort:
                 if prior["proposal"] != proposal.to_dict():
                     return TerminalReconciliationReceipt(
                         receipt_ref=f"rejected:{key}",
-                        audit_ref=f"audit:{key}:conflict",
                         run_id=proposal.run_id,
                         invocation_id=proposal.invocation_id,
                         kind=proposal.kind,
@@ -562,7 +649,7 @@ class SharedTerminalPort:
                 handle.flush()
                 os.fsync(handle.fileno())
                 self.accepted.append(key)
-                self.product_events.append(receipt.product_event_ref or "")
+                self.product_events.append(product_event_resource(receipt))
                 self.product_receipts.extend(receipt.product_receipts)
             return receipt
 
@@ -631,23 +718,35 @@ class RuntimeContractTests(unittest.TestCase):
             outcome_proposal=outcome,
         )
         receipt = TerminalReconciliationReceipt(
-            "terminal-receipt:one",
-            "audit:one",
-            snapshot.run_id,
-            invocation.invocation_id,
-            "completed",
-            terminal.idempotency_key,
-            True,
-            True,
-            operation_ref="operation:one",
-            application_ref="application:one",
-            gateway_receipt_ref="gateway:one",
-            product_event_ref="product-event:one",
-            actor_ref=snapshot.actor_ref,
-            workspace_ref=snapshot.workspace_ref,
-            snapshot_digest=snapshot.digest(),
-            terminal_slot=terminal.idempotency_key,
-            proposal_digest=terminal.digest(),
+            receipt_ref="terminal-receipt:one",
+            run_id=snapshot.run_id,
+            invocation_id=invocation.invocation_id,
+            kind="completed",
+            idempotency_key=terminal.idempotency_key,
+            accepted=True,
+            legal_transition=True,
+            proofs=tuple(
+                TerminalProof(
+                    proof_kind=proof_kind,
+                    proof_ref=f"terminal-proof:{proof_kind}:{terminal.idempotency_key}",
+                    resource_ref=f"{resource_prefix}:{terminal.idempotency_key}",
+                    run_id=snapshot.run_id,
+                    invocation_id=invocation.invocation_id,
+                    actor_ref=snapshot.actor_ref,
+                    workspace_ref=snapshot.workspace_ref,
+                    snapshot_digest=snapshot.digest(),
+                    terminal_slot=terminal.idempotency_key,
+                    terminal_kind="completed",
+                    proposal_digest=terminal.digest(),
+                )
+                for proof_kind, resource_prefix in (
+                    ("operation_attempt", "operation"),
+                    ("application", "application"),
+                    ("gateway", "gateway"),
+                    ("audit", "audit"),
+                    ("product_event", "product-event"),
+                )
+            ),
             product_receipts=(
                 ProductReceipt(
                     "submission:one",
@@ -661,6 +760,7 @@ class RuntimeContractTests(unittest.TestCase):
                     snapshot_digest=snapshot.digest(),
                     terminal_slot=terminal.idempotency_key,
                     proposal_digest=terminal.digest(),
+                    terminal_kind="completed",
                 ),
             ),
         )
@@ -873,7 +973,7 @@ class RuntimeContractTests(unittest.TestCase):
         self.assertEqual(len(port.receipts), 1)
         self.assertEqual(
             port.receipts[0].product_receipts[0].resource_ref,
-            port.receipts[0].product_event_ref,
+            product_event_resource(port.receipts[0]),
         )
 
     def test_multibyte_transcript_limit_fails_before_unbounded_retention(self) -> None:
@@ -939,6 +1039,74 @@ class RuntimeContractTests(unittest.TestCase):
         )
         self.assertEqual(exit_value.kind, "cancelled")
         self.assertEqual(exit_value.final_sequence, 1)
+
+    def test_cancellation_authority_receipt_is_lossless_and_fully_bound(self) -> None:
+        snapshot = make_snapshot()
+        invocation = make_invocation(snapshot, invocation_id="invocation:cancellation-roundtrip")
+        authority_receipt = cancellation_receipt(snapshot, invocation)
+        self.assertEqual(
+            CancellationAuthorityReceipt.from_json(authority_receipt.to_json()),
+            authority_receipt,
+        )
+
+        cancellation = MutableCancellation()
+        cancellation.cancel()
+        port = FixtureTerminalReconciliationPort()
+        exit_value = run_execute(
+            snapshot=snapshot,
+            invocation=invocation,
+            cancellation=cancellation,
+            cancellation_authority=FixtureCancellationAuthority([authority_receipt]),
+            terminal_port=port,
+        )
+        self.assertEqual(exit_value.kind, "cancelled")
+        proposal = port.proposals[0]
+        self.assertEqual(
+            TerminalProposal.from_json(proposal.to_json()),
+            proposal,
+        )
+        self.assertEqual(proposal.cancellation_receipt, authority_receipt)
+        self.assertEqual(len(port.product_events), 1)
+
+        wrong_values = {
+            "run_id": "run:forged",
+            "invocation_id": "invocation:forged",
+            "actor_ref": "agent:forged",
+            "workspace_ref": "workspace:forged",
+            "snapshot_digest": "digest:forged",
+            "resource_ref": "cancel:forged",
+            "idempotency_key": "cancel:forged",
+            "gateway_receipt_ref": "gateway:forged",
+            "audit_ref": "audit:forged",
+        }
+        for field_name, value in wrong_values.items():
+            with self.subTest(field_name=field_name):
+                forged = replace(authority_receipt, **{field_name: value})
+                forged_port = FixtureTerminalReconciliationPort()
+                with self.assertRaises(BindingError):
+                    run_execute(
+                        snapshot=snapshot,
+                        invocation=invocation,
+                        cancellation=cancellation,
+                        cancellation_authority=FixtureCancellationAuthority([forged]),
+                        terminal_port=forged_port,
+                    )
+                self.assertEqual(forged_port.product_events, [])
+
+        wrong_kind = replace(authority_receipt)
+        object.__setattr__(wrong_kind, "kind", "terminal_event")
+        with self.assertRaises(BindingError):
+            run_execute(
+                snapshot=snapshot,
+                invocation=invocation,
+                cancellation=cancellation,
+                cancellation_authority=FixtureCancellationAuthority([wrong_kind]),
+                terminal_port=FixtureTerminalReconciliationPort(),
+            )
+        missing_kind = authority_receipt.to_dict()
+        del missing_kind["kind"]
+        with self.assertRaises(ContractError):
+            CancellationAuthorityReceipt.from_dict(missing_kind)
 
     def test_canonical_lease_authority_binds_all_fields_atomically(self) -> None:
         self.assertEqual(parse_utc_timestamp("2026-08-04T00:00:00Z"), datetime(2026, 8, 4, tzinfo=timezone.utc))
@@ -1125,6 +1293,74 @@ class RuntimeContractTests(unittest.TestCase):
             )
         self.assertEqual(len(kernel.requests), 1)
 
+    def test_runtime_configuration_is_checked_before_authority_and_retry_keeps_checkpoint(self) -> None:
+        snapshot = make_snapshot()
+        invocation = make_invocation(
+            snapshot,
+            invocation_id="invocation:configured-retry",
+            trigger=InvocationTrigger("continuation", "event:answer"),
+            checkpoint_ref="checkpoint:retry",
+        )
+        binding = CanonicalLeaseBinding(
+            snapshot.run_id,
+            invocation.invocation_id,
+            "lease:one",
+            "host:one",
+            True,
+            invocation.lease.expires_at,
+        )
+        lease_authority = CountingLeaseAuthority(
+            FixtureCanonicalLeaseAuthority([binding], clock=lambda: TRUSTED_NOW)
+        )
+        attestation = CheckpointAttestation(
+            checkpoint_ref=invocation.checkpoint_ref,
+            source_run_id=snapshot.run_id,
+            source_invocation_id="invocation:source",
+            snapshot_digest=snapshot.digest(),
+            actor_ref=snapshot.actor_ref,
+            profile_version=snapshot.profile_version,
+            continuation_event_ref="event:answer",
+            continuation_trigger_kind="continuation",
+            allowed_target_invocation_id=invocation.invocation_id,
+        )
+        checkpoint_authority = CountingCheckpointAuthority(
+            FixtureCheckpointAuthority([attestation])
+        )
+        cancellation = cancellation_receipt(snapshot, invocation)
+        cancellation_authority = CountingCancellationAuthority(
+            FixtureCancellationAuthority([cancellation])
+        )
+
+        with self.assertRaises(ContractError):
+            execute(
+                run=snapshot,
+                invocation=invocation,
+                lease_authority=lease_authority,
+                lease_binding=binding,
+                checkpoint_authority=checkpoint_authority,
+                checkpoint_attestation=attestation,
+                cancellation_authority=cancellation_authority,
+                terminal_port=None,
+            )
+        self.assertEqual(lease_authority.calls, 0)
+        self.assertEqual(checkpoint_authority.calls, 0)
+        self.assertEqual(cancellation_authority.calls, 0)
+
+        exit_value = execute(
+            run=snapshot,
+            invocation=invocation,
+            lease_authority=lease_authority,
+            lease_binding=binding,
+            checkpoint_authority=checkpoint_authority,
+            checkpoint_attestation=attestation,
+            cancellation_authority=cancellation_authority,
+            terminal_port=FixtureTerminalReconciliationPort(),
+        )
+        self.assertEqual(exit_value.kind, "completed")
+        self.assertEqual(lease_authority.calls, 1)
+        self.assertEqual(checkpoint_authority.calls, 1)
+        self.assertEqual(cancellation_authority.calls, 0)
+
     def test_input_requests_are_authorized_receipt_correlated_and_terminally_consistent(self) -> None:
         snapshot = make_snapshot()
         port = FixtureTerminalReconciliationPort()
@@ -1295,7 +1531,7 @@ class RuntimeContractTests(unittest.TestCase):
         self.assertEqual(len(port.receipts), 1)
         self.assertEqual(
             port.receipts[0].product_receipts[0].resource_ref,
-            port.receipts[0].product_event_ref,
+            product_event_resource(port.receipts[0]),
         )
 
     def test_synchronized_runtime_and_supervisor_race_has_one_product_event(self) -> None:
@@ -1341,7 +1577,7 @@ class RuntimeContractTests(unittest.TestCase):
         self.assertEqual(len(port.product_events), 1)
         self.assertEqual(
             port.receipts[0].product_receipts[0].resource_ref,
-            port.receipts[0].product_event_ref,
+            product_event_resource(port.receipts[0]),
         )
 
     def test_exact_runtime_replay_returns_the_same_atomic_receipt(self) -> None:
@@ -1357,7 +1593,10 @@ class RuntimeContractTests(unittest.TestCase):
 
     def test_accepted_receipt_proof_is_complete_and_exact(self) -> None:
         def missing_application(receipt: TerminalReconciliationReceipt):
-            object.__setattr__(receipt, "application_ref", None)
+            proofs = tuple(
+                item for item in receipt.proofs if item.proof_kind != "application"
+            )
+            object.__setattr__(receipt, "proofs", proofs)
             return receipt
 
         def wrong_product_kind(receipt: TerminalReconciliationReceipt):
@@ -1370,11 +1609,13 @@ class RuntimeContractTests(unittest.TestCase):
             return receipt
 
         def wrong_binding(receipt: TerminalReconciliationReceipt):
-            object.__setattr__(receipt, "actor_ref", "agent:forged")
+            proof = next(item for item in receipt.proofs if item.proof_kind == "audit")
+            object.__setattr__(proof, "actor_ref", "agent:forged")
             return receipt
 
         def forged_proposal_digest(receipt: TerminalReconciliationReceipt):
-            object.__setattr__(receipt, "proposal_digest", "digest:forged")
+            proof = next(item for item in receipt.proofs if item.proof_kind == "product_event")
+            object.__setattr__(proof, "proposal_digest", "digest:forged")
             return receipt
 
         for index, forge in enumerate(
@@ -1395,6 +1636,99 @@ class RuntimeContractTests(unittest.TestCase):
                     invocation,
                     terminal_port=port,
                 )
+                self.assertEqual(status, 1)
+                self.assertEqual(port.calls, 1)
+                self.assertEqual(port.product_events, [])
+                self.assertEqual(lines[-1]["type"], "reconciliation_request")
+
+        def replace_proof(receipt: TerminalReconciliationReceipt, proof_kind: str, **changes):
+            proofs = tuple(
+                replace(item, **changes) if item.proof_kind == proof_kind else item
+                for item in receipt.proofs
+            )
+            object.__setattr__(receipt, "proofs", proofs)
+            return receipt
+
+        for proof_kind in (
+            "operation_attempt",
+            "application",
+            "gateway",
+            "audit",
+            "product_event",
+        ):
+            with self.subTest(proof_kind=proof_kind):
+                snapshot = make_snapshot()
+                invocation = make_invocation(snapshot, invocation_id=f"invocation:replace:{proof_kind}")
+                port = ForgedReceiptPort(
+                    lambda receipt, proof_kind=proof_kind: replace_proof(
+                        receipt, proof_kind, resource_ref="resource:forged"
+                    )
+                )
+                status, lines, _ = serve_fixture(snapshot, invocation, terminal_port=port)
+                self.assertEqual(status, 1)
+                self.assertEqual(port.calls, 1)
+                self.assertEqual(port.product_events, [])
+                self.assertEqual(lines[-1]["type"], "reconciliation_request")
+
+        for field_name, forged_value in {
+            "run_id": "run:forged",
+            "invocation_id": "invocation:forged",
+            "actor_ref": "agent:forged",
+            "workspace_ref": "workspace:forged",
+            "snapshot_digest": "snapshot:forged",
+            "terminal_slot": "terminal:forged",
+            "terminal_kind": "failed",
+            "proposal_digest": "digest:forged",
+        }.items():
+            with self.subTest(proof_field=field_name):
+                snapshot = make_snapshot()
+                invocation = make_invocation(snapshot, invocation_id=f"invocation:field:{field_name}")
+
+                def forge_field(receipt, field_name=field_name, forged_value=forged_value):
+                    proof = next(
+                        item for item in receipt.proofs if item.proof_kind == "audit"
+                    )
+                    object.__setattr__(proof, field_name, forged_value)
+                    return receipt
+
+                port = ForgedReceiptPort(forge_field)
+                status, lines, _ = serve_fixture(snapshot, invocation, terminal_port=port)
+                self.assertEqual(status, 1)
+                self.assertEqual(port.calls, 1)
+                self.assertEqual(port.product_events, [])
+                self.assertEqual(lines[-1]["type"], "reconciliation_request")
+
+        for forge_name, forge in (
+            (
+                "duplicate_shared_resource",
+                lambda receipt: replace_proof(
+                    receipt,
+                    "application",
+                    resource_ref=next(
+                        item.resource_ref
+                        for item in receipt.proofs
+                        if item.proof_kind == "operation_attempt"
+                    ),
+                ),
+            ),
+            (
+                "wrong_terminal_kind",
+                lambda receipt: replace_proof(
+                    receipt, "audit", terminal_kind="failed"
+                ),
+            ),
+            (
+                "wrong_proof_kind",
+                lambda receipt: replace_proof(
+                    receipt, "audit", proof_kind="gateway"
+                ),
+            ),
+        ):
+            with self.subTest(forge_name=forge_name):
+                snapshot = make_snapshot()
+                invocation = make_invocation(snapshot, invocation_id=f"invocation:{forge_name}")
+                port = ForgedReceiptPort(forge)
+                status, lines, _ = serve_fixture(snapshot, invocation, terminal_port=port)
                 self.assertEqual(status, 1)
                 self.assertEqual(port.calls, 1)
                 self.assertEqual(port.product_events, [])
@@ -1436,7 +1770,7 @@ class RuntimeContractTests(unittest.TestCase):
         self.assertLessEqual(len(port.receipts[0].product_receipts), 128)
         self.assertEqual(
             port.receipts[0].product_receipts[0].resource_ref,
-            port.receipts[0].product_event_ref,
+            product_event_resource(port.receipts[0]),
         )
 
     def test_terminal_proposal_rejects_wrong_kind_and_forged_required_evidence(self) -> None:
@@ -1466,8 +1800,17 @@ class RuntimeContractTests(unittest.TestCase):
                 evidence_receipt_refs=("receipt:other",),
                 outcome_proposal=outcome,
             )
-        forged_cancellation = ProductReceipt(
-            "cancel:one", "receipt:cancel", "run:other", "invocation:one", "cancel:one"
+        forged_cancellation = CancellationAuthorityReceipt(
+            resource_ref="cancel:one",
+            receipt_ref="receipt:cancel",
+            run_id="run:other",
+            invocation_id="invocation:one",
+            actor_ref="agent:one",
+            workspace_ref="workspace:one",
+            snapshot_digest="snapshot:one",
+            idempotency_key="cancel:run:other:invocation:one",
+            gateway_receipt_ref="gateway:cancel:run:other:invocation:one",
+            audit_ref="audit:cancel:run:other:invocation:one",
         )
         with self.assertRaises(BindingError):
             TerminalProposal(
@@ -1595,6 +1938,9 @@ class RuntimeContractTests(unittest.TestCase):
         self.assertIsNotNone(exact_snapshot, "the snapshot byte boundary must be reachable")
         assert exact_snapshot is not None
         self.assertEqual(len(exact_snapshot.to_json().encode("utf-8")), MAX_RUN_SNAPSHOT_BYTES)
+        self.assertEqual(RunSnapshot.from_json(exact_snapshot.to_json()), exact_snapshot)
+        with self.assertRaises(BoundsError):
+            RunSnapshot.from_json(exact_snapshot.to_json() + " ")
         last = exact_snapshot.assignment.acceptance_criteria[-1]
         with self.assertRaises(BoundsError):
             replace(
@@ -1628,6 +1974,9 @@ class RuntimeContractTests(unittest.TestCase):
         self.assertIsNotNone(exact_invocation, "the invocation byte boundary must be reachable")
         assert exact_invocation is not None
         self.assertEqual(len(exact_invocation.to_json().encode("utf-8")), MAX_INVOCATION_BYTES)
+        self.assertEqual(InvocationEnvelope.from_json(exact_invocation.to_json()), exact_invocation)
+        with self.assertRaises(BoundsError):
+            InvocationEnvelope.from_json(exact_invocation.to_json() + " ")
         last = exact_invocation.new_context_event_refs[-1]
         with self.assertRaises(BoundsError):
             replace(exact_invocation, new_context_event_refs=exact_invocation.new_context_event_refs[:-1] + (last + "x",))
@@ -1672,6 +2021,53 @@ class RuntimeContractTests(unittest.TestCase):
         self.assertEqual([line["type"] for line in second_lines].count("exit"), 1)
         self.assertEqual(second_lines[-1]["exit"]["kind"], "completed")  # type: ignore[index]
         self.assertGreaterEqual(sum(line["type"] == "event" for line in second_lines), 3)
+
+    def test_service_frame_reader_bounds_bytes_and_stops_at_one_line(self) -> None:
+        snapshot = make_snapshot()
+        invocation = make_invocation(snapshot)
+        valid = json.dumps(
+            {"run": snapshot.to_dict(), "invocation": invocation.to_dict()},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        stream = StringIO(valid + "\n" + ("x" * (MAX_SERVICE_REQUEST_BYTES + 1)) + "\n")
+        self.assertEqual(_read_bounded_request_line(stream), valid)
+        self.assertLess(stream.tell(), len(valid) + MAX_SERVICE_REQUEST_BYTES)
+
+        exact_frame = "x" * MAX_SERVICE_REQUEST_BYTES
+        self.assertEqual(
+            _read_bounded_request_line(StringIO(exact_frame + "\n")), exact_frame
+        )
+        with self.assertRaises(BoundsError):
+            _read_bounded_request_line(StringIO("a" * (MAX_SERVICE_REQUEST_BYTES + 1) + "\n"))
+        with self.assertRaises(BoundsError):
+            _read_bounded_request_line(
+                StringIO("é" * ((MAX_SERVICE_REQUEST_BYTES // 2) + 1) + "\n")
+            )
+        with self.assertRaises(BoundsError):
+            _read_bounded_request_line(StringIO(valid))
+
+    def test_service_rejects_oversized_composite_and_unterminated_frames_before_decode(self) -> None:
+        oversized = "{" + ("a" * (MAX_SERVICE_REQUEST_BYTES + 1)) + "}\n"
+        with patch("sys.stdin", StringIO(oversized)), patch("sys.stdout", StringIO()):
+            self.assertEqual(service_main(["--once"]), 2)
+
+        snapshot = make_snapshot()
+        invocation = make_invocation(snapshot)
+        request = json.dumps(
+            {"run": snapshot.to_dict(), "invocation": invocation.to_dict()},
+            separators=(",", ":"),
+        )
+        with patch("sys.stdin", StringIO(request)), patch("sys.stdout", StringIO()):
+            self.assertEqual(service_main(["--once"]), 2)
+
+    def test_snapshot_and_invocation_raw_multibyte_and_mib_bounds_fail_before_decode(self) -> None:
+        for parser in (RunSnapshot.from_json, InvocationEnvelope.from_json):
+            with self.subTest(parser=parser):
+                with self.assertRaises(BoundsError):
+                    parser("é" * (1_048_576 // 2 + 1))
+                with self.assertRaises(BoundsError):
+                    parser("a" * (1_048_576 + 1))
 
     def test_service_request_rejects_unknown_fields(self) -> None:
         snapshot = make_snapshot()
@@ -2135,12 +2531,17 @@ class RuntimeContractTests(unittest.TestCase):
         invocation = make_invocation(snapshot, invocation_id="invocation:wrong-cancel-ref")
         cancellation = MutableCancellation()
         cancellation.cancel()
-        forged_receipt = ProductReceipt(
-            "cancel:forged",
-            "receipt:forged",
-            snapshot.run_id,
-            invocation.invocation_id,
-            "cancel:forged",
+        forged_receipt = CancellationAuthorityReceipt(
+            resource_ref="cancel:forged",
+            receipt_ref=f"cancel-receipt:{invocation.invocation_id}",
+            run_id=snapshot.run_id,
+            invocation_id=invocation.invocation_id,
+            actor_ref=snapshot.actor_ref,
+            workspace_ref=snapshot.workspace_ref,
+            snapshot_digest=snapshot.digest(),
+            idempotency_key=f"cancel:{snapshot.run_id}:{invocation.invocation_id}",
+            gateway_receipt_ref=f"gateway:cancel:{snapshot.run_id}:{invocation.invocation_id}",
+            audit_ref=f"audit:cancel:{snapshot.run_id}:{invocation.invocation_id}",
         )
         port = FixtureTerminalReconciliationPort()
         status, lines, _ = serve_fixture(

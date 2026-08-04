@@ -11,7 +11,7 @@ import argparse
 import json
 import sys
 from datetime import datetime, timezone
-from typing import Any, Callable, TextIO
+from typing import Any, BinaryIO, Callable, TextIO
 
 from .adapter import (
     CanonicalLeaseAuthority,
@@ -36,10 +36,15 @@ from .adapter import (
 )
 from .contract import (
     AssignmentSnapshot,
+    BoundsError,
     ContractDigests,
     ContractError,
     BindingError,
     InvocationEnvelope,
+    MAX_INVOCATION_BYTES,
+    MAX_REFERENCE_LENGTH,
+    MAX_RUN_SNAPSHOT_BYTES,
+    MAX_TEXT_LENGTH,
     MAX_NEW_CONTEXT_EVENT_REFS,
     OperationDescriptor,
     RuntimeFailure,
@@ -50,11 +55,63 @@ from .contract import (
     TerminalProposal,
     ToolPresentation,
     VersionedContextRef,
+    _check_raw_wire_size,
 )
 
 
 GENERIC_RUNTIME_FAILURE = "runtime execution failed; Plane reconciliation is required"
 InternalFailureHook = Callable[[Exception], None]
+
+# The request carries two independently bounded contracts plus the bounded
+# fake-kernel configuration used only by this deterministic service fixture.
+# The factor of three covers the largest UTF-8-to-JSON-escape expansion before
+# the composite frame is decoded; the final allowance covers object framing.
+MAX_FAKE_PLAN_BYTES = 2 * MAX_TEXT_LENGTH + 2 * MAX_REFERENCE_LENGTH + 8 * 1024
+MAX_SERVICE_REQUEST_BYTES = (
+    3 * MAX_RUN_SNAPSHOT_BYTES
+    + 3 * MAX_INVOCATION_BYTES
+    + MAX_FAKE_PLAN_BYTES
+    + 16 * 1024
+)
+
+
+def _read_bounded_request_line(stream: TextIO) -> str:
+    """Read one complete UTF-8 JSON-lines frame without unbounded buffering."""
+
+    source: BinaryIO | TextIO = getattr(stream, "buffer", stream)
+    frame = bytearray()
+    while len(frame) < MAX_SERVICE_REQUEST_BYTES + 1:
+        raw = source.read(1)
+        if not raw:
+            break
+        if isinstance(raw, str):
+            try:
+                raw_bytes = raw.encode("utf-8")
+            except UnicodeEncodeError as exc:
+                raise ContractError("service request must be valid UTF-8") from exc
+        else:
+            raw_bytes = raw
+        if not isinstance(raw_bytes, bytes) or not raw_bytes:
+            raise ContractError("service input stream returned an invalid frame")
+        frame.extend(raw_bytes)
+        if raw_bytes.endswith(b"\n"):
+            break
+    raw_bytes = bytes(frame)
+    if not raw_bytes:
+        return ""
+    if not raw_bytes.endswith(b"\n") or raw_bytes.count(b"\n") != 1:
+        raise BoundsError("service request must be one terminated JSON line")
+    frame = raw_bytes[:-1]
+    if frame.endswith(b"\r"):
+        frame = frame[:-1]
+    if len(frame) > MAX_SERVICE_REQUEST_BYTES:
+        raise BoundsError(
+            f"service request exceeds {MAX_SERVICE_REQUEST_BYTES} UTF-8 bytes"
+        )
+    try:
+        return frame.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ContractError("service request must be valid UTF-8") from exc
 
 
 class _DemoTerminalPort(FixtureTerminalReconciliationPort):
@@ -255,6 +312,13 @@ def _fake_plan(raw: Any) -> FakeKernelPlan:
         return FakeKernelPlan()
     if not isinstance(raw, dict):
         raise ContractError("fakePlan must be an object")
+    fake_plan_size = len(
+        json.dumps(raw, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode(
+            "utf-8"
+        )
+    )
+    if fake_plan_size > MAX_FAKE_PLAN_BYTES:
+        raise ContractError("fakePlan exceeds its bounded service request surface")
     unknown = sorted(set(raw).difference({
         "transcript",
         "transcriptRef",
@@ -339,6 +403,15 @@ def serve_once(
     invocation: InvocationEnvelope | None = None
     collector: EventCollector | None = None
     try:
+        if "\n" in request_line:
+            if not request_line.endswith("\n") or request_line.count("\n") != 1:
+                raise ContractError("service request must be one JSON line")
+            request_line = request_line[:-1]
+            if request_line.endswith("\r"):
+                request_line = request_line[:-1]
+        request_line = _check_raw_wire_size(
+            request_line, "serviceRequest", MAX_SERVICE_REQUEST_BYTES
+        )
         request = json.loads(request_line)
         if not isinstance(request, dict):
             raise ContractError("service request must be an object")
@@ -462,7 +535,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--once", action="store_true", help="accept one JSON-lines invocation (the default)")
     args = parser.parse_args(argv)
     del args
-    request_line = sys.stdin.readline()
+    try:
+        request_line = _read_bounded_request_line(sys.stdin)
+    except (BoundsError, ContractError):
+        return 2
     if not request_line:
         return 2
     try:

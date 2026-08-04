@@ -44,6 +44,7 @@ MAX_MESSAGE_PROPOSALS = 64
 MAX_MESSAGE_PROPOSAL_BYTES = 64 * 1024
 MAX_TERMINAL_PROPOSAL_BYTES = 128 * 1024
 MAX_TERMINAL_RECEIPT_BYTES = 128 * 1024
+MAX_TERMINAL_PROOFS = 5
 
 
 class ContractError(ValueError):
@@ -191,7 +192,10 @@ def _check_wire_size(value: Mapping[str, Any], name: str, maximum: int) -> None:
 def _check_raw_wire_size(raw: Any, name: str, maximum: int) -> str:
     if not isinstance(raw, str):
         raise ContractError(f"{name} JSON must be a string")
-    size = len(raw.encode("utf-8"))
+    try:
+        size = len(raw.encode("utf-8"))
+    except UnicodeEncodeError as exc:
+        raise ContractError(f"{name} JSON must be valid UTF-8 text") from exc
     if size > maximum:
         raise BoundsError(f"{name} JSON exceeds {maximum} UTF-8 bytes (got {size})")
     return raw
@@ -534,6 +538,7 @@ class RunSnapshot:
     @classmethod
     def from_json(cls, raw: str) -> "RunSnapshot":
         try:
+            raw = _check_raw_wire_size(raw, "runSnapshot", MAX_RUN_SNAPSHOT_BYTES)
             return cls.from_dict(json.loads(raw))
         except (TypeError, ValueError, json.JSONDecodeError) as exc:
             if isinstance(exc, ContractError):
@@ -701,6 +706,7 @@ class InvocationEnvelope:
     @classmethod
     def from_json(cls, raw: str) -> "InvocationEnvelope":
         try:
+            raw = _check_raw_wire_size(raw, "invocation", MAX_INVOCATION_BYTES)
             return cls.from_dict(json.loads(raw))
         except (TypeError, ValueError, json.JSONDecodeError) as exc:
             if isinstance(exc, ContractError):
@@ -1116,6 +1122,230 @@ class RuntimeExit:
             raise ContractError(f"invalid runtime exit JSON: {exc}") from exc
 
 
+TERMINAL_KINDS = frozenset(
+    {"completed", "waiting_for_input", "failed", "blocked", "cancelled"}
+)
+
+TERMINAL_PROOF_KINDS = frozenset(
+    {"operation_attempt", "application", "gateway", "audit", "product_event"}
+)
+
+
+@dataclass(frozen=True)
+class TerminalProof:
+    """One fully bound proof for a terminal reconciliation boundary."""
+
+    proof_kind: str
+    proof_ref: str
+    resource_ref: str
+    run_id: str
+    invocation_id: str
+    actor_ref: str
+    workspace_ref: str
+    snapshot_digest: str
+    terminal_slot: str
+    terminal_kind: str
+    proposal_digest: str
+
+    def __post_init__(self) -> None:
+        if self.proof_kind not in TERMINAL_PROOF_KINDS:
+            raise ContractError(f"unsupported terminal proof kind: {self.proof_kind!r}")
+        for name in (
+            "proof_ref",
+            "resource_ref",
+            "run_id",
+            "invocation_id",
+            "actor_ref",
+            "workspace_ref",
+            "snapshot_digest",
+            "terminal_slot",
+            "proposal_digest",
+        ):
+            object.__setattr__(
+                self,
+                name,
+                _require_text(getattr(self, name), f"terminalProof.{name}"),
+            )
+        if self.terminal_kind not in TERMINAL_KINDS:
+            raise ContractError(f"unsupported terminal proof terminal kind: {self.terminal_kind!r}")
+        prefixes = {
+            "operation_attempt": "operation",
+            "application": "application",
+            "gateway": "gateway",
+            "audit": "audit",
+            "product_event": "product-event",
+        }
+        if self.resource_ref != f"{prefixes[self.proof_kind]}:{self.terminal_slot}":
+            raise BindingError("terminal proof resource is not bound to its proof kind and slot")
+        if self.proof_ref != f"terminal-proof:{self.proof_kind}:{self.terminal_slot}":
+            raise BindingError("terminal proof identity is not bound to its proof kind and slot")
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "proofKind": self.proof_kind,
+            "proofRef": self.proof_ref,
+            "resourceRef": self.resource_ref,
+            "runId": self.run_id,
+            "invocationId": self.invocation_id,
+            "actorRef": self.actor_ref,
+            "workspaceRef": self.workspace_ref,
+            "snapshotDigest": self.snapshot_digest,
+            "terminalSlot": self.terminal_slot,
+            "terminalKind": self.terminal_kind,
+            "proposalDigest": self.proposal_digest,
+        }
+
+    @classmethod
+    def from_dict(cls, raw: Any) -> "TerminalProof":
+        data = _mapping(raw, "terminalProof")
+        _reject_unknown(
+            data,
+            {
+                "proofKind",
+                "proofRef",
+                "resourceRef",
+                "runId",
+                "invocationId",
+                "actorRef",
+                "workspaceRef",
+                "snapshotDigest",
+                "terminalSlot",
+                "terminalKind",
+                "proposalDigest",
+            },
+            "terminalProof",
+        )
+        return cls(
+            proof_kind=_require_text(data.get("proofKind"), "terminalProof.proofKind"),
+            proof_ref=_require_text(data.get("proofRef"), "terminalProof.proofRef"),
+            resource_ref=_require_text(data.get("resourceRef"), "terminalProof.resourceRef"),
+            run_id=_require_text(data.get("runId"), "terminalProof.runId"),
+            invocation_id=_require_text(data.get("invocationId"), "terminalProof.invocationId"),
+            actor_ref=_require_text(data.get("actorRef"), "terminalProof.actorRef"),
+            workspace_ref=_require_text(data.get("workspaceRef"), "terminalProof.workspaceRef"),
+            snapshot_digest=_require_text(
+                data.get("snapshotDigest"), "terminalProof.snapshotDigest"
+            ),
+            terminal_slot=_require_text(data.get("terminalSlot"), "terminalProof.terminalSlot"),
+            terminal_kind=_require_text(data.get("terminalKind"), "terminalProof.terminalKind"),
+            proposal_digest=_require_text(
+                data.get("proposalDigest"), "terminalProof.proposalDigest"
+            ),
+        )
+
+
+@dataclass(frozen=True)
+class CancellationAuthorityReceipt:
+    """Host-authoritative, invocation-bound cancellation receipt."""
+
+    resource_ref: str
+    receipt_ref: str
+    run_id: str
+    invocation_id: str
+    actor_ref: str
+    workspace_ref: str
+    snapshot_digest: str
+    idempotency_key: str
+    gateway_receipt_ref: str
+    audit_ref: str
+    kind: str = "cancellation"
+
+    def __post_init__(self) -> None:
+        for name in (
+            "resource_ref",
+            "receipt_ref",
+            "run_id",
+            "invocation_id",
+            "actor_ref",
+            "workspace_ref",
+            "snapshot_digest",
+            "idempotency_key",
+            "gateway_receipt_ref",
+            "audit_ref",
+        ):
+            object.__setattr__(
+                self,
+                name,
+                _require_text(getattr(self, name), f"cancellationReceipt.{name}"),
+            )
+        if self.kind != "cancellation":
+            raise ContractError("cancellation authority receipt must have cancellation kind")
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "resourceRef": self.resource_ref,
+            "receiptRef": self.receipt_ref,
+            "runId": self.run_id,
+            "invocationId": self.invocation_id,
+            "actorRef": self.actor_ref,
+            "workspaceRef": self.workspace_ref,
+            "snapshotDigest": self.snapshot_digest,
+            "idempotencyKey": self.idempotency_key,
+            "gatewayReceiptRef": self.gateway_receipt_ref,
+            "auditRef": self.audit_ref,
+            "kind": self.kind,
+        }
+
+    @classmethod
+    def from_dict(cls, raw: Any) -> "CancellationAuthorityReceipt":
+        data = _mapping(raw, "cancellationReceipt")
+        _reject_unknown(
+            data,
+            {
+                "resourceRef",
+                "receiptRef",
+                "runId",
+                "invocationId",
+                "actorRef",
+                "workspaceRef",
+                "snapshotDigest",
+                "idempotencyKey",
+                "gatewayReceiptRef",
+                "auditRef",
+                "kind",
+            },
+            "cancellationReceipt",
+        )
+        return cls(
+            resource_ref=_require_text(data.get("resourceRef"), "cancellationReceipt.resourceRef"),
+            receipt_ref=_require_text(data.get("receiptRef"), "cancellationReceipt.receiptRef"),
+            run_id=_require_text(data.get("runId"), "cancellationReceipt.runId"),
+            invocation_id=_require_text(
+                data.get("invocationId"), "cancellationReceipt.invocationId"
+            ),
+            actor_ref=_require_text(data.get("actorRef"), "cancellationReceipt.actorRef"),
+            workspace_ref=_require_text(
+                data.get("workspaceRef"), "cancellationReceipt.workspaceRef"
+            ),
+            snapshot_digest=_require_text(
+                data.get("snapshotDigest"), "cancellationReceipt.snapshotDigest"
+            ),
+            idempotency_key=_require_text(
+                data.get("idempotencyKey"), "cancellationReceipt.idempotencyKey"
+            ),
+            gateway_receipt_ref=_require_text(
+                data.get("gatewayReceiptRef"), "cancellationReceipt.gatewayReceiptRef"
+            ),
+            audit_ref=_require_text(data.get("auditRef"), "cancellationReceipt.auditRef"),
+            kind=_require_text(data.get("kind"), "cancellationReceipt.kind"),
+        )
+
+    def to_json(self) -> str:
+        payload = self.to_dict()
+        _check_wire_size(payload, "cancellationReceipt", MAX_TERMINAL_RECEIPT_BYTES)
+        return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+    @classmethod
+    def from_json(cls, raw: str) -> "CancellationAuthorityReceipt":
+        try:
+            raw = _check_raw_wire_size(raw, "cancellationReceipt", MAX_TERMINAL_RECEIPT_BYTES)
+            return cls.from_dict(json.loads(raw))
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            if isinstance(exc, ContractError):
+                raise
+            raise ContractError(f"invalid cancellation receipt JSON: {exc}") from exc
+
+
 @dataclass(frozen=True)
 class ProductReceipt:
     """Receipt returned by one narrow, host-authorized product operation."""
@@ -1131,6 +1361,7 @@ class ProductReceipt:
     snapshot_digest: str | None = None
     terminal_slot: str | None = None
     proposal_digest: str | None = None
+    terminal_kind: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "resource_ref", _require_text(self.resource_ref, "receipt.resourceRef"))
@@ -1145,6 +1376,7 @@ class ProductReceipt:
                 name,
                 _require_optional_text(getattr(self, name), f"receipt.{name}"),
             )
+        object.__setattr__(self, "terminal_kind", _require_optional_text(self.terminal_kind, "receipt.terminalKind"))
 
     def to_dict(self) -> dict[str, str]:
         return {
@@ -1159,6 +1391,7 @@ class ProductReceipt:
             "snapshotDigest": self.snapshot_digest,
             "terminalSlot": self.terminal_slot,
             "proposalDigest": self.proposal_digest,
+            "terminalKind": self.terminal_kind,
         }
 
     @classmethod
@@ -1178,6 +1411,7 @@ class ProductReceipt:
                 "snapshotDigest",
                 "terminalSlot",
                 "proposalDigest",
+                "terminalKind",
             },
             "productReceipt",
         )
@@ -1193,12 +1427,8 @@ class ProductReceipt:
             snapshot_digest=_require_optional_text(data.get("snapshotDigest"), "receipt.snapshotDigest"),
             terminal_slot=_require_optional_text(data.get("terminalSlot"), "receipt.terminalSlot"),
             proposal_digest=_require_optional_text(data.get("proposalDigest"), "receipt.proposalDigest"),
+            terminal_kind=_require_optional_text(data.get("terminalKind"), "receipt.terminalKind"),
         )
-
-
-TERMINAL_KINDS = frozenset(
-    {"completed", "waiting_for_input", "failed", "blocked", "cancelled"}
-)
 
 
 @dataclass(frozen=True)
@@ -1384,7 +1614,7 @@ class TerminalProposal:
     source: str = "runtime"
     outcome_proposal: OutcomeProposal | None = None
     input_request_proposal: InputRequestProposal | None = None
-    cancellation_receipt: ProductReceipt | None = None
+    cancellation_receipt: CancellationAuthorityReceipt | None = None
     artifact_proposals: tuple[ArtifactProposal, ...] = ()
     message_proposals: tuple[MessageProposal, ...] = ()
 
@@ -1481,7 +1711,10 @@ class TerminalProposal:
                 raise ContractError("cancelled terminal proposal requires cancellation authority evidence")
             if self.outcome_proposal is not None or self.input_request_proposal is not None:
                 raise ContractError("cancelled terminal proposal has wrong-kind evidence")
-            if self.cancellation_receipt.run_id != self.run_id or self.cancellation_receipt.invocation_id != self.invocation_id:
+            if (
+                self.cancellation_receipt.run_id != self.run_id
+                or self.cancellation_receipt.invocation_id != self.invocation_id
+            ):
                 raise BindingError("cancellation evidence is bound to a different invocation")
             if self.cancellation_receipt.receipt_ref not in receipt_refs:
                 raise ContractError("cancelled terminal proposal evicted mandatory cancellation evidence")
@@ -1516,15 +1749,7 @@ class TerminalProposal:
                 self.input_request_proposal.to_dict() if self.input_request_proposal else None
             ),
             "cancellationReceipt": (
-                {
-                    "resourceRef": self.cancellation_receipt.resource_ref,
-                    "receiptRef": self.cancellation_receipt.receipt_ref,
-                    "runId": self.cancellation_receipt.run_id,
-                    "invocationId": self.cancellation_receipt.invocation_id,
-                    "idempotencyKey": self.cancellation_receipt.idempotency_key,
-                }
-                if self.cancellation_receipt
-                else None
+                self.cancellation_receipt.to_dict() if self.cancellation_receipt else None
             ),
             "artifactProposals": [item.to_dict() for item in self.artifact_proposals],
             "messageProposals": [item.to_dict() for item in self.message_proposals],
@@ -1594,7 +1819,7 @@ class TerminalProposal:
                 else None
             ),
             cancellation_receipt=(
-                ProductReceipt.from_dict(cancellation)
+                CancellationAuthorityReceipt.from_dict(cancellation)
                 if cancellation is not None
                 else None
             ),
@@ -1652,27 +1877,17 @@ class TerminalReconciliationReceipt:
     """The host/Plane result for one terminal proposal."""
 
     receipt_ref: str
-    audit_ref: str
     run_id: str
     invocation_id: str
     kind: str
     idempotency_key: str
     accepted: bool
     legal_transition: bool
-    operation_ref: str | None = None
-    application_ref: str | None = None
-    gateway_receipt_ref: str | None = None
-    product_event_ref: str | None = None
+    proofs: tuple[TerminalProof, ...] = ()
     product_receipts: tuple[ProductReceipt, ...] = ()
-    actor_ref: str | None = None
-    workspace_ref: str | None = None
-    snapshot_digest: str | None = None
-    terminal_slot: str | None = None
-    proposal_digest: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "receipt_ref", _require_text(self.receipt_ref, "terminalReceipt.receiptRef"))
-        object.__setattr__(self, "audit_ref", _require_text(self.audit_ref, "terminalReceipt.auditRef"))
         object.__setattr__(self, "run_id", _require_text(self.run_id, "terminalReceipt.runId"))
         object.__setattr__(
             self,
@@ -1688,22 +1903,40 @@ class TerminalReconciliationReceipt:
         )
         if not isinstance(self.accepted, bool) or not isinstance(self.legal_transition, bool):
             raise ContractError("terminal receipt decisions must be booleans")
-        object.__setattr__(self, "operation_ref", _require_optional_text(self.operation_ref, "terminalReceipt.operationRef"))
-        object.__setattr__(
-            self,
-            "application_ref",
-            _require_optional_text(self.application_ref, "terminalReceipt.applicationRef"),
-        )
-        object.__setattr__(
-            self,
-            "gateway_receipt_ref",
-            _require_optional_text(self.gateway_receipt_ref, "terminalReceipt.gatewayReceiptRef"),
-        )
-        object.__setattr__(
-            self,
-            "product_event_ref",
-            _require_optional_text(self.product_event_ref, "terminalReceipt.productEventRef"),
-        )
+        proofs = tuple(self.proofs)
+        if len(proofs) > MAX_TERMINAL_PROOFS:
+            raise BoundsError(f"terminalReceipt.proofs exceeds {MAX_TERMINAL_PROOFS} items")
+        if not all(isinstance(item, TerminalProof) for item in proofs):
+            raise ContractError("terminalReceipt.proofs contains an unsupported value")
+        if len({item.proof_kind for item in proofs}) != len(proofs):
+            raise ContractError("terminalReceipt.proofs must contain unique proof kinds")
+        if len({item.proof_ref for item in proofs}) != len(proofs):
+            raise ContractError("terminalReceipt.proofs must contain unique proof identities")
+        if len({item.resource_ref for item in proofs}) != len(proofs):
+            raise ContractError("terminalReceipt.proofs must contain unique proof resources")
+        if proofs:
+            first = proofs[0]
+            if any(
+                (
+                    item.run_id != first.run_id
+                    or item.invocation_id != first.invocation_id
+                    or item.actor_ref != first.actor_ref
+                    or item.workspace_ref != first.workspace_ref
+                    or item.snapshot_digest != first.snapshot_digest
+                    or item.terminal_slot != first.terminal_slot
+                    or item.terminal_kind != first.terminal_kind
+                    or item.proposal_digest != first.proposal_digest
+                )
+                for item in proofs[1:]
+            ):
+                raise BindingError("terminal receipt proofs disagree on their common binding")
+            if any(
+                item.terminal_slot != self.idempotency_key
+                or item.terminal_kind != self.kind
+                for item in proofs
+            ):
+                raise BindingError("terminal receipt proofs are not bound to the receipt")
+        object.__setattr__(self, "proofs", proofs)
         product_receipts = tuple(self.product_receipts)
         if len(product_receipts) > MAX_TERMINAL_PRODUCT_RECEIPTS:
             raise BoundsError(
@@ -1717,52 +1950,41 @@ class TerminalReconciliationReceipt:
         ):
             raise BindingError("terminal product receipt is not bound to the terminal slot")
         object.__setattr__(self, "product_receipts", product_receipts)
-        for name in ("actor_ref", "workspace_ref", "snapshot_digest", "terminal_slot", "proposal_digest"):
-            object.__setattr__(
-                self,
-                name,
-                _require_optional_text(getattr(self, name), f"terminalReceipt.{name}"),
-            )
         if self.accepted and self.legal_transition:
-            for name in (
-                "operation_ref",
-                "application_ref",
-                "gateway_receipt_ref",
-                "product_event_ref",
-                "actor_ref",
-                "workspace_ref",
-                "snapshot_digest",
-                "terminal_slot",
-                "proposal_digest",
-            ):
-                if getattr(self, name) is None:
-                    raise ContractError(
-                        f"accepted terminal receipt requires {name} proof"
-                    )
+            if len(proofs) != MAX_TERMINAL_PROOFS or {
+                item.proof_kind for item in proofs
+            } != TERMINAL_PROOF_KINDS:
+                raise ContractError("accepted terminal receipt requires exactly one proof of every kind")
             if not product_receipts:
                 raise ContractError("accepted terminal receipt requires product receipts")
+            if any(
+                item.terminal_kind != self.kind
+                or any(
+                    getattr(item, name) is None
+                    for name in (
+                        "actor_ref",
+                        "workspace_ref",
+                        "snapshot_digest",
+                        "terminal_slot",
+                        "proposal_digest",
+                    )
+                )
+                for item in product_receipts
+            ):
+                raise ContractError("accepted terminal receipt has an incompletely bound product proof")
         _check_wire_size(self.to_dict(), "terminalReceipt", MAX_TERMINAL_RECEIPT_BYTES)
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "receiptRef": self.receipt_ref,
-            "auditRef": self.audit_ref,
             "runId": self.run_id,
             "invocationId": self.invocation_id,
             "kind": self.kind,
             "idempotencyKey": self.idempotency_key,
             "accepted": self.accepted,
             "legalTransition": self.legal_transition,
-            "operationRef": self.operation_ref,
-            "applicationRef": self.application_ref,
-            "gatewayReceiptRef": self.gateway_receipt_ref,
-            "productEventRef": self.product_event_ref,
+            "proofs": [item.to_dict() for item in self.proofs],
             "productReceipts": [item.to_dict() for item in self.product_receipts],
-            "actorRef": self.actor_ref,
-            "workspaceRef": self.workspace_ref,
-            "snapshotDigest": self.snapshot_digest,
-            "terminalSlot": self.terminal_slot,
-            "proposalDigest": self.proposal_digest,
         }
 
     @classmethod
@@ -1772,44 +1994,32 @@ class TerminalReconciliationReceipt:
             data,
             {
                 "receiptRef",
-                "auditRef",
                 "runId",
                 "invocationId",
                 "kind",
                 "idempotencyKey",
                 "accepted",
                 "legalTransition",
-                "operationRef",
-                "applicationRef",
-                "gatewayReceiptRef",
-                "productEventRef",
+                "proofs",
                 "productReceipts",
-                "actorRef",
-                "workspaceRef",
-                "snapshotDigest",
-                "terminalSlot",
-                "proposalDigest",
             },
             "terminalReceipt",
         )
         return cls(
             receipt_ref=_require_text(data.get("receiptRef"), "terminalReceipt.receiptRef"),
-            audit_ref=_require_text(data.get("auditRef"), "terminalReceipt.auditRef"),
             run_id=_require_text(data.get("runId"), "terminalReceipt.runId"),
             invocation_id=_require_text(data.get("invocationId"), "terminalReceipt.invocationId"),
             kind=_require_text(data.get("kind"), "terminalReceipt.kind"),
             idempotency_key=_require_text(data.get("idempotencyKey"), "terminalReceipt.idempotencyKey"),
             accepted=data.get("accepted"),
             legal_transition=data.get("legalTransition"),
-            operation_ref=_require_optional_text(data.get("operationRef"), "terminalReceipt.operationRef"),
-            application_ref=_require_optional_text(
-                data.get("applicationRef"), "terminalReceipt.applicationRef"
-            ),
-            gateway_receipt_ref=_require_optional_text(
-                data.get("gatewayReceiptRef"), "terminalReceipt.gatewayReceiptRef"
-            ),
-            product_event_ref=_require_optional_text(
-                data.get("productEventRef"), "terminalReceipt.productEventRef"
+            proofs=tuple(
+                TerminalProof.from_dict(item)
+                for item in _sequence(
+                    data.get("proofs"),
+                    "terminalReceipt.proofs",
+                    maximum=MAX_TERMINAL_PROOFS,
+                )
             ),
             product_receipts=tuple(
                 ProductReceipt.from_dict(item)
@@ -1818,15 +2028,6 @@ class TerminalReconciliationReceipt:
                     "terminalReceipt.productReceipts",
                     maximum=MAX_TERMINAL_PRODUCT_RECEIPTS,
                 )
-            ),
-            actor_ref=_require_optional_text(data.get("actorRef"), "terminalReceipt.actorRef"),
-            workspace_ref=_require_optional_text(data.get("workspaceRef"), "terminalReceipt.workspaceRef"),
-            snapshot_digest=_require_optional_text(
-                data.get("snapshotDigest"), "terminalReceipt.snapshotDigest"
-            ),
-            terminal_slot=_require_optional_text(data.get("terminalSlot"), "terminalReceipt.terminalSlot"),
-            proposal_digest=_require_optional_text(
-                data.get("proposalDigest"), "terminalReceipt.proposalDigest"
             ),
         )
 

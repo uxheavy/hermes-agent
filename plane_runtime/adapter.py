@@ -18,6 +18,7 @@ from .contract import (
     ArtifactProposal,
     BindingError,
     BoundsError,
+    CancellationAuthorityReceipt,
     ContractError,
     InputRequestObserved,
     MessageProposal,
@@ -35,6 +36,7 @@ from .contract import (
     RunSnapshot,
     SequenceError,
     TerminalProposal,
+    TerminalProof,
     TerminalReconciliationReceipt,
     TERMINAL_KINDS,
     TranscriptObserved,
@@ -89,7 +91,7 @@ class CancellationAuthority(Protocol):
         *,
         run: RunSnapshot,
         invocation: InvocationEnvelope,
-    ) -> ProductReceipt:
+    ) -> CancellationAuthorityReceipt:
         ...
 
 
@@ -630,9 +632,9 @@ class FixtureCheckpointAuthority:
 class FixtureCancellationAuthority:
     """Deterministic host authority used by tests and the demo service only."""
 
-    def __init__(self, receipts: Iterable[ProductReceipt]) -> None:
+    def __init__(self, receipts: Iterable[CancellationAuthorityReceipt]) -> None:
         self._lock = RLock()
-        self._receipts: dict[tuple[str, str], ProductReceipt] = {}
+        self._receipts: dict[tuple[str, str], CancellationAuthorityReceipt] = {}
         for receipt in receipts:
             key = (receipt.run_id, receipt.invocation_id)
             if key in self._receipts:
@@ -644,7 +646,7 @@ class FixtureCancellationAuthority:
         *,
         run: RunSnapshot,
         invocation: InvocationEnvelope,
-    ) -> ProductReceipt:
+    ) -> CancellationAuthorityReceipt:
         with self._lock:
             receipt = self._receipts.get((run.run_id, invocation.invocation_id))
             if receipt is None:
@@ -677,6 +679,29 @@ def _validate_product_receipt(
         raise BindingError("product receipt is not bound to this invocation and resource")
 
 
+def _terminal_proof_resource(proof_kind: str, terminal_slot: str) -> str:
+    prefixes = {
+        "operation_attempt": "operation",
+        "application": "application",
+        "gateway": "gateway",
+        "audit": "audit",
+        "product_event": "product-event",
+    }
+    try:
+        prefix = prefixes[proof_kind]
+    except KeyError as exc:  # pragma: no cover - TerminalProof rejects this first
+        raise ContractError(f"unsupported terminal proof kind: {proof_kind!r}") from exc
+    return f"{prefix}:{terminal_slot}"
+
+
+def _terminal_proof_ref(proof_kind: str, terminal_slot: str) -> str:
+    return f"terminal-proof:{proof_kind}:{terminal_slot}"
+
+
+def _proofs_by_kind(receipt: TerminalReconciliationReceipt) -> dict[str, TerminalProof]:
+    return {proof.proof_kind: proof for proof in receipt.proofs}
+
+
 def _terminal_proposal(
     *,
     run: RunSnapshot,
@@ -686,7 +711,7 @@ def _terminal_proposal(
     source: str = "runtime",
     outcome_proposal: OutcomeProposal | None = None,
     input_request_proposal: InputRequestProposal | None = None,
-    cancellation_receipt: ProductReceipt | None = None,
+    cancellation_receipt: CancellationAuthorityReceipt | None = None,
     artifact_proposals: Iterable[ArtifactProposal] = (),
     message_proposals: Iterable[MessageProposal] = (),
 ) -> TerminalProposal:
@@ -776,21 +801,44 @@ def _reconcile_terminal(
         )
     if not receipt.accepted or not receipt.legal_transition:
         return receipt
+    if len(receipt.proofs) != 5:
+        raise TerminalReconciliationError(
+            message="terminal reconciliation receipt requires exactly five typed proofs",
+        )
     if (
-        receipt.actor_ref != proposal.actor_ref
-        or receipt.workspace_ref != proposal.workspace_ref
-        or receipt.snapshot_digest != proposal.snapshot_digest
-        or receipt.terminal_slot != proposal.idempotency_key
-        or receipt.proposal_digest != proposal.digest()
-        or not receipt.operation_ref
-        or not receipt.application_ref
-        or not receipt.gateway_receipt_ref
-        or not receipt.audit_ref
-        or not receipt.product_event_ref
+        len({proof.proof_ref for proof in receipt.proofs}) != 5
+        or len({proof.resource_ref for proof in receipt.proofs}) != 5
     ):
         raise TerminalReconciliationError(
-            message="terminal reconciliation receipt is missing binding or application proof",
+            message="terminal reconciliation receipt contains duplicate proof identities",
         )
+    proofs = _proofs_by_kind(receipt)
+    if set(proofs) != {
+        "operation_attempt",
+        "application",
+        "gateway",
+        "audit",
+        "product_event",
+    }:
+        raise TerminalReconciliationError(
+            message="terminal reconciliation receipt has missing or extra typed proofs",
+        )
+    for proof_kind, proof in proofs.items():
+        if (
+            proof.proof_ref != _terminal_proof_ref(proof_kind, proposal.idempotency_key)
+            or proof.resource_ref != _terminal_proof_resource(proof_kind, proposal.idempotency_key)
+            or proof.run_id != proposal.run_id
+            or proof.invocation_id != proposal.invocation_id
+            or proof.actor_ref != proposal.actor_ref
+            or proof.workspace_ref != proposal.workspace_ref
+            or proof.snapshot_digest != proposal.snapshot_digest
+            or proof.terminal_slot != proposal.idempotency_key
+            or proof.terminal_kind != proposal.kind
+            or proof.proposal_digest != proposal.digest()
+        ):
+            raise TerminalReconciliationError(
+                message="terminal reconciliation receipt contains an unbound typed proof",
+            )
     expected: list[tuple[str, str]] = []
     if proposal.kind == "completed":
         assert proposal.outcome_proposal is not None
@@ -799,7 +847,7 @@ def _reconcile_terminal(
         assert proposal.input_request_proposal is not None
         expected.append(("input_request", proposal.input_request_proposal.request_ref))
     else:
-        expected.append(("terminal_event", receipt.product_event_ref))
+        expected.append(("terminal_event", proofs["product_event"].resource_ref))
     expected.extend(("artifact", item.artifact_ref) for item in proposal.artifact_proposals)
     expected.extend(("message", item.message_ref) for item in proposal.message_proposals)
     if len(receipt.product_receipts) != len(expected):
@@ -821,6 +869,7 @@ def _reconcile_terminal(
             product_receipt.run_id != proposal.run_id
             or product_receipt.invocation_id != proposal.invocation_id
             or product_receipt.kind != expected_kind
+            or product_receipt.terminal_kind != proposal.kind
             or product_receipt.resource_ref != expected_resource
             or product_receipt.actor_ref != proposal.actor_ref
             or product_receipt.workspace_ref != proposal.workspace_ref
@@ -851,7 +900,7 @@ def _validate_terminal_evidence(
     kind: str,
     proposal: TerminalProposal,
     stream: EventStream,
-    cancellation_receipt: ProductReceipt | None,
+    cancellation_receipt: CancellationAuthorityReceipt | None,
 ) -> None:
     if (
         proposal.run_id != run.run_id
@@ -937,7 +986,7 @@ def _return_terminal(
     invocation: InvocationEnvelope,
     stream: EventStream,
     exit_value: RuntimeExit,
-    cancellation_receipt: ProductReceipt | None = None,
+    cancellation_receipt: CancellationAuthorityReceipt | None = None,
     outcome_proposal: OutcomeProposal | None = None,
     input_request_proposal: InputRequestProposal | None = None,
     artifact_proposals: Iterable[ArtifactProposal] = (),
@@ -978,7 +1027,7 @@ def _return_terminal_safely(
     invocation: InvocationEnvelope,
     stream: EventStream,
     exit_value: RuntimeExit,
-    cancellation_receipt: ProductReceipt | None = None,
+    cancellation_receipt: CancellationAuthorityReceipt | None = None,
     outcome_proposal: OutcomeProposal | None = None,
     input_request_proposal: InputRequestProposal | None = None,
     artifact_proposals: Iterable[ArtifactProposal] = (),
@@ -1022,18 +1071,27 @@ def _cancellation_receipt(
     authority: CancellationAuthority | None,
     run: RunSnapshot,
     invocation: InvocationEnvelope,
-) -> ProductReceipt:
+) -> CancellationAuthorityReceipt:
     if authority is None:
         raise ContractError("cancelled execution requires an injected cancellation authority")
     receipt = authority.validate_cancellation(run=run, invocation=invocation)
-    if not isinstance(receipt, ProductReceipt):
+    if not isinstance(receipt, CancellationAuthorityReceipt):
         raise ContractError("cancellation authority returned an invalid receipt")
+    expected_idempotency_key = f"cancel:{run.run_id}:{invocation.invocation_id}"
     if (
         receipt.run_id != run.run_id
         or receipt.invocation_id != invocation.invocation_id
         or receipt.resource_ref != invocation.cancellation_ref
+        or receipt.actor_ref != run.actor_ref
+        or receipt.workspace_ref != run.workspace_ref
+        or receipt.snapshot_digest != run.digest()
+        or receipt.kind != "cancellation"
+        or receipt.idempotency_key != expected_idempotency_key
+        or receipt.receipt_ref != f"cancel-receipt:{invocation.invocation_id}"
+        or receipt.gateway_receipt_ref != f"gateway:{expected_idempotency_key}"
+        or receipt.audit_ref != f"audit:{expected_idempotency_key}"
     ):
-        raise BindingError("cancellation receipt is not bound to this invocation")
+        raise BindingError("cancellation receipt is not fully bound to this invocation")
     return receipt
 
 
@@ -1063,21 +1121,27 @@ def execute(
     _validate_inputs(run, invocation)
     if lease_authority is None or lease_binding is None:
         raise LeaseError("execution requires an injected canonical lease authority and host binding")
+    if terminal_port is None:
+        raise ContractError("execution requires an injected terminal reconciliation port")
+    if invocation.checkpoint_ref is not None and (
+        checkpoint_authority is None or checkpoint_attestation is None
+    ):
+        raise ContractError(
+            "checkpoint continuation requires an injected checkpoint authority and attestation"
+        )
+    if invocation.checkpoint_ref is None and (
+        checkpoint_authority is not None or checkpoint_attestation is not None
+    ):
+        raise ContractError("checkpoint authority data is not allowed for an initial invocation")
     lease_authority.validate_lease(run=run, invocation=invocation, binding=lease_binding)
     if invocation.checkpoint_ref is not None:
-        if checkpoint_authority is None or checkpoint_attestation is None:
-            raise ContractError(
-                "checkpoint continuation requires an injected checkpoint authority and attestation"
-            )
+        assert checkpoint_authority is not None
+        assert checkpoint_attestation is not None
         checkpoint_authority.claim_checkpoint(
             run=run,
             invocation=invocation,
             attestation=checkpoint_attestation,
         )
-    elif checkpoint_authority is not None or checkpoint_attestation is not None:
-        raise ContractError("checkpoint authority data is not allowed for an initial invocation")
-    if terminal_port is None:
-        raise ContractError("execution requires an injected terminal reconciliation port")
     cancellation = cancellation or NeverCancelled()
     if execution_phase is not None:
         execution_phase.execution_started = True
@@ -1457,23 +1521,35 @@ class FixtureTerminalReconciliationPort:
         key = proposal.idempotency_key
         return TerminalReconciliationReceipt(
             receipt_ref=f"terminal-receipt:{key}",
-            audit_ref=f"audit:{key}",
             run_id=proposal.run_id,
             invocation_id=proposal.invocation_id,
             kind=proposal.kind,
             idempotency_key=key,
             accepted=accepted,
             legal_transition=legal_transition,
-            operation_ref=f"operation:{key}",
-            application_ref=f"application:{key}",
-            gateway_receipt_ref=f"gateway:{key}",
-            product_event_ref=f"product-event:{key}",
+            proofs=tuple(
+                TerminalProof(
+                    proof_kind=proof_kind,
+                    proof_ref=_terminal_proof_ref(proof_kind, key),
+                    resource_ref=_terminal_proof_resource(proof_kind, key),
+                    run_id=proposal.run_id,
+                    invocation_id=proposal.invocation_id,
+                    actor_ref=proposal.actor_ref,
+                    workspace_ref=proposal.workspace_ref,
+                    snapshot_digest=proposal.snapshot_digest,
+                    terminal_slot=key,
+                    terminal_kind=proposal.kind,
+                    proposal_digest=proposal.digest(),
+                )
+                for proof_kind in (
+                    "operation_attempt",
+                    "application",
+                    "gateway",
+                    "audit",
+                    "product_event",
+                )
+            ),
             product_receipts=product_receipts,
-            actor_ref=proposal.actor_ref,
-            workspace_ref=proposal.workspace_ref,
-            snapshot_digest=proposal.snapshot_digest,
-            terminal_slot=key,
-            proposal_digest=proposal.digest(),
         )
 
     def _product_receipt(
@@ -1496,6 +1572,7 @@ class FixtureTerminalReconciliationPort:
             snapshot_digest=proposal.snapshot_digest,
             terminal_slot=proposal.idempotency_key,
             proposal_digest=proposal.digest(),
+            terminal_kind=proposal.kind,
         )
 
     def reconcile_terminal(self, proposal: TerminalProposal) -> TerminalReconciliationReceipt:
