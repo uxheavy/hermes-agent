@@ -621,6 +621,7 @@ def serve_once(
         invocation_id=invocation.invocation_id,
         expected_causation_ref=invocation.causation_ref,
     )
+    terminal_rejections: list[TerminalReconciliationRejected] = []
     phase = ExecutionPhase()
 
     def emit(event) -> None:
@@ -642,7 +643,21 @@ def serve_once(
             checkpoint_attestation=checkpoint_attestation,
             terminal_port=terminal_port,
             execution_phase=phase,
+            _terminal_rejection_sink=terminal_rejections.append,
         )
+        if terminal_rejections:
+            if len(terminal_rejections) != 1:
+                raise TerminalReconciliationError(
+                    message="terminal reconciliation produced multiple rejection results",
+                )
+            return _handle_terminal_reconciliation_rejection(
+                exc=terminal_rejections[0],
+                run=run,
+                invocation=invocation,
+                collector=collector,
+                output=output,
+                internal_failure_hook=internal_failure_hook,
+            )
         output.write(json.dumps({"type": "exit", "exit": exit_value.to_dict()}, sort_keys=True) + "\n")
         output.flush()
         return 0
@@ -672,15 +687,6 @@ def serve_once(
         )
         output.flush()
         return 1
-    except TerminalReconciliationRejected as exc:
-        return _handle_terminal_reconciliation_rejection(
-            exc=exc,
-            run=run,
-            invocation=invocation,
-            collector=collector,
-            output=output,
-            internal_failure_hook=internal_failure_hook,
-        )
     except TerminalReconciliationError as exc:
         return _handle_terminal_reconciliation_failure(
             exc=exc,

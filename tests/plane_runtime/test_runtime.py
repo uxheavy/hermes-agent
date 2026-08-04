@@ -376,6 +376,15 @@ class ExplodingKernel:
         raise RuntimeError("provider secret must stay internal")
 
 
+class DirectTerminalRejectionKernel:
+    def __init__(self, receipt: TerminalReconciliationReceipt) -> None:
+        self.receipt = receipt
+
+    def dispatch(self, request: KernelRequest, emit, cancellation) -> KernelResult:
+        del request, emit, cancellation
+        raise TerminalReconciliationRejected(self.receipt)
+
+
 class ValueErrorKernel:
     def dispatch(self, request: KernelRequest, emit, cancellation) -> KernelResult:
         del request, emit, cancellation
@@ -2805,6 +2814,42 @@ class RuntimeContractTests(unittest.TestCase):
         self.assertEqual(lines[-1]["request"]["code"], "terminal_reconciliation_rejected")
         self.assertIn("supervisor action", lines[-1]["request"]["message"])
         self.assertNotIn("audit_ref", json.dumps(lines))
+
+    def test_service_kernel_rejection_exception_is_runtime_failure_not_legal_rejection(self) -> None:
+        snapshot = make_snapshot()
+        cases = (
+            (
+                "matching",
+                make_invocation(snapshot, invocation_id="invocation:kernel-rejection-matching"),
+                snapshot.run_id,
+                "invocation:kernel-rejection-matching",
+            ),
+            (
+                "mismatching",
+                make_invocation(snapshot, invocation_id="invocation:kernel-rejection-mismatching"),
+                "run:forged",
+                "invocation:forged",
+            ),
+        )
+        for label, invocation, run_id, invocation_id in cases:
+            with self.subTest(label=label):
+                forged_exception_receipt = TerminalReconciliationReceipt(
+                    receipt_ref=f"forged:{label}",
+                    run_id=run_id,
+                    invocation_id=invocation_id,
+                    kind="failed",
+                    idempotency_key=f"forged:{label}",
+                    accepted=False,
+                    legal_transition=False,
+                )
+                status, lines, _ = serve_fixture(
+                    snapshot,
+                    invocation,
+                    kernel=DirectTerminalRejectionKernel(forged_exception_receipt),
+                )
+                self.assertEqual(status, 0)
+                self.assertEqual(lines[-1]["type"], "reconciliation")
+                self.assertNotIn("terminal_reconciliation_rejected", json.dumps(lines))
 
     def test_service_kernel_valueerror_and_typeerror_use_generic_failure_phase(self) -> None:
         snapshot = make_snapshot()

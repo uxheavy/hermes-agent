@@ -301,6 +301,9 @@ class TerminalReconciliationRejected(Exception):
         super().__init__("Plane legally rejected the terminal reconciliation proposal")
 
 
+_TerminalRejectionSink = Callable[[TerminalReconciliationRejected], None]
+
+
 class NeverCancelled:
     def is_cancelled(self) -> bool:
         return False
@@ -1078,8 +1081,9 @@ def _return_terminal_safely(
     input_request_proposal: InputRequestProposal | None = None,
     artifact_proposals: Iterable[ArtifactProposal] = (),
     message_proposals: Iterable[MessageProposal] = (),
+    terminal_rejection_sink: _TerminalRejectionSink | None = None,
 ) -> RuntimeExit:
-    """Convert a terminal-wire overflow into one minimal bounded failure."""
+    """Handle validated terminal rejection or convert wire overflow to failure."""
 
     try:
         return _return_terminal(
@@ -1094,6 +1098,11 @@ def _return_terminal_safely(
             artifact_proposals=artifact_proposals,
             message_proposals=message_proposals,
         )
+    except TerminalReconciliationRejected as exc:
+        if terminal_rejection_sink is None:
+            raise
+        terminal_rejection_sink(exc)
+        return exit_value
     except BoundsError:
         return _return_terminal(
             port=port,
@@ -1109,6 +1118,7 @@ def _return_terminal_safely(
                     retryable=False,
                 ),
             ),
+            terminal_rejection_sink=terminal_rejection_sink,
         )
 
 
@@ -1156,6 +1166,7 @@ def execute(
     checkpoint_attestation: CheckpointAttestation | None = None,
     terminal_port: TerminalReconciliationPort | None = None,
     execution_phase: ExecutionPhase | None = None,
+    _terminal_rejection_sink: _TerminalRejectionSink | None = None,
 ) -> RuntimeExit:
     """Execute exactly one invocation through the replaceable kernel port.
 
@@ -1223,6 +1234,7 @@ def execute(
             stream=stream,
             exit_value=RuntimeExit(kind="cancelled", final_sequence=stream.last_sequence),
             cancellation_receipt=cancellation_receipt,
+            terminal_rejection_sink=_terminal_rejection_sink,
         )
     kernel = kernel or FakeKernel()
     request = KernelRequest(
@@ -1408,6 +1420,7 @@ def execute(
             cancellation_receipt=cancellation_receipt,
             artifact_proposals=artifact_proposals,
             message_proposals=message_proposals,
+            terminal_rejection_sink=_terminal_rejection_sink,
         )
     except BoundsError:
         # Ingestion limits are an invocation failure, not permission to keep
@@ -1427,6 +1440,7 @@ def execute(
                     retryable=False,
                 ),
             ),
+            terminal_rejection_sink=_terminal_rejection_sink,
         )
     if cancellation.is_cancelled():
         cancellation_receipt = _cancellation_receipt(
@@ -1443,6 +1457,7 @@ def execute(
             cancellation_receipt=cancellation_receipt,
             artifact_proposals=artifact_proposals,
             message_proposals=message_proposals,
+            terminal_rejection_sink=_terminal_rejection_sink,
         )
     if result.terminal_kind == "waiting_for_input" and not pending_input_requests:
         raise ContractError("waiting_for_input requires a visible authorized input request")
@@ -1465,6 +1480,7 @@ def execute(
             cancellation_receipt=cancellation_receipt,
             artifact_proposals=artifact_proposals,
             message_proposals=message_proposals,
+            terminal_rejection_sink=_terminal_rejection_sink,
         )
     return _return_terminal_safely(
         port=terminal_port,
@@ -1480,6 +1496,7 @@ def execute(
         input_request_proposal=input_request_proposal,
         artifact_proposals=artifact_proposals,
         message_proposals=message_proposals,
+        terminal_rejection_sink=_terminal_rejection_sink,
     )
 
 
