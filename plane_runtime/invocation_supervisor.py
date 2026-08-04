@@ -1,20 +1,22 @@
 """Fail-closed supervision for one disposable Plane runtime invocation.
 
-This module deliberately does not reuse Hermes' configurable terminal or Docker
-environment implementations.  Those implementations serve a wider product
-surface and intentionally support persistence, mounts, ambient configuration,
-and interactive processes.  An invocation needs the opposite: one immutable
-command, one bounded child, and one authoritative terminal handoff.
+The child process is an evidence producer, never a Plane authority.  It emits
+bounded runtime events, one terminal proposal, and one exit.  This module runs
+in the trusted host and is the only place that may submit the proposal through
+the injected :class:`TerminalReconciliationPort`.
 
-The real runner is optional and capability-gated.  Tests and a future runtime
-service inject a runner implementing :class:`DockerRunner`; the supervisor
-never creates a Docker client or reads ambient environment on its own.
+The Docker implementation is deliberately strict and conservative.  It uses
+only fixed argv controls, performs bounded Docker JSON inspection before and
+after launch, and refuses to claim production enforcement when inspection is
+ambiguous or unavailable.  Fake runners are supported as explicit test seams
+and are marked as such in their enforcement attestation.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import selectors
@@ -25,11 +27,15 @@ from threading import RLock
 from typing import Callable, Mapping, Protocol, Sequence
 
 from .adapter import (
+    CanonicalLeaseAuthority,
+    CanonicalLeaseBinding,
     CancellationSignal,
     EventCollector,
     TerminalReconciliationPort,
     classify_process_death,
     reconcile_process_death,
+    reconcile_terminal_proposal,
+    validate_terminal_proposal,
 )
 from .contract import (
     BindingError,
@@ -38,20 +44,22 @@ from .contract import (
     InvocationEnvelope,
     MAX_EVENT_BYTES,
     MAX_INVOCATION_BYTES,
+    MAX_REFERENCE_LENGTH,
     MAX_RUN_SNAPSHOT_BYTES,
-    MAX_TERMINAL_RECEIPT_BYTES,
+    MAX_TERMINAL_PROPOSAL_BYTES,
     RuntimeExit,
     RuntimeConfigurationError,
     RunSnapshot,
+    TerminalProposal,
     TerminalReconciliationReceipt,
     canonical_json_bytes,
 )
 
 
-_IMAGE_DIGEST = re.compile(
-    r"[a-z0-9][a-z0-9._:/-]*[a-z0-9]@sha256:[0-9a-f]{64}"
-)
-_CONTAINER_NAME = re.compile(r"[a-z0-9][a-z0-9-]{0,62}")
+# Docker policy is intentionally module-private.  InvocationPolicy contains
+# only bounded scalars and the immutable image reference; callers cannot pass
+# network, namespace, entrypoint, mount, device, logging, or persistence
+# controls into the command builder.
 _FIXED_ENTRYPOINT = "python3"
 _FIXED_SERVICE_MODULE = "plane_runtime.service"
 _FIXED_SERVICE_ARGS = ("--once",)
@@ -60,13 +68,10 @@ _FIXED_USER = "65532:65532"
 _FIXED_TMPFS_TARGET = "/tmp"
 _FIXED_TMPFS_OPTIONS = "rw,noexec,nosuid,nodev"
 _FIXED_PULL_POLICY = "never"
+_FIXED_LOG_DRIVER = "none"
 _FIXED_CONTAINER_PREFIX = "plane-invocation"
-_MAX_RETAINED_INVOCATIONS = 1024
-
-# This is intentionally a literal allowlist.  It is not derived from
-# os.environ, and it contains no HOME, HERMES_HOME, credential, proxy, cloud,
-# provider, Plane, or database setting.
-_CHILD_ENV: tuple[tuple[str, str], ...] = (
+_FIXED_PROTOCOL_LABEL = "plane.agent-runtime/protocol=plane.agent-runtime/v1"
+_FIXED_ALLOWED_ENV: tuple[tuple[str, str], ...] = (
     ("LANG", "C.UTF-8"),
     ("LC_ALL", "C.UTF-8"),
     ("PATH", "/usr/local/bin:/usr/bin:/bin"),
@@ -78,6 +83,14 @@ _DOCKER_CLIENT_ENV: Mapping[str, str] = {
     "LC_ALL": "C.UTF-8",
     "PATH": "/usr/local/bin:/usr/bin:/bin",
 }
+_ALLOWED_IMAGE_ENV_KEYS = frozenset(key for key, _ in _FIXED_ALLOWED_ENV)
+_SUPPORTED_STORAGE_DRIVERS = frozenset({"overlay2", "btrfs", "zfs", "devicemapper"})
+_IMAGE_DIGEST = re.compile(r"[a-z0-9][a-z0-9._:/-]*[a-z0-9]@sha256:[0-9a-f]{64}")
+_REGISTRY_PORT = re.compile(r"[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?:[0-9]{1,5}")
+_IMAGE_COMPONENT = re.compile(r"[a-z0-9]+(?:[._-][a-z0-9]+)*")
+_CONTAINER_NAME = re.compile(r"[a-z0-9][a-z0-9-]{0,62}")
+_HEX_ID = re.compile(r"[0-9a-f]{12,64}")
+_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 _SAFE_DEATH_REASON = "runtime process exited before terminal evidence"
 _SAFE_DEATH_REASONS = frozenset(
     {
@@ -87,8 +100,12 @@ _SAFE_DEATH_REASONS = frozenset(
         "runtime invocation exceeded its wall-time bound",
         "runtime invocation was stopped by a cancellation signal",
         "runtime process died before terminal evidence",
+        "runtime launch failed before terminal evidence",
     }
 )
+_MAX_RETAINED_INVOCATIONS = 1024
+_MAX_DOCKER_INSPECTION_BYTES = 128 * 1024
+_POLICY_FINGERPRINTS: dict[int, tuple[object, ...]] = {}
 
 
 def _positive_int(value: object, name: str, *, minimum: int = 1) -> int:
@@ -98,14 +115,136 @@ def _positive_int(value: object, name: str, *, minimum: int = 1) -> int:
 
 
 def _positive_float(value: object, name: str) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
-        raise ContractError(f"{name} must be a positive number")
-    return float(value)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ContractError(f"{name} must be a positive finite number")
+    number = float(value)
+    if not math.isfinite(number) or number <= 0:
+        raise ContractError(f"{name} must be a positive finite number")
+    return number
+
+
+def _validate_image_reference(image: object) -> str:
+    if not isinstance(image, str) or not image or _CONTROL.search(image) or any(
+        character.isspace() for character in image
+    ):
+        raise ContractError("invocation image must be a canonical digest reference")
+    if len(image) > MAX_REFERENCE_LENGTH:
+        raise ContractError("invocation image reference is too long")
+    if image.startswith("-") or image.count("@") != 1 or "//" in image or "::" in image:
+        raise ContractError("invocation image must be a canonical digest reference")
+    name, digest = image.rsplit("@", 1)
+    if not digest.startswith("sha256:") or len(digest) != len("sha256:") + 64:
+        raise ContractError("invocation image must use a lowercase sha256 digest")
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+        raise ContractError("invocation image must use a lowercase sha256 digest")
+    if not _IMAGE_DIGEST.fullmatch(image) or ".." in name:
+        raise ContractError("invocation image must be a canonical digest reference")
+    components = name.split("/")
+    if any(not component for component in components):
+        raise ContractError("invocation image contains an empty name component")
+    for index, component in enumerate(components):
+        if ":" in component:
+            if index != 0 or not _REGISTRY_PORT.fullmatch(component):
+                raise ContractError("invocation image contains an invalid registry component")
+        elif not _IMAGE_COMPONENT.fullmatch(component):
+            raise ContractError("invocation image contains an invalid name component")
+    return image
+
+
+def _policy_fingerprint(policy: "InvocationPolicy") -> tuple[object, ...]:
+    return (
+        policy.image,
+        policy.cpu_millicores,
+        policy.memory_bytes,
+        policy.pids_limit,
+        policy.wall_time_seconds,
+        policy.stdout_limit_bytes,
+        policy.stderr_limit_bytes,
+        policy.frame_limit_bytes,
+        policy.request_limit_bytes,
+        policy.max_output_frames,
+        policy.tmpfs_bytes,
+        policy.storage_limit_bytes,
+        policy.stop_timeout_seconds,
+        policy.kill_timeout_seconds,
+        policy.remove_timeout_seconds,
+    )
+
+
+def _validate_policy_values(policy: "InvocationPolicy") -> tuple[object, ...]:
+    _validate_image_reference(policy.image)
+    cpu = _positive_int(policy.cpu_millicores, "cpu_millicores")
+    if cpu > 4000:
+        raise ContractError("invocation CPU bound is outside the permitted range")
+    memory = _positive_int(policy.memory_bytes, "memory_bytes", minimum=16 * 1024 * 1024)
+    if memory > 4 * 1024 * 1024 * 1024:
+        raise ContractError("invocation memory bound is outside the permitted range")
+    pids = _positive_int(policy.pids_limit, "pids_limit", minimum=4)
+    if pids > 4096:
+        raise ContractError("invocation PID bound is outside the permitted range")
+    wall = _positive_float(policy.wall_time_seconds, "wall_time_seconds")
+    if wall > 3600:
+        raise ContractError("invocation wall-time bound is outside the permitted range")
+    stdout_limit = _positive_int(policy.stdout_limit_bytes, "stdout_limit_bytes")
+    stderr_limit = _positive_int(policy.stderr_limit_bytes, "stderr_limit_bytes")
+    if stdout_limit > 16 * 1024 * 1024 or stderr_limit > 16 * 1024 * 1024:
+        raise ContractError("invocation output bound is outside the permitted range")
+    frame_limit = _positive_int(policy.frame_limit_bytes, "frame_limit_bytes")
+    if frame_limit < MAX_EVENT_BYTES or frame_limit > MAX_TERMINAL_PROPOSAL_BYTES:
+        raise ContractError("frame_limit_bytes is outside the permitted range")
+    request_limit = _positive_int(policy.request_limit_bytes, "request_limit_bytes")
+    if request_limit < MAX_RUN_SNAPSHOT_BYTES + MAX_INVOCATION_BYTES or request_limit > 512 * 1024:
+        raise ContractError("request_limit_bytes is outside the permitted range")
+    frames = _positive_int(policy.max_output_frames, "max_output_frames", minimum=2)
+    if frames > 4096:
+        raise ContractError("invocation frame-count bound is outside the permitted range")
+    tmpfs = _positive_int(policy.tmpfs_bytes, "tmpfs_bytes", minimum=1024 * 1024)
+    storage = _positive_int(policy.storage_limit_bytes, "storage_limit_bytes", minimum=16 * 1024 * 1024)
+    if tmpfs > 1024 * 1024 * 1024 or storage > 16 * 1024 * 1024 * 1024:
+        raise ContractError("invocation storage bound is outside the permitted range")
+    cleanup_values: list[float] = []
+    for name, value in (
+        ("stop_timeout_seconds", policy.stop_timeout_seconds),
+        ("kill_timeout_seconds", policy.kill_timeout_seconds),
+        ("remove_timeout_seconds", policy.remove_timeout_seconds),
+    ):
+        timeout = _positive_float(value, name)
+        if timeout > 60:
+            raise ContractError("invocation cleanup deadline is outside the permitted range")
+        cleanup_values.append(timeout)
+    return (
+        policy.image,
+        cpu,
+        memory,
+        pids,
+        wall,
+        stdout_limit,
+        stderr_limit,
+        frame_limit,
+        request_limit,
+        frames,
+        tmpfs,
+        storage,
+        *cleanup_values,
+    )
+
+
+def _validate_policy(policy: "InvocationPolicy") -> tuple[object, ...]:
+    if not isinstance(policy, InvocationPolicy):
+        raise ContractError("invocation policy is invalid")
+    values = _validate_policy_values(policy)
+    if _POLICY_FINGERPRINTS.get(id(policy)) != _policy_fingerprint(policy):
+        raise ContractError("invocation policy was mutated after construction")
+    return values
 
 
 @dataclass(frozen=True)
 class InvocationPolicy:
-    """Immutable, explicit bounds and isolation requirements for one launch."""
+    """Validated image and resource bounds for one launch.
+
+    Isolation controls are intentionally absent from this type.  They are
+    fixed module-private policy and are copied into argv by this module.
+    """
 
     image: str
     cpu_millicores: int = 500
@@ -114,89 +253,23 @@ class InvocationPolicy:
     wall_time_seconds: float = 120.0
     stdout_limit_bytes: int = 256 * 1024
     stderr_limit_bytes: int = 64 * 1024
-    frame_limit_bytes: int = MAX_TERMINAL_RECEIPT_BYTES + 4096
+    frame_limit_bytes: int = MAX_TERMINAL_PROPOSAL_BYTES
     request_limit_bytes: int = 192 * 1024
     max_output_frames: int = 514
     tmpfs_bytes: int = 16 * 1024 * 1024
+    storage_limit_bytes: int = 512 * 1024 * 1024
     stop_timeout_seconds: float = 2.0
     kill_timeout_seconds: float = 2.0
     remove_timeout_seconds: float = 2.0
-    entrypoint: str = _FIXED_ENTRYPOINT
-    service_module: str = _FIXED_SERVICE_MODULE
-    service_args: tuple[str, ...] = _FIXED_SERVICE_ARGS
-    network_mode: str = _FIXED_NETWORK
-    read_only_rootfs: bool = True
-    no_new_privileges: bool = True
-    drop_all_capabilities: bool = True
-    user: str = _FIXED_USER
-    pull_policy: str = _FIXED_PULL_POLICY
 
     def __post_init__(self) -> None:
-        if not isinstance(self.image, str) or not _IMAGE_DIGEST.fullmatch(self.image):
-            raise ContractError("invocation image must be an immutable sha256 digest reference")
-        if not isinstance(self.service_args, (tuple, list)):
-            raise ContractError("service_args must be immutable fixed command arguments")
-        object.__setattr__(self, "service_args", tuple(self.service_args))
-        _positive_int(self.cpu_millicores, "cpu_millicores")
-        if self.cpu_millicores > 4000:
-            raise ContractError("invocation CPU bound is outside the permitted range")
-        _positive_int(self.memory_bytes, "memory_bytes", minimum=16 * 1024 * 1024)
-        if self.memory_bytes > 4 * 1024 * 1024 * 1024:
-            raise ContractError("invocation memory bound is outside the permitted range")
-        _positive_int(self.pids_limit, "pids_limit", minimum=4)
-        if self.pids_limit > 4096:
-            raise ContractError("invocation PID bound is outside the permitted range")
-        _positive_float(self.wall_time_seconds, "wall_time_seconds")
-        if self.wall_time_seconds > 3600:
-            raise ContractError("invocation wall-time bound is outside the permitted range")
-        _positive_int(self.stdout_limit_bytes, "stdout_limit_bytes")
-        _positive_int(self.stderr_limit_bytes, "stderr_limit_bytes")
-        if self.stdout_limit_bytes > 16 * 1024 * 1024 or self.stderr_limit_bytes > 16 * 1024 * 1024:
-            raise ContractError("invocation output bound is outside the permitted range")
-        _positive_int(self.frame_limit_bytes, "frame_limit_bytes")
-        if self.frame_limit_bytes < MAX_EVENT_BYTES:
-            raise ContractError("frame_limit_bytes must cover the runtime event bound")
-        if self.frame_limit_bytes > MAX_TERMINAL_RECEIPT_BYTES + MAX_EVENT_BYTES:
-            raise ContractError("frame_limit_bytes exceeds the terminal receipt bound")
-        _positive_int(self.request_limit_bytes, "request_limit_bytes")
-        if self.request_limit_bytes < MAX_RUN_SNAPSHOT_BYTES + MAX_INVOCATION_BYTES:
-            raise ContractError("request_limit_bytes cannot contain the two runtime contracts")
-        if self.request_limit_bytes > 512 * 1024:
-            raise ContractError("invocation request bound is outside the permitted range")
-        _positive_int(self.max_output_frames, "max_output_frames", minimum=2)
-        if self.max_output_frames > 4096:
-            raise ContractError("invocation frame-count bound is outside the permitted range")
-        _positive_int(self.tmpfs_bytes, "tmpfs_bytes", minimum=1024 * 1024)
-        if self.tmpfs_bytes > 1024 * 1024 * 1024:
-            raise ContractError("invocation tmpfs bound is outside the permitted range")
-        for name, value in (
-            ("stop_timeout_seconds", self.stop_timeout_seconds),
-            ("kill_timeout_seconds", self.kill_timeout_seconds),
-            ("remove_timeout_seconds", self.remove_timeout_seconds),
-        ):
-            _positive_float(value, name)
-            if float(value) > 60:
-                raise ContractError("invocation cleanup deadline is outside the permitted range")
-        if (
-            self.entrypoint != _FIXED_ENTRYPOINT
-            or self.service_module != _FIXED_SERVICE_MODULE
-            or self.service_args != _FIXED_SERVICE_ARGS
-        ):
-            raise ContractError("invocation command is fixed to plane_runtime.service --once")
-        if (
-            self.network_mode != _FIXED_NETWORK
-            or self.read_only_rootfs is not True
-            or self.no_new_privileges is not True
-            or self.drop_all_capabilities is not True
-            or self.user != _FIXED_USER
-            or self.pull_policy != _FIXED_PULL_POLICY
-        ):
-            raise ContractError("invocation isolation requirements cannot be relaxed")
+        _validate_policy_values(self)
+        _POLICY_FINGERPRINTS[id(self)] = _policy_fingerprint(self)
 
 
 @dataclass(frozen=True)
 class DockerRunnerCapabilities:
-    """Capabilities a runner must prove before a container may be launched."""
+    """Deprecated test metadata; never used as enforcement authority."""
 
     immutable_digest: bool = False
     no_pull: bool = False
@@ -220,27 +293,59 @@ class DockerRunnerCapabilities:
         return cls(*(True for _ in cls.__dataclass_fields__))
 
     def missing(self) -> tuple[str, ...]:
+        values = (
+            ("immutable_digest", self.immutable_digest),
+            ("no_pull", self.no_pull),
+            ("network_none", self.network_none),
+            ("read_only_rootfs", self.read_only_rootfs),
+            ("no_new_privileges", self.no_new_privileges),
+            ("cap_drop_all", self.cap_drop_all),
+            ("non_root_user", self.non_root_user),
+            ("bounded_tmpfs", self.bounded_tmpfs),
+            ("cpu_limit", self.cpu_limit),
+            ("memory_limit", self.memory_limit),
+            ("pid_limit", self.pid_limit),
+            ("bounded_output", self.bounded_output),
+            ("bounded_wall_time", self.bounded_wall_time),
+            ("stop", self.stop),
+            ("kill", self.kill),
+            ("remove", self.remove),
+        )
         return tuple(
-            name for name, supported in (
-                ("immutable_digest", self.immutable_digest),
-                ("no_pull", self.no_pull),
-                ("network_none", self.network_none),
-                ("read_only_rootfs", self.read_only_rootfs),
-                ("no_new_privileges", self.no_new_privileges),
-                ("cap_drop_all", self.cap_drop_all),
-                ("non_root_user", self.non_root_user),
-                ("bounded_tmpfs", self.bounded_tmpfs),
-                ("cpu_limit", self.cpu_limit),
-                ("memory_limit", self.memory_limit),
-                ("pid_limit", self.pid_limit),
-                ("bounded_output", self.bounded_output),
-                ("bounded_wall_time", self.bounded_wall_time),
-                ("stop", self.stop),
-                ("kill", self.kill),
-                ("remove", self.remove),
-            )
+            name
+            for name, supported in values
             if not supported
         )
+
+
+@dataclass(frozen=True)
+class EnforcementAttestation:
+    """Evidence that a runner enforced the fixed invocation policy."""
+
+    classification: str
+    argv_digest: str
+    container_name: str
+    evidence: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.classification not in {"production", "test"}:
+            raise ContractError("invalid runner trust classification")
+        if not re.fullmatch(r"[0-9a-f]{64}", self.argv_digest):
+            raise ContractError("runner attestation has an invalid argv digest")
+        if not _CONTAINER_NAME.fullmatch(self.container_name):
+            raise ContractError("runner attestation has an invalid container name")
+        if len(self.evidence) > 16 or not self.evidence or any(
+            not isinstance(item, str)
+            or not item
+            or len(item) > MAX_REFERENCE_LENGTH
+            or _CONTROL.search(item)
+            for item in self.evidence
+        ):
+            raise ContractError("runner attestation requires bounded evidence")
+
+    @property
+    def is_production(self) -> bool:
+        return self.classification == "production"
 
 
 @dataclass(frozen=True)
@@ -269,8 +374,12 @@ class InvocationProcess(Protocol):
 
 
 class DockerRunner(Protocol):
-    @property
-    def capabilities(self) -> DockerRunnerCapabilities:
+    def attest_invocation(
+        self,
+        argv: Sequence[str],
+        *,
+        client_env: Mapping[str, str],
+    ) -> EnforcementAttestation:
         ...
 
     def launch(
@@ -282,54 +391,69 @@ class DockerRunner(Protocol):
     ) -> InvocationProcess:
         ...
 
-    def stop(self, container_name: str, *, timeout_seconds: float) -> None:
-        ...
-
-    def kill(self, container_name: str, *, timeout_seconds: float) -> None:
-        ...
-
-    def remove(self, container_name: str, *, timeout_seconds: float) -> None:
+    def cleanup(
+        self,
+        container_name: str,
+        *,
+        stop_timeout_seconds: float,
+        kill_timeout_seconds: float,
+        remove_timeout_seconds: float,
+    ) -> "CleanupReport":
         ...
 
 
 @dataclass(frozen=True)
 class CleanupReport:
-    """Exact cleanup attempts and safe operational failure codes."""
+    """Bounded cleanup evidence; absence must be proven after removal."""
 
     container_name: str
     stop_attempted: bool
     kill_attempted: bool
     remove_attempted: bool
     failures: tuple[str, ...] = ()
+    post_cleanup_absent: bool = False
 
     @property
     def succeeded(self) -> bool:
-        return not self.failures
+        return self.post_cleanup_absent and not self.failures
 
 
 @dataclass(frozen=True)
 class InvocationResult:
-    """Supervisor result; ``completed`` is true only with trusted evidence."""
+    """Supervisor result; child exit and proposal are never authority."""
 
     status: str
     container_name: str
     exit: RuntimeExit | None = None
+    proposal: TerminalProposal | None = None
     receipt: TerminalReconciliationReceipt | None = None
     cleanup: CleanupReport | None = None
+    enforcement: EnforcementAttestation | None = None
     evidence: tuple[str, ...] = ()
 
     @property
     def completed(self) -> bool:
         return self.status == "completed"
 
+    @property
+    def production_completed(self) -> bool:
+        return self.completed and self.enforcement is not None and self.enforcement.is_production
+
+
+def _argv_digest(argv: Sequence[str]) -> str:
+    try:
+        encoded = b"\0".join(item.encode("utf-8") for item in argv)
+    except (AttributeError, UnicodeEncodeError) as exc:
+        raise ContractError("Docker argv must contain UTF-8 strings") from exc
+    return hashlib.sha256(encoded).hexdigest()
+
 
 def build_invocation_env(policy: InvocationPolicy | None = None) -> dict[str, str]:
     """Return the literal child environment; ambient process state is ignored."""
 
     if policy is not None:
-        if not isinstance(policy, InvocationPolicy):
-            raise ContractError("invocation policy is invalid")
-    return dict(_CHILD_ENV)
+        _validate_policy(policy)
+    return dict(_FIXED_ALLOWED_ENV)
 
 
 def _validate_binding(run: RunSnapshot, invocation: InvocationEnvelope) -> None:
@@ -376,64 +500,72 @@ def build_invocation_argv(
     invocation: InvocationEnvelope,
     policy: InvocationPolicy,
 ) -> tuple[str, ...]:
-    """Build the complete fixed Docker argv for one invocation."""
+    """Build the complete fixed Docker create argv for one invocation."""
 
-    if not isinstance(policy, InvocationPolicy):
-        raise ContractError("invocation policy is invalid")
+    values = _validate_policy(policy)
+    (
+        image,
+        cpu,
+        memory,
+        pids,
+        _wall,
+        _stdout,
+        _stderr,
+        _frame,
+        _request,
+        _frames,
+        tmpfs,
+        storage,
+        stop_timeout,
+        _kill_timeout,
+        _remove_timeout,
+    ) = values
     _validate_binding(run, invocation)
     name = invocation_container_name(run, invocation)
     binding = _binding_digest(run, invocation)
     argv: list[str] = [
         "docker",
-        "run",
+        "create",
         "--name",
         name,
         "--label",
-        "plane.agent-runtime/protocol=plane.agent-runtime/v1",
+        _FIXED_PROTOCOL_LABEL,
         "--label",
         f"plane.agent-runtime/invocation-binding=sha256:{binding}",
         "--pull",
-        policy.pull_policy,
+        _FIXED_PULL_POLICY,
         "--network",
-        policy.network_mode,
+        _FIXED_NETWORK,
         "--read-only",
         "--security-opt",
         "no-new-privileges",
         "--cap-drop",
         "ALL",
         "--user",
-        policy.user,
+        _FIXED_USER,
         "--cpus",
-        f"{policy.cpu_millicores / 1000:.3f}",
+        f"{int(cpu) / 1000:.3f}",
         "--memory",
-        _size(policy.memory_bytes),
+        _size(int(memory)),
         "--pids-limit",
-        str(policy.pids_limit),
+        str(int(pids)),
         "--stop-timeout",
-        str(max(1, int(policy.stop_timeout_seconds))),
+        str(max(1, int(float(stop_timeout)))),
         "--tmpfs",
-        f"{_FIXED_TMPFS_TARGET}:{_FIXED_TMPFS_OPTIONS},size={_size(policy.tmpfs_bytes)}",
+        f"{_FIXED_TMPFS_TARGET}:{_FIXED_TMPFS_OPTIONS},size={_size(int(tmpfs))}",
+        "--storage-opt",
+        f"size={_size(int(storage))}",
+        "--log-driver",
+        _FIXED_LOG_DRIVER,
     ]
-    for key, value in _CHILD_ENV:
+    for key, value in _FIXED_ALLOWED_ENV:
         argv.extend(("--env", f"{key}={value}"))
-    argv.extend(
-        (
-            "--entrypoint",
-            policy.entrypoint,
-            policy.image,
-            "-m",
-            policy.service_module,
-            *policy.service_args,
-        )
-    )
+    argv.extend(("--entrypoint", _FIXED_ENTRYPOINT, str(image), "-m", _FIXED_SERVICE_MODULE, *_FIXED_SERVICE_ARGS))
     return tuple(argv)
 
 
-def _request_bytes(
-    run: RunSnapshot,
-    invocation: InvocationEnvelope,
-    policy: InvocationPolicy,
-) -> bytes:
+def _request_bytes(run: RunSnapshot, invocation: InvocationEnvelope, policy: InvocationPolicy) -> bytes:
+    _validate_policy(policy)
     _validate_binding(run, invocation)
     payload = json.dumps(
         {"invocation": invocation.to_dict(), "run": run.to_dict()},
@@ -441,7 +573,7 @@ def _request_bytes(
         separators=(",", ":"),
         ensure_ascii=False,
     ).encode("utf-8")
-    if len(payload) + 1 > policy.request_limit_bytes:
+    if len(payload) + 1 > int(policy.request_limit_bytes):
         raise BoundsError("invocation request exceeds the supervisor request bound")
     return payload + b"\n"
 
@@ -464,7 +596,7 @@ def _safe_cancel_check(signal: CancellationSignal) -> tuple[bool, bool]:
 @dataclass(frozen=True)
 class _ParsedOutput:
     exit: RuntimeExit
-    receipt: TerminalReconciliationReceipt
+    proposal: TerminalProposal
     final_sequence: int
 
 
@@ -475,7 +607,8 @@ def _parse_child_output(
     invocation: InvocationEnvelope,
     policy: InvocationPolicy,
 ) -> _ParsedOutput:
-    if not stdout or len(stdout) > policy.stdout_limit_bytes:
+    _validate_policy(policy)
+    if not stdout or len(stdout) > int(policy.stdout_limit_bytes):
         raise BoundsError("child stdout exceeded its supervisor bound")
     if not stdout.endswith(b"\n"):
         raise ContractError("child stdout ended with a truncated frame")
@@ -484,91 +617,63 @@ def _parse_child_output(
         invocation_id=invocation.invocation_id,
         expected_causation_ref=invocation.causation_ref,
     )
+    proposal: TerminalProposal | None = None
     exit_value: RuntimeExit | None = None
-    receipt: TerminalReconciliationReceipt | None = None
     frames = 0
-    for raw_line in stdout.splitlines():
+    lines = stdout.split(b"\n")
+    if lines[-1] != b"":
+        raise ContractError("child stdout has an invalid line terminator")
+    for raw_line in lines[:-1]:
         frames += 1
-        if frames > policy.max_output_frames:
+        if frames > int(policy.max_output_frames):
             raise BoundsError("child frame count exceeded its supervisor bound")
-        if not raw_line or len(raw_line) > policy.frame_limit_bytes:
+        if not raw_line or len(raw_line) > int(policy.frame_limit_bytes) or raw_line.endswith(b"\r"):
             raise BoundsError("child frame exceeded its supervisor bound")
         try:
-            decoded = raw_line.decode("utf-8")
-            frame = json.loads(decoded)
+            frame = json.loads(raw_line.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise ContractError("child emitted malformed JSON output") from exc
         if not isinstance(frame, dict):
             raise ContractError("child emitted a non-object frame")
         kind = frame.get("type")
+        if exit_value is not None:
+            raise ContractError("child emitted bytes after terminal exit")
         if kind == "event":
-            if exit_value is not None or receipt is not None:
-                raise ContractError("child emitted an event after terminal evidence")
-            event = frame.get("event")
+            if proposal is not None:
+                raise ContractError("child emitted an event after its terminal proposal")
             from .contract import RuntimeEvent
 
-            collector.accept(RuntimeEvent.from_dict(event))
+            collector.accept(RuntimeEvent.from_dict(frame.get("event")))
+        elif kind == "proposal":
+            if proposal is not None:
+                raise ContractError("child emitted duplicate terminal proposals")
+            proposal = TerminalProposal.from_dict(frame.get("proposal"))
+            validate_terminal_proposal(
+                run=run,
+                invocation=invocation,
+                kind=proposal.kind,
+                proposal=proposal,
+                stream=collector,
+            )
         elif kind == "exit":
-            if exit_value is not None:
-                raise ContractError("child emitted duplicate exit evidence")
+            if proposal is None:
+                raise ContractError("child emitted exit before its terminal proposal")
             exit_value = RuntimeExit.from_dict(frame.get("exit"))
-        elif kind == "reconciliation":
-            if receipt is not None:
-                raise ContractError("child emitted duplicate terminal receipt")
-            receipt = TerminalReconciliationReceipt.from_dict(frame.get("receipt"))
         else:
-            # Error and reconciliation-request frames intentionally do not
-            # cross this boundary as successful terminal evidence.
             raise ContractError("child emitted an unsupported service frame")
-    if exit_value is None or receipt is None:
-        raise ContractError("child did not return both exit and terminal receipt evidence")
+    if proposal is None or exit_value is None:
+        raise ContractError("child did not return exactly one proposal and one exit")
     if exit_value.final_sequence != collector.last_sequence:
         raise ContractError("child exit sequence does not match bounded event evidence")
-    _validate_child_receipt(receipt, exit_value, run, invocation)
-    return _ParsedOutput(exit_value, receipt, collector.last_sequence)
-
-
-def _validate_child_receipt(
-    receipt: TerminalReconciliationReceipt,
-    exit_value: RuntimeExit,
-    run: RunSnapshot,
-    invocation: InvocationEnvelope,
-) -> None:
-    if (
-        not receipt.accepted
-        or not receipt.legal_transition
-        or receipt.run_id != run.run_id
-        or receipt.invocation_id != invocation.invocation_id
-        or receipt.kind != exit_value.kind
-        or receipt.idempotency_key != f"terminal:{run.run_id}:{invocation.invocation_id}"
-    ):
-        raise BindingError("child terminal receipt is not an accepted invocation receipt")
-    for proof in receipt.proofs:
-        if (
-            proof.run_id != run.run_id
-            or proof.invocation_id != invocation.invocation_id
-            or proof.actor_ref != run.actor_ref
-            or proof.workspace_ref != run.workspace_ref
-            or proof.snapshot_digest != run.digest()
-            or proof.terminal_slot != receipt.idempotency_key
-            or proof.terminal_kind != exit_value.kind
-        ):
-            raise BindingError("child terminal proof is not bound to the invocation")
-    for product in receipt.product_receipts:
-        if (
-            product.run_id != run.run_id
-            or product.invocation_id != invocation.invocation_id
-            or product.actor_ref != run.actor_ref
-            or product.workspace_ref != run.workspace_ref
-            or product.snapshot_digest != run.digest()
-            or product.terminal_slot != receipt.idempotency_key
-            or product.terminal_kind != exit_value.kind
-        ):
-            raise BindingError("child product receipt is not bound to the invocation")
+    if proposal.final_sequence != collector.last_sequence or proposal.kind != exit_value.kind:
+        raise BindingError("child proposal is not bound to the terminal exit")
+    if proposal.source != "runtime":
+        raise BindingError("child proposal has an invalid authority source")
+    return _ParsedOutput(exit_value, proposal, collector.last_sequence)
 
 
 class _SubprocessDockerProcess:
-    """Selector-driven bounded I/O for the Docker CLI launcher."""
+    """Selector-driven bounded I/O for the Docker attach process."""
 
     def __init__(self, process: subprocess.Popen[bytes]) -> None:
         self._process = process
@@ -632,10 +737,7 @@ class _SubprocessDockerProcess:
                         limit = stdout_limit_bytes if key.data == "stdout" else stderr_limit_bytes
                         if len(target) + len(chunk) > limit:
                             return ProcessCapture(
-                                self._process.poll(),
-                                bytes(stdout),
-                                bytes(stderr),
-                                output_exceeded=True,
+                                self._process.poll(), bytes(stdout), bytes(stderr), output_exceeded=True
                             )
                         target.extend(chunk)
                 if self._process.poll() is not None and "stdin" in {
@@ -655,11 +757,319 @@ class _SubprocessDockerProcess:
                         pass
 
 
-class SubprocessDockerRunner:
-    """Small real Docker CLI runner, usable only with explicit capabilities."""
+def _json_object(raw: bytes, label: str) -> dict[str, object]:
+    if not raw or len(raw) > _MAX_DOCKER_INSPECTION_BYTES or not raw.endswith(b"\n"):
+        raise RuntimeConfigurationError(f"Docker {label} inspection was unbounded or incomplete")
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeConfigurationError(f"Docker {label} inspection was not valid JSON") from exc
+    if not isinstance(value, dict):
+        raise RuntimeConfigurationError(f"Docker {label} inspection was not an object")
+    return value
 
-    def __init__(self, capabilities: DockerRunnerCapabilities) -> None:
+
+class SubprocessDockerRunner:
+    """Docker CLI adapter with evidence-based preflight and cleanup."""
+
+    def __init__(self, capabilities: DockerRunnerCapabilities | None = None) -> None:
+        # Kept only for source compatibility with old test adapters.  The
+        # supervisor never reads this caller assertion.
         self.capabilities = capabilities
+        self._attestation: EnforcementAttestation | None = None
+
+    def _run_json(self, command: Sequence[str], *, timeout_seconds: float, label: str) -> dict[str, object]:
+        try:
+            completed = subprocess.run(
+                tuple(command),
+                env=dict(_DOCKER_CLIENT_ENV),
+                cwd="/",
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=max(0.1, timeout_seconds),
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise RuntimeConfigurationError(f"Docker {label} inspection failed") from exc
+        if completed.returncode != 0:
+            raise RuntimeConfigurationError(f"Docker {label} inspection was rejected")
+        return _json_object(completed.stdout, label)
+
+    @staticmethod
+    def _image_env(config: dict[str, object]) -> None:
+        raw_env = config.get("Env")
+        if raw_env in (None, []):
+            return
+        if not isinstance(raw_env, list):
+            raise RuntimeConfigurationError("image environment inspection is ambiguous")
+        for item in raw_env:
+            if not isinstance(item, str) or "=" not in item or _CONTROL.search(item):
+                raise RuntimeConfigurationError("image environment contains an invalid entry")
+            key, _value = item.split("=", 1)
+            if key not in _ALLOWED_IMAGE_ENV_KEYS:
+                raise RuntimeConfigurationError("image contains a non-allowlisted environment key")
+
+    @staticmethod
+    def _image_command(config: dict[str, object]) -> None:
+        for field in ("Entrypoint", "Cmd"):
+            value = config.get(field)
+            if value is None:
+                continue
+            if not isinstance(value, list) or any(not isinstance(item, str) or _CONTROL.search(item) for item in value):
+                raise RuntimeConfigurationError(f"image {field} inspection is ambiguous")
+            if any(
+                item in {"--privileged", "--network=host", "--pid=host", "--ipc=host"}
+                or item.startswith(("--device", "--cap-add", "--mount", "--volume", "-v"))
+                for item in value
+            ):
+                raise RuntimeConfigurationError(f"image {field} contains an unsafe surprise")
+
+    @staticmethod
+    def _size_bytes(value: str) -> int:
+        match = re.fullmatch(r"([0-9]+)([kKmMgG]?)", value)
+        if match is None:
+            raise ContractError("Docker size value is invalid")
+        number = int(match.group(1))
+        multiplier = {"": 1, "k": 1024, "K": 1024, "m": 1024**2, "M": 1024**2, "g": 1024**3, "G": 1024**3}[match.group(2)]
+        return number * multiplier
+
+    @classmethod
+    def _policy_from_argv(cls, argv: Sequence[str]) -> InvocationPolicy:
+        image = cls._image_from_argv(argv)
+        cpus = cls._flag_value(argv, "--cpus")
+        cpu_number = float(cpus)
+        if not math.isfinite(cpu_number) or cpu_number <= 0:
+            raise ContractError("Docker CPU value is invalid")
+        cpu_millicores = int(round(cpu_number * 1000))
+        if f"{cpu_millicores / 1000:.3f}" != cpus:
+            raise ContractError("Docker CPU value is not canonical")
+        memory_bytes = cls._size_bytes(cls._flag_value(argv, "--memory"))
+        if _size(memory_bytes) != cls._flag_value(argv, "--memory"):
+            raise ContractError("Docker memory value is not canonical")
+        pids_limit = int(cls._flag_value(argv, "--pids-limit"))
+        if str(pids_limit) != cls._flag_value(argv, "--pids-limit"):
+            raise ContractError("Docker PID value is not canonical")
+        stop_timeout = cls._flag_value(argv, "--stop-timeout")
+        if not stop_timeout.isdigit() or int(stop_timeout) < 1 or str(int(stop_timeout)) != stop_timeout:
+            raise ContractError("Docker stop timeout is invalid")
+        tmpfs = cls._flag_value(argv, "--tmpfs")
+        target, options = tmpfs.split(":", 1)
+        if target != _FIXED_TMPFS_TARGET:
+            raise ContractError("Docker tmpfs target is invalid")
+        option_values = options.split(",")
+        fixed_options = _FIXED_TMPFS_OPTIONS.split(",")
+        if set(option_values[: len(fixed_options)]) != set(fixed_options):
+            raise ContractError("Docker tmpfs options are invalid")
+        size_values = [item[5:] for item in option_values[len(fixed_options) :] if item.startswith("size=")]
+        if len(size_values) != 1 or len(option_values) != len(fixed_options) + 1:
+            raise ContractError("Docker tmpfs size is invalid")
+        tmpfs_bytes = cls._size_bytes(size_values[0])
+        if _size(tmpfs_bytes) != size_values[0]:
+            raise ContractError("Docker tmpfs size is not canonical")
+        storage = cls._flag_value(argv, "--storage-opt")
+        if not storage.startswith("size=") or storage.count("=") != 1:
+            raise ContractError("Docker storage size is invalid")
+        storage_bytes = cls._size_bytes(storage[5:])
+        if _size(storage_bytes) != storage[5:]:
+            raise ContractError("Docker storage size is not canonical")
+        return InvocationPolicy(
+            image,
+            cpu_millicores=cpu_millicores,
+            memory_bytes=memory_bytes,
+            pids_limit=pids_limit,
+            tmpfs_bytes=tmpfs_bytes,
+            storage_limit_bytes=storage_bytes,
+        )
+
+    @classmethod
+    def _assert_fixed_argv_shape(cls, argv: Sequence[str]) -> None:
+        if tuple(argv[:2]) != ("docker", "create"):
+            raise ContractError("production runner accepts only fixed docker create argv")
+        allowed_flags = {
+            "--name", "--label", "--pull", "--network", "--read-only",
+            "--security-opt", "--cap-drop", "--user", "--cpus", "--memory",
+            "--pids-limit", "--stop-timeout", "--tmpfs", "--storage-opt",
+            "--log-driver", "--env", "--entrypoint", "--once", "-m",
+        }
+        if any(item.startswith("-") and item not in allowed_flags for item in argv[2:]):
+            raise ContractError("Docker argv contains an unsupported flag")
+        for flag, expected in (
+            ("--pull", _FIXED_PULL_POLICY),
+            ("--network", _FIXED_NETWORK),
+            ("--security-opt", "no-new-privileges"),
+            ("--cap-drop", "ALL"),
+            ("--user", _FIXED_USER),
+            ("--log-driver", _FIXED_LOG_DRIVER),
+            ("--entrypoint", _FIXED_ENTRYPOINT),
+        ):
+            if cls._flag_value(argv, flag) != expected:
+                raise ContractError(f"Docker argv {flag} is not fixed")
+        for flag in ("--read-only",):
+            if list(argv).count(flag) != 1:
+                raise ContractError(f"Docker argv must contain exactly one {flag}")
+        if list(argv).count("--name") != 1 or list(argv).count("--label") != 2 or list(argv).count("--env") != len(_FIXED_ALLOWED_ENV):
+            raise ContractError("Docker argv labels/environment are not fixed")
+        labels = [argv[index + 1] for index, value in enumerate(argv) if value == "--label"]
+        if _FIXED_PROTOCOL_LABEL not in labels or sum(
+            bool(re.fullmatch(r"plane\.agent-runtime/invocation-binding=sha256:[0-9a-f]{64}", item))
+            for item in labels
+        ) != 1:
+            raise ContractError("Docker argv binding labels are not fixed")
+        expected_env = [f"{key}={value}" for key, value in _FIXED_ALLOWED_ENV]
+        actual_env = [argv[index + 1] for index, value in enumerate(argv) if value == "--env"]
+        if actual_env != expected_env:
+            raise ContractError("Docker argv environment is not the fixed allowlist")
+        cls._policy_from_argv(argv)
+
+    def _preflight(self, argv: Sequence[str], *, timeout_seconds: float) -> None:
+        if tuple(argv[:2]) != ("docker", "create"):
+            raise ContractError("production runner accepts only fixed docker create argv")
+        info = self._run_json(("docker", "info", "--format", "{{json .}}"), timeout_seconds=timeout_seconds, label="daemon")
+        if info.get("OSType") != "linux" or not isinstance(info.get("Driver"), str):
+            raise RuntimeConfigurationError("Docker daemon platform or storage driver is ambiguous")
+        if info["Driver"] not in _SUPPORTED_STORAGE_DRIVERS:
+            raise RuntimeConfigurationError("Docker storage driver cannot prove a bounded layer")
+        cgroup_version = info.get("CgroupVersion")
+        if cgroup_version not in {"1", "2"}:
+            raise RuntimeConfigurationError("Docker cgroup version is ambiguous")
+        security_options = info.get("SecurityOptions")
+        if info.get("Rootless") is not False or not isinstance(security_options, list) or any("rootless" in str(item).lower() for item in security_options):
+            raise RuntimeConfigurationError("Docker rootless/security mode is ambiguous")
+        image = self._image_from_argv(argv)
+        image_info = self._run_json(
+            ("docker", "image", "inspect", "--format", "{{json .}}", image),
+            timeout_seconds=timeout_seconds,
+            label="image",
+        )
+        if image_info.get("Os") not in (None, "linux"):
+            raise RuntimeConfigurationError("Docker image platform is not linux")
+        repo_digests = image_info.get("RepoDigests")
+        if not isinstance(repo_digests, list) or image not in repo_digests:
+            raise RuntimeConfigurationError("exact digest-pinned image is not locally verified")
+        config = image_info.get("Config")
+        if not isinstance(config, dict):
+            raise RuntimeConfigurationError("Docker image config is ambiguous")
+        self._image_env(config)
+        self._image_command(config)
+        volumes = config.get("Volumes")
+        if volumes not in (None, {}):
+            raise RuntimeConfigurationError("image-declared volumes are not permitted")
+
+    @staticmethod
+    def _flag_value(argv: Sequence[str], flag: str) -> str:
+        values = [index for index, value in enumerate(argv) if value == flag]
+        if len(values) != 1 or values[0] + 1 >= len(argv):
+            raise ContractError(f"Docker argv must contain exactly one {flag} flag")
+        value = argv[values[0] + 1]
+        if not isinstance(value, str) or _CONTROL.search(value):
+            raise ContractError(f"Docker argv {flag} value is invalid")
+        return value
+
+    @classmethod
+    def _image_from_argv(cls, argv: Sequence[str]) -> str:
+        entrypoint_index = [index for index, value in enumerate(argv) if value == "--entrypoint"]
+        if len(entrypoint_index) != 1:
+            raise ContractError("Docker argv must contain exactly one entrypoint")
+        image_index = entrypoint_index[0] + 2
+        if image_index >= len(argv):
+            raise ContractError("Docker argv has no image")
+        image = argv[image_index]
+        _validate_image_reference(image)
+        if tuple(argv[image_index + 1 :]) != ("-m", _FIXED_SERVICE_MODULE, *_FIXED_SERVICE_ARGS):
+            raise ContractError("Docker argv has an unexpected child command")
+        return image
+
+    def attest_invocation(
+        self,
+        argv: Sequence[str],
+        *,
+        client_env: Mapping[str, str],
+    ) -> EnforcementAttestation:
+        if dict(client_env) != dict(_DOCKER_CLIENT_ENV):
+            raise ContractError("Docker client environment is not the fixed allowlist")
+        name = self._flag_value(argv, "--name")
+        if not _CONTAINER_NAME.fullmatch(name):
+            raise ContractError("Docker argv has an invalid deterministic container name")
+        self._assert_fixed_argv_shape(argv)
+        self._preflight(argv, timeout_seconds=5.0)
+        attestation = EnforcementAttestation(
+            classification="production",
+            argv_digest=_argv_digest(argv),
+            container_name=name,
+            evidence=("daemon_inspected", "image_digest_inspected", "image_config_inspected", "fixed_argv"),
+        )
+        self._attestation = attestation
+        return attestation
+
+    def _inspect_container(self, name: str, *, timeout_seconds: float, allow_absent: bool = False) -> dict[str, object] | None:
+        try:
+            completed = subprocess.run(
+                ("docker", "inspect", "--format", "{{json .}}", name),
+                env=dict(_DOCKER_CLIENT_ENV),
+                cwd="/",
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=max(0.1, timeout_seconds),
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise RuntimeConfigurationError("Docker container inspection failed") from exc
+        if completed.returncode != 0:
+            if allow_absent and b"no such object" in completed.stderr.lower():
+                return None
+            raise RuntimeConfigurationError("Docker container inspection was ambiguous")
+        return _json_object(completed.stdout, "container")
+
+    @staticmethod
+    def _assert_post_launch(container: dict[str, object], argv: Sequence[str], policy: InvocationPolicy) -> None:
+        host = container.get("HostConfig")
+        config = container.get("Config")
+        if not isinstance(host, dict) or not isinstance(config, dict):
+            raise RuntimeConfigurationError("Docker post-launch config is ambiguous")
+        if host.get("NetworkMode") != _FIXED_NETWORK or host.get("ReadonlyRootfs") is not True:
+            raise RuntimeConfigurationError("Docker network/rootfs enforcement did not match")
+        if config.get("User") != _FIXED_USER:
+            raise RuntimeConfigurationError("Docker non-root user enforcement did not match")
+        security = host.get("SecurityOpt")
+        if not isinstance(security, list) or "no-new-privileges:true" not in security:
+            raise RuntimeConfigurationError("Docker no-new-privileges enforcement did not match")
+        cap_drop = host.get("CapDrop")
+        if not isinstance(cap_drop, list) or "ALL" not in cap_drop:
+            raise RuntimeConfigurationError("Docker capability drop enforcement did not match")
+        if host.get("Memory") != policy.memory_bytes or host.get("PidsLimit") != policy.pids_limit:
+            raise RuntimeConfigurationError("Docker memory/PID enforcement did not match")
+        nano_cpus = host.get("NanoCpus")
+        if nano_cpus != int(policy.cpu_millicores * 1_000_000):
+            raise RuntimeConfigurationError("Docker CPU enforcement did not match")
+        tmpfs = host.get("Tmpfs")
+        expected_tmpfs = f"{_FIXED_TMPFS_OPTIONS},size={_size(policy.tmpfs_bytes)}"
+        if not isinstance(tmpfs, dict) or tmpfs.get(_FIXED_TMPFS_TARGET) != expected_tmpfs:
+            raise RuntimeConfigurationError("Docker tmpfs enforcement did not match")
+        storage_opt = host.get("StorageOpt")
+        if not isinstance(storage_opt, dict) or storage_opt.get("size") != _size(policy.storage_limit_bytes):
+            raise RuntimeConfigurationError("Docker storage enforcement did not match")
+        log_config = container.get("LogConfig")
+        if not isinstance(log_config, dict) or log_config.get("Type") != _FIXED_LOG_DRIVER:
+            raise RuntimeConfigurationError("Docker logging enforcement did not match")
+        if (
+            container.get("Mounts") not in ([], None)
+            or host.get("Binds") not in ([], None)
+            or host.get("VolumesFrom") not in ([], None)
+            or host.get("Devices") not in ([], None)
+        ):
+            raise RuntimeConfigurationError("Docker mounts/devices are not isolated")
+        for key in ("PidMode", "IpcMode", "UTSMode", "UsernsMode"):
+            if host.get(key) in {"host", "/host"}:
+                raise RuntimeConfigurationError("Docker host namespace is not isolated")
+        expected_env = [f"{key}={value}" for key, value in _FIXED_ALLOWED_ENV]
+        if config.get("Env") != expected_env:
+            raise RuntimeConfigurationError("Docker environment did not clear image state")
+        if config.get("Entrypoint") != [_FIXED_ENTRYPOINT] or config.get("Cmd") != ["-m", _FIXED_SERVICE_MODULE, *_FIXED_SERVICE_ARGS]:
+            raise RuntimeConfigurationError("Docker child command did not match the fixed command")
+        if container.get("Name") not in (None, f"/{SubprocessDockerRunner._flag_value(argv, '--name')}"):
+            raise RuntimeConfigurationError("Docker container identity did not match")
 
     def launch(
         self,
@@ -668,39 +1078,130 @@ class SubprocessDockerRunner:
         client_env: Mapping[str, str],
         input_bytes: bytes,
     ) -> InvocationProcess:
-        del input_bytes
         if dict(client_env) != dict(_DOCKER_CLIENT_ENV):
             raise ContractError("Docker client environment is not the fixed allowlist")
+        name = self._flag_value(argv, "--name")
+        expected = self._attestation
+        if expected is None or expected.argv_digest != _argv_digest(argv) or expected.container_name != name:
+            raise RuntimeConfigurationError("Docker launch lacks an exact preflight attestation")
+        del input_bytes
         try:
-            name_index = tuple(argv).index("--name") + 1
-            name = tuple(argv)[name_index]
-        except (ValueError, IndexError) as exc:
-            raise ContractError("Docker argv has no valid invocation name") from exc
-        process = _SubprocessDockerProcess(
-            subprocess.Popen(
+            created = subprocess.run(
                 tuple(argv),
-                stdin=subprocess.PIPE,
+                env=dict(_DOCKER_CLIENT_ENV),
+                cwd="/",
+                stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                env=dict(client_env),
-                cwd="/",
-                close_fds=True,
+                timeout=5.0,
+                check=False,
             )
-        )
-        return process
-
-    def _control(self, action: str, name: str, timeout_seconds: float) -> None:
-        if action == "rm":
-            command = ("docker", "rm", "--force", name)
-        elif action == "stop":
-            command = ("docker", "stop", "--time", "1", name)
-        elif action == "kill":
-            command = ("docker", "kill", name)
-        else:  # pragma: no cover - only called by the fixed cleanup methods
-            raise ContractError("unsupported Docker cleanup action")
-        completed = subprocess.run(
-            command,
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise RuntimeConfigurationError("Docker create failed") from exc
+        if created.returncode != 0 or not _HEX_ID.fullmatch(created.stdout.decode("ascii", "ignore").strip()):
+            raise RuntimeConfigurationError("Docker create did not return a bounded container identity")
+        container = self._inspect_container(name, timeout_seconds=5.0)
+        if container is None:
+            raise RuntimeConfigurationError("Docker create identity cannot be inspected")
+        # Reconstruct only the post-launch scalar expectations from the exact
+        # argv that was attested before create.  Dangerous controls remain
+        # module-private and are checked by _assert_fixed_argv_shape.
+        raise_policy = self._policy_from_argv(argv)
+        self._assert_post_launch(container, argv, raise_policy)
+        try:
+            started = subprocess.run(
+                ("docker", "start", name),
+                env=dict(_DOCKER_CLIENT_ENV),
+                cwd="/",
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=5.0,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise RuntimeConfigurationError("Docker start failed") from exc
+        if started.returncode != 0:
+            raise RuntimeConfigurationError("Docker start was rejected")
+        running = self._inspect_container(name, timeout_seconds=5.0)
+        if running is None:
+            raise RuntimeConfigurationError("Docker container disappeared during start")
+        self._assert_post_launch(running, argv, raise_policy)
+        attached = subprocess.Popen(
+            ("docker", "attach", "--sig-proxy=false", name),
             env=dict(_DOCKER_CLIENT_ENV),
+            cwd="/",
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            close_fds=True,
+        )
+        return _SubprocessDockerProcess(attached)
+
+    def cleanup(
+        self,
+        container_name: str,
+        *,
+        stop_timeout_seconds: float,
+        kill_timeout_seconds: float,
+        remove_timeout_seconds: float,
+    ) -> CleanupReport:
+        if not _CONTAINER_NAME.fullmatch(container_name):
+            return CleanupReport(container_name, False, False, False, ("invalid_name",), False)
+        failures: list[str] = []
+        stop_attempted = kill_attempted = remove_attempted = False
+        try:
+            state = self._inspect_container(container_name, timeout_seconds=stop_timeout_seconds, allow_absent=True)
+        except Exception:
+            return CleanupReport(container_name, False, False, False, ("inspect_failed",), False)
+        if state is not None:
+            state_data = state.get("State")
+            running = isinstance(state_data, dict) and state_data.get("Running") is True
+            if running:
+                stop_attempted = True
+                try:
+                    self._control(("docker", "stop", "--time", "1", container_name), stop_timeout_seconds)
+                except Exception:
+                    try:
+                        post_stop = self._inspect_container(container_name, timeout_seconds=stop_timeout_seconds, allow_absent=True)
+                    except Exception:
+                        post_stop = state
+                    still_running = post_stop is not None and isinstance(post_stop.get("State"), dict) and post_stop["State"].get("Running") is True
+                    if still_running:
+                        kill_attempted = True
+                        try:
+                            self._control(("docker", "kill", container_name), kill_timeout_seconds)
+                        except Exception:
+                            failures.append("kill_failed")
+            remove_attempted = True
+            try:
+                self._control(("docker", "rm", "--force", "--volumes", container_name), remove_timeout_seconds)
+            except Exception:
+                try:
+                    if self._inspect_container(container_name, timeout_seconds=remove_timeout_seconds, allow_absent=True) is not None:
+                        failures.append("remove_failed")
+                except Exception:
+                    failures.append("remove_failed")
+        try:
+            absent = self._inspect_container(container_name, timeout_seconds=remove_timeout_seconds, allow_absent=True) is None
+        except Exception:
+            absent = False
+            failures.append("post_cleanup_inspect_failed")
+        return CleanupReport(
+            container_name,
+            stop_attempted,
+            kill_attempted,
+            remove_attempted,
+            tuple(dict.fromkeys(failures)),
+            absent,
+        )
+
+    @staticmethod
+    def _control(command: Sequence[str], timeout_seconds: float) -> None:
+        completed = subprocess.run(
+            tuple(command),
+            env=dict(_DOCKER_CLIENT_ENV),
+            cwd="/",
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -708,20 +1209,11 @@ class SubprocessDockerRunner:
             check=False,
         )
         if completed.returncode != 0:
-            raise RuntimeError("docker cleanup command failed")
-
-    def stop(self, container_name: str, *, timeout_seconds: float) -> None:
-        self._control("stop", container_name, timeout_seconds)
-
-    def kill(self, container_name: str, *, timeout_seconds: float) -> None:
-        self._control("kill", container_name, timeout_seconds)
-
-    def remove(self, container_name: str, *, timeout_seconds: float) -> None:
-        self._control("rm", container_name, timeout_seconds)
+            raise RuntimeConfigurationError("Docker cleanup command failed")
 
 
 class InvocationSupervisor:
-    """Run, bound, and dispose of exactly one invocation process."""
+    """Run, bound, reconcile, and dispose of exactly one invocation."""
 
     def __init__(
         self,
@@ -729,36 +1221,92 @@ class InvocationSupervisor:
         policy: InvocationPolicy,
         runner: DockerRunner,
         terminal_port: TerminalReconciliationPort,
+        lease_authority: CanonicalLeaseAuthority,
+        lease_binding: CanonicalLeaseBinding,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
-        if not isinstance(policy, InvocationPolicy):
-            raise ContractError("invocation policy is invalid")
+        _validate_policy(policy)
         if terminal_port is None:
             raise RuntimeConfigurationError("invocation supervisor requires terminal reconciliation")
+        if lease_authority is None or lease_binding is None:
+            raise RuntimeConfigurationError("invocation supervisor requires host lease authority")
         self.policy = policy
         self.runner = runner
         self.terminal_port = terminal_port
+        self.lease_authority = lease_authority
+        self.lease_binding = lease_binding
+        self._lease_fingerprint = (
+            lease_binding.run_id,
+            lease_binding.invocation_id,
+            lease_binding.lease_id,
+            lease_binding.holder_ref,
+            lease_binding.active,
+            lease_binding.expires_at,
+        )
         self._clock = clock
         self._lock = RLock()
         self._results: dict[tuple[str, str], InvocationResult] = {}
         self._death_receipts: dict[tuple[str, str], TerminalReconciliationReceipt | None] = {}
 
-    def _capability_failure(self) -> bool:
-        capabilities = getattr(self.runner, "capabilities", None)
-        return not isinstance(capabilities, DockerRunnerCapabilities) or bool(capabilities.missing())
+    def _attest(self, argv: Sequence[str]) -> EnforcementAttestation:
+        attest = getattr(self.runner, "attest_invocation", None)
+        if not callable(attest):
+            raise RuntimeConfigurationError("runner has no evidence-based enforcement attestation")
+        result = attest(argv, client_env=dict(_DOCKER_CLIENT_ENV))
+        if not isinstance(result, EnforcementAttestation):
+            raise RuntimeConfigurationError("runner returned an invalid enforcement attestation")
+        expected_name = self._container_name_from_argv(argv)
+        if result.argv_digest != _argv_digest(argv) or result.container_name != expected_name:
+            raise BindingError("runner enforcement attestation is not bound to exact argv")
+        if result.is_production and type(self.runner) is not SubprocessDockerRunner:
+            raise RuntimeConfigurationError("only the inspected subprocess Docker runner may attest production enforcement")
+        return result
+
+    @staticmethod
+    def _container_name_from_argv(argv: Sequence[str]) -> str:
+        indexes = [index for index, value in enumerate(argv) if value == "--name"]
+        if len(indexes) != 1 or indexes[0] + 1 >= len(argv):
+            raise ContractError("Docker argv has no deterministic container name")
+        name = argv[indexes[0] + 1]
+        if not isinstance(name, str) or not _CONTAINER_NAME.fullmatch(name):
+            raise ContractError("Docker argv has an invalid deterministic container name")
+        return name
 
     def _cleanup(self, name: str) -> CleanupReport:
-        failures: list[str] = []
-        for action, timeout in (
-            ("stop", self.policy.stop_timeout_seconds),
-            ("kill", self.policy.kill_timeout_seconds),
-            ("remove", self.policy.remove_timeout_seconds),
+        _validate_policy(self.policy)
+        cleanup = getattr(self.runner, "cleanup", None)
+        if not callable(cleanup):
+            return CleanupReport(name, False, False, False, ("cleanup_not_supported",), False)
+        try:
+            report = cleanup(
+                name,
+                stop_timeout_seconds=float(self.policy.stop_timeout_seconds),
+                kill_timeout_seconds=float(self.policy.kill_timeout_seconds),
+                remove_timeout_seconds=float(self.policy.remove_timeout_seconds),
+            )
+        except Exception:
+            return CleanupReport(name, False, False, False, ("cleanup_failed",), False)
+        if not isinstance(report, CleanupReport) or report.container_name != name:
+            return CleanupReport(name, False, False, False, ("invalid_cleanup_report",), False)
+        return report
+
+    def _validate_host_lease(self, run: RunSnapshot, invocation: InvocationEnvelope) -> None:
+        binding = self.lease_binding
+        if (
+            self._lease_fingerprint
+            != (
+                binding.run_id,
+                binding.invocation_id,
+                binding.lease_id,
+                binding.holder_ref,
+                binding.active,
+                binding.expires_at,
+            )
         ):
-            try:
-                getattr(self.runner, action)(name, timeout_seconds=timeout)
-            except Exception:
-                failures.append(f"{action}_failed")
-        return CleanupReport(name, True, True, True, tuple(failures))
+            raise BindingError("host lease binding was mutated after supervisor construction")
+        if not binding.matches(invocation):
+            raise BindingError("invocation lease is not the canonical host lease")
+        self.lease_authority.validate_lease(run=run, invocation=invocation, binding=binding)
 
     def reconcile_death(
         self,
@@ -766,7 +1314,7 @@ class InvocationSupervisor:
         invocation: InvocationEnvelope,
         *,
         final_sequence: int = 0,
-        reason: str = "runtime process exited before terminal evidence",
+        reason: str = _SAFE_DEATH_REASON,
     ) -> TerminalReconciliationReceipt | None:
         """Reconcile one process death once; repeated races reuse its receipt."""
 
@@ -802,30 +1350,78 @@ class InvocationSupervisor:
         final_sequence: int,
         reason: str,
         evidence: tuple[str, ...],
+        enforcement: EnforcementAttestation | None,
     ) -> InvocationResult:
-        receipt = self.reconcile_death(
-            run,
-            invocation,
-            final_sequence=final_sequence,
-            reason=reason,
-        )
-        status = (
-            "failed"
-            if receipt is not None and receipt.accepted and cleanup.succeeded
-            else "supervisor_action_required"
-        )
+        receipt = self.reconcile_death(run, invocation, final_sequence=final_sequence, reason=reason)
+        status = "failed" if receipt is not None and receipt.accepted and cleanup.succeeded else "supervisor_action_required"
         codes = list(evidence)
-        if not cleanup.succeeded or receipt is None:
-            codes.append("supervisor_action_required")
+        if receipt is None:
+            codes.append("host_reconciliation_missing")
         if not cleanup.succeeded:
-            codes.append("cleanup_failed")
+            codes.extend(("cleanup_failed", "supervisor_action_required"))
         return InvocationResult(
             status=status,
             container_name=name,
             exit=classify_process_death(final_sequence=final_sequence, reason=reason),
             receipt=receipt,
             cleanup=cleanup,
+            enforcement=enforcement,
             evidence=tuple(dict.fromkeys(codes)),
+        )
+
+    def _result_from_proposal(
+        self,
+        run: RunSnapshot,
+        invocation: InvocationEnvelope,
+        *,
+        name: str,
+        parsed: _ParsedOutput,
+        cleanup: CleanupReport,
+        enforcement: EnforcementAttestation,
+    ) -> InvocationResult:
+        try:
+            receipt = reconcile_terminal_proposal(port=self.terminal_port, proposal=parsed.proposal)
+        except Exception:
+            return InvocationResult(
+                status="supervisor_action_required",
+                container_name=name,
+                exit=parsed.exit,
+                proposal=parsed.proposal,
+                cleanup=cleanup,
+                enforcement=enforcement,
+                evidence=("host_reconciliation_failed", "supervisor_action_required"),
+            )
+        if not receipt.accepted or not receipt.legal_transition:
+            return InvocationResult(
+                status="supervisor_action_required",
+                container_name=name,
+                exit=parsed.exit,
+                proposal=parsed.proposal,
+                receipt=receipt,
+                cleanup=cleanup,
+                enforcement=enforcement,
+                evidence=("host_reconciliation_rejected", "supervisor_action_required"),
+            )
+        if not cleanup.succeeded:
+            return InvocationResult(
+                status="supervisor_action_required",
+                container_name=name,
+                exit=parsed.exit,
+                proposal=parsed.proposal,
+                receipt=receipt,
+                cleanup=cleanup,
+                enforcement=enforcement,
+                evidence=("cleanup_failed", "supervisor_action_required"),
+            )
+        return InvocationResult(
+            status=receipt.kind,
+            container_name=name,
+            exit=parsed.exit,
+            proposal=parsed.proposal,
+            receipt=receipt,
+            cleanup=cleanup,
+            enforcement=enforcement,
+            evidence=("host_reconciliation", "enforcement_attested"),
         )
 
     def run_once(
@@ -835,9 +1431,10 @@ class InvocationSupervisor:
         *,
         cancellation: CancellationSignal | None = None,
     ) -> InvocationResult:
-        """Launch and dispose of one invocation; never replay ``outcome_unknown``."""
+        """Launch, bound, reconcile, and dispose of one invocation."""
 
         _validate_binding(run, invocation)
+        _validate_policy(self.policy)
         key = (run.run_id, invocation.invocation_id)
         name = invocation_container_name(run, invocation)
         with self._lock:
@@ -845,74 +1442,74 @@ class InvocationSupervisor:
             if prior is not None:
                 return prior
             if len(self._results) >= _MAX_RETAINED_INVOCATIONS:
-                result = InvocationResult(
-                    status="supervisor_action_required",
-                    container_name=name,
-                    evidence=("supervisor_action_required",),
-                )
+                result = InvocationResult("supervisor_action_required", name, evidence=("supervisor_action_required",))
+                self._results[key] = result
                 return result
-            if self._capability_failure():
-                result = InvocationResult(
-                    status="rejected",
-                    container_name=name,
-                    evidence=("policy_rejected", "runner_capability_missing"),
-                )
+            try:
+                self._validate_host_lease(run, invocation)
+            except (BindingError, ContractError, RuntimeConfigurationError):
+                result = InvocationResult("rejected", name, evidence=("lease_rejected", "supervisor_action_required"))
                 self._results[key] = result
                 return result
             signal = cancellation or _NeverCancelled()
             cancelled, signal_error = _safe_cancel_check(signal)
             if cancelled:
-                evidence = ("cancellation_signal_unavailable",) if signal_error else ("cancellation_signal",)
                 result = InvocationResult(
-                    status="supervisor_action_required",
-                    container_name=name,
-                    evidence=evidence + ("supervisor_action_required",),
+                    "supervisor_action_required",
+                    name,
+                    evidence=(("cancellation_signal_unavailable",) if signal_error else ("cancellation_signal",))
+                    + ("supervisor_action_required",),
                 )
                 self._results[key] = result
                 return result
             try:
                 argv = build_invocation_argv(run, invocation, self.policy)
                 request = _request_bytes(run, invocation, self.policy)
+                enforcement = self._attest(argv)
+            except (ContractError, BoundsError, RuntimeConfigurationError, BindingError):
+                result = InvocationResult("rejected", name, evidence=("policy_rejected", "enforcement_unproven"))
+                self._results[key] = result
+                return result
+            try:
                 process = self.runner.launch(
                     argv,
                     client_env=dict(_DOCKER_CLIENT_ENV),
                     input_bytes=request,
                 )
-            except (ContractError, BoundsError):
-                result = InvocationResult(
-                    status="rejected",
-                    container_name=name,
-                    evidence=("policy_rejected",),
-                )
-                self._results[key] = result
-                return result
             except Exception:
-                result = InvocationResult(
-                    status="supervisor_action_required",
-                    container_name=name,
-                    evidence=("launch_failed", "supervisor_action_required"),
+                cleanup = self._cleanup(name)
+                result = self._result_for_death(
+                    run,
+                    invocation,
+                    name=name,
+                    cleanup=cleanup,
+                    final_sequence=0,
+                    reason="runtime launch failed before terminal evidence",
+                    evidence=("launch_failed",),
+                    enforcement=enforcement,
                 )
                 self._results[key] = result
                 return result
 
-            deadline = self._clock() + self.policy.wall_time_seconds
+            deadline = self._clock() + float(self.policy.wall_time_seconds)
+            collection_failed = False
             try:
                 capture = process.collect(
                     input_bytes=request,
                     deadline=deadline,
-                    stdout_limit_bytes=self.policy.stdout_limit_bytes,
-                    stderr_limit_bytes=self.policy.stderr_limit_bytes,
+                    stdout_limit_bytes=int(self.policy.stdout_limit_bytes),
+                    stderr_limit_bytes=int(self.policy.stderr_limit_bytes),
                     is_cancelled=lambda: _safe_cancel_check(signal)[0],
                 )
             except Exception:
                 capture = ProcessCapture(None)
+                collection_failed = True
             cleanup = self._cleanup(name)
             final_sequence = 0
-            if (
-                capture.output_exceeded
-                or len(capture.stdout) > self.policy.stdout_limit_bytes
-                or len(capture.stderr) > self.policy.stderr_limit_bytes
-            ):
+            if collection_failed:
+                reason = "runtime output was malformed or lacked terminal evidence"
+                evidence = ("collection_failed",)
+            elif capture.output_exceeded or len(capture.stdout) > int(self.policy.stdout_limit_bytes) or len(capture.stderr) > int(self.policy.stderr_limit_bytes):
                 reason = "runtime output exceeded supervisor bounds"
                 evidence = ("output_limit_exceeded",)
             elif capture.timed_out:
@@ -922,43 +1519,27 @@ class InvocationSupervisor:
                 reason = "runtime invocation was stopped by a cancellation signal"
                 evidence = ("cancellation_signal",)
             elif capture.returncode not in (0, None):
-                reason = "runtime process exited before terminal evidence"
+                reason = _SAFE_DEATH_REASON
                 evidence = ("child_nonzero_exit",)
             else:
                 try:
-                    parsed = _parse_child_output(
-                        capture.stdout,
-                        run=run,
-                        invocation=invocation,
-                        policy=self.policy,
-                    )
+                    parsed = _parse_child_output(capture.stdout, run=run, invocation=invocation, policy=self.policy)
                 except Exception:
                     reason = "runtime output was malformed or lacked terminal evidence"
-                    evidence = ("invalid_child_output", "missing_terminal_receipt")
+                    evidence = ("invalid_child_output",)
                 else:
                     final_sequence = parsed.final_sequence
                     if capture.returncode is None:
                         reason = "runtime process died before terminal evidence"
                         evidence = ("child_process_died",)
-                    elif not cleanup.succeeded:
-                        result = InvocationResult(
-                            status="supervisor_action_required",
-                            container_name=name,
-                            exit=parsed.exit,
-                            receipt=parsed.receipt,
-                            cleanup=cleanup,
-                            evidence=("cleanup_failed", "supervisor_action_required"),
-                        )
-                        self._results[key] = result
-                        return result
                     else:
-                        result = InvocationResult(
-                            status=parsed.exit.kind,
-                            container_name=name,
-                            exit=parsed.exit,
-                            receipt=parsed.receipt,
+                        result = self._result_from_proposal(
+                            run,
+                            invocation,
+                            name=name,
+                            parsed=parsed,
                             cleanup=cleanup,
-                            evidence=("terminal_receipt",),
+                            enforcement=enforcement,
                         )
                         self._results[key] = result
                         return result
@@ -970,6 +1551,7 @@ class InvocationSupervisor:
                 final_sequence=final_sequence,
                 reason=reason,
                 evidence=evidence,
+                enforcement=enforcement,
             )
             self._results[key] = result
             return result
@@ -978,6 +1560,7 @@ class InvocationSupervisor:
 __all__ = [
     "CleanupReport",
     "DockerRunnerCapabilities",
+    "EnforcementAttestation",
     "InvocationPolicy",
     "InvocationResult",
     "InvocationSupervisor",

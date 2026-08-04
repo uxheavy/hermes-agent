@@ -66,6 +66,8 @@ from .contract import InvocationEnvelope, PROTOCOL
 
 
 EventSink = Callable[[RuntimeEvent], None]
+TerminalProposalSink = Callable[[TerminalProposal], None]
+TerminalProposalSink = Callable[[TerminalProposal], None]
 
 
 class CancellationSignal(Protocol):
@@ -548,7 +550,7 @@ def _authority_now(clock: Callable[[], datetime]) -> datetime:
 
 
 class FixtureCanonicalLeaseAuthority:
-    """Deterministic host authority used by tests and the demo service only."""
+    """Deterministic host authority used by explicit tests only."""
 
     def __init__(
         self,
@@ -1028,6 +1030,26 @@ def _validate_terminal_evidence(
             raise ContractError("message evidence was forged")
 
 
+def validate_terminal_proposal(
+    *,
+    run: RunSnapshot,
+    invocation: InvocationEnvelope,
+    kind: str,
+    proposal: TerminalProposal,
+    stream: EventStream,
+) -> None:
+    """Validate a child proposal without giving it a reconciliation port."""
+
+    _validate_terminal_evidence(
+        run=run,
+        invocation=invocation,
+        kind=kind,
+        proposal=proposal,
+        stream=stream,
+        cancellation_receipt=proposal.cancellation_receipt,
+    )
+
+
 def _return_terminal(
     *,
     port: TerminalReconciliationPort | None,
@@ -1040,6 +1062,7 @@ def _return_terminal(
     input_request_proposal: InputRequestProposal | None = None,
     artifact_proposals: Iterable[ArtifactProposal] = (),
     message_proposals: Iterable[MessageProposal] = (),
+    proposal_sink: TerminalProposalSink | None = None,
 ) -> RuntimeExit:
     proposal = _terminal_proposal(
         run=run,
@@ -1060,10 +1083,12 @@ def _return_terminal(
         stream=stream,
         cancellation_receipt=cancellation_receipt,
     )
-    receipt = _reconcile_terminal(
-        port,
-        proposal,
-    )
+    if proposal_sink is not None:
+        if port is not None:
+            raise ContractError("terminal proposal cannot use host reconciliation and proposal-only output")
+        proposal_sink(proposal)
+        return exit_value
+    receipt = _reconcile_terminal(port, proposal)
     if not receipt.accepted or not receipt.legal_transition:
         raise TerminalReconciliationRejected(receipt)
     return exit_value
@@ -1082,6 +1107,7 @@ def _return_terminal_safely(
     artifact_proposals: Iterable[ArtifactProposal] = (),
     message_proposals: Iterable[MessageProposal] = (),
     terminal_rejection_sink: _TerminalRejectionSink | None = None,
+    proposal_sink: TerminalProposalSink | None = None,
 ) -> RuntimeExit:
     """Handle validated terminal rejection or convert wire overflow to failure."""
 
@@ -1097,6 +1123,7 @@ def _return_terminal_safely(
             input_request_proposal=input_request_proposal,
             artifact_proposals=artifact_proposals,
             message_proposals=message_proposals,
+            proposal_sink=proposal_sink,
         )
     except TerminalReconciliationRejected as exc:
         if terminal_rejection_sink is None:
@@ -1119,6 +1146,7 @@ def _return_terminal_safely(
                 ),
             ),
             terminal_rejection_sink=terminal_rejection_sink,
+            proposal_sink=proposal_sink,
         )
 
 
@@ -1167,6 +1195,7 @@ def execute(
     terminal_port: TerminalReconciliationPort | None = None,
     execution_phase: ExecutionPhase | None = None,
     _terminal_rejection_sink: _TerminalRejectionSink | None = None,
+    terminal_proposal_sink: TerminalProposalSink | None = None,
 ) -> RuntimeExit:
     """Execute exactly one invocation through the replaceable kernel port.
 
@@ -1188,8 +1217,12 @@ def execute(
         raise ContractError("cancellation signal must return a boolean")
     if lease_authority is None or lease_binding is None:
         raise LeaseError("execution requires an injected canonical lease authority and host binding")
-    if terminal_port is None:
-        raise ContractError("execution requires an injected terminal reconciliation port")
+    if terminal_port is None and terminal_proposal_sink is None:
+        raise ContractError(
+            "execution requires an injected terminal reconciliation port or proposal sink"
+        )
+    if terminal_port is not None and terminal_proposal_sink is not None:
+        raise ContractError("execution cannot reconcile and emit a proposal in the same path")
     if initially_cancelled and cancellation_authority is None:
         raise RuntimeConfigurationError(
             "signalled cancellation requires an injected cancellation authority"
@@ -1235,6 +1268,7 @@ def execute(
             exit_value=RuntimeExit(kind="cancelled", final_sequence=stream.last_sequence),
             cancellation_receipt=cancellation_receipt,
             terminal_rejection_sink=_terminal_rejection_sink,
+            proposal_sink=terminal_proposal_sink,
         )
     kernel = kernel or FakeKernel()
     request = KernelRequest(
@@ -1421,6 +1455,7 @@ def execute(
             artifact_proposals=artifact_proposals,
             message_proposals=message_proposals,
             terminal_rejection_sink=_terminal_rejection_sink,
+            proposal_sink=terminal_proposal_sink,
         )
     except BoundsError:
         # Ingestion limits are an invocation failure, not permission to keep
@@ -1441,6 +1476,7 @@ def execute(
                 ),
             ),
             terminal_rejection_sink=_terminal_rejection_sink,
+            proposal_sink=terminal_proposal_sink,
         )
     if cancellation.is_cancelled():
         cancellation_receipt = _cancellation_receipt(
@@ -1458,6 +1494,7 @@ def execute(
             artifact_proposals=artifact_proposals,
             message_proposals=message_proposals,
             terminal_rejection_sink=_terminal_rejection_sink,
+            proposal_sink=terminal_proposal_sink,
         )
     if result.terminal_kind == "waiting_for_input" and not pending_input_requests:
         raise ContractError("waiting_for_input requires a visible authorized input request")
@@ -1481,6 +1518,7 @@ def execute(
             artifact_proposals=artifact_proposals,
             message_proposals=message_proposals,
             terminal_rejection_sink=_terminal_rejection_sink,
+            proposal_sink=terminal_proposal_sink,
         )
     return _return_terminal_safely(
         port=terminal_port,
@@ -1497,6 +1535,50 @@ def execute(
         artifact_proposals=artifact_proposals,
         message_proposals=message_proposals,
         terminal_rejection_sink=_terminal_rejection_sink,
+        proposal_sink=terminal_proposal_sink,
+    )
+
+
+def execute_proposal_only(
+    *,
+    run: RunSnapshot,
+    invocation: InvocationEnvelope,
+    emit: EventSink | None = None,
+    cancellation: CancellationSignal | None = None,
+    cancellation_authority: CancellationAuthority | None = None,
+    kernel: KernelPort,
+    lease_authority: CanonicalLeaseAuthority,
+    lease_binding: CanonicalLeaseBinding,
+    checkpoint_authority: CheckpointAuthority | None = None,
+    checkpoint_attestation: CheckpointAttestation | None = None,
+    execution_phase: ExecutionPhase | None = None,
+    proposal_sink: TerminalProposalSink,
+) -> RuntimeExit:
+    """Run the untrusted child path and emit one terminal proposal only.
+
+    The child can validate host-supplied lease/checkpoint inputs and translate
+    bounded kernel observations, but it has no terminal port.  Consequently it
+    cannot construct or return a Plane reconciliation receipt.
+    """
+
+    if kernel is None or proposal_sink is None:
+        raise RuntimeConfigurationError(
+            "proposal-only execution requires an injected kernel and proposal sink"
+        )
+    return execute(
+        run=run,
+        invocation=invocation,
+        emit=emit,
+        cancellation=cancellation,
+        cancellation_authority=cancellation_authority,
+        kernel=kernel,
+        lease_authority=lease_authority,
+        lease_binding=lease_binding,
+        checkpoint_authority=checkpoint_authority,
+        checkpoint_attestation=checkpoint_attestation,
+        terminal_port=None,
+        execution_phase=execution_phase,
+        terminal_proposal_sink=proposal_sink,
     )
 
 
@@ -1570,7 +1652,7 @@ class FakeKernel:
 
 
 class FixtureTerminalReconciliationPort:
-    """Explicit atomic fixture for tests and the demo service.
+    """Explicit atomic fixture for tests only.
 
     The fixture intentionally has no separate outcome, artifact, or input
     mutation methods.  All visible terminal product events are applied while

@@ -14,8 +14,7 @@ import os
 import selectors
 import sys
 import time
-from datetime import datetime, timezone
-from typing import Any, BinaryIO, Callable, TextIO
+from typing import BinaryIO, Callable, Protocol, TextIO
 
 from .adapter import (
     CanonicalLeaseAuthority,
@@ -24,11 +23,6 @@ from .adapter import (
     CheckpointAttestation,
     EventCollector,
     ExecutionPhase,
-    FixtureCanonicalLeaseAuthority,
-    FixtureCheckpointAuthority,
-    FixtureTerminalReconciliationPort,
-    FakeKernel,
-    FakeKernelPlan,
     KernelPort,
     CancellationAuthority,
     CancellationSignal,
@@ -37,30 +31,22 @@ from .adapter import (
     TerminalReconciliationError,
     TerminalReconciliationPort,
     execute,
+    execute_proposal_only,
     reconcile_terminal_proposal,
 )
 from .contract import (
-    AssignmentSnapshot,
     BoundsError,
-    ContractDigests,
     ContractError,
     BindingError,
     InvocationEnvelope,
     MAX_INVOCATION_BYTES,
-    MAX_REFERENCE_LENGTH,
     MAX_RUN_SNAPSHOT_BYTES,
-    MAX_TEXT_LENGTH,
     MAX_NEW_CONTEXT_EVENT_REFS,
-    OperationDescriptor,
     RuntimeFailure,
     RuntimeConfigurationError,
-    RuntimeModelRoute,
-    RuntimeBudgetPolicy,
+    RuntimeExit,
     RunSnapshot,
-    RuntimeBudget,
     TerminalProposal,
-    ToolPresentation,
-    VersionedContextRef,
     _check_raw_wire_size,
 )
 
@@ -68,15 +54,12 @@ from .contract import (
 GENERIC_RUNTIME_FAILURE = "runtime execution failed; Plane reconciliation is required"
 InternalFailureHook = Callable[[Exception], None]
 
-# The request carries two independently bounded contracts plus the bounded
-# fake-kernel configuration used only by this deterministic service fixture.
-# The factor of three covers the largest UTF-8-to-JSON-escape expansion before
-# the composite frame is decoded; the final allowance covers object framing.
-MAX_FAKE_PLAN_BYTES = 2 * MAX_TEXT_LENGTH + 2 * MAX_REFERENCE_LENGTH + 8 * 1024
+# The request carries two independently bounded contracts.  The factor of
+# three covers the largest UTF-8-to-JSON-escape expansion before the composite
+# frame is decoded; the final allowance covers object framing.
 MAX_SERVICE_REQUEST_BYTES = (
     3 * MAX_RUN_SNAPSHOT_BYTES
     + 3 * MAX_INVOCATION_BYTES
-    + MAX_FAKE_PLAN_BYTES
     + 16 * 1024
 )
 SERVICE_FRAME_TIMEOUT_SECONDS = 1.0
@@ -232,10 +215,6 @@ def _read_bounded_request_line(
             with reader:
                 return reader.read_frame()
     return reader.read_frame()
-
-
-class _DemoTerminalPort(FixtureTerminalReconciliationPort):
-    """Explicit demo-only atomic fixture, not production durability."""
 
 
 class _CapturingTerminalPort:
@@ -394,164 +373,6 @@ def _handle_terminal_reconciliation_rejection(
     return 1
 
 
-_DEMO_LEASE_BINDINGS = (
-    CanonicalLeaseBinding(
-        run_id="run:one",
-        invocation_id="invocation:one",
-        lease_id="lease:one",
-        holder_ref="host:one",
-        active=True,
-        expires_at="2099-01-01T00:00:00Z",
-    ),
-    CanonicalLeaseBinding(
-        run_id="run:one",
-        invocation_id="invocation:replacement",
-        lease_id="lease:one",
-        holder_ref="host:one",
-        active=True,
-        expires_at="2099-01-01T00:00:00Z",
-    ),
-)
-
-
-def _demo_snapshot() -> RunSnapshot:
-    """Return the fixed host fixture used to attest the demo continuation."""
-
-    return RunSnapshot(
-        protocol="plane.agent-runtime/v1",
-        run_id="run:one",
-        assignment=AssignmentSnapshot(
-            version="assignment:v1",
-            target_ref="issue:one",
-            objective="Produce the assigned result",
-            acceptance_criteria=("The result is deterministic",),
-        ),
-        actor_ref="agent:one",
-        workspace_ref="workspace:one",
-        profile_version="profile:v1",
-        behavioral_prompt="Use the runtime port.",
-        context=(VersionedContextRef("context:one", "sha256:context"),),
-        tool_presentation=ToolPresentation(
-            eager_operations=(OperationDescriptor("operation:read", "sha256:operation"),),
-            catalog_digest="sha256:catalog",
-        ),
-        model=RuntimeModelRoute(model="fake-model", route_ref="route:fake"),
-        total_budget_policy=RuntimeBudgetPolicy(total=RuntimeBudget(5, 100, 100)),
-        contract_digests=ContractDigests("snapshot:v1", "invocation:v1", "event:v1", "exit:v1"),
-    )
-
-
-_DEMO_CHECKPOINT_ATTESTATION = CheckpointAttestation(
-    checkpoint_ref="checkpoint:one",
-    source_run_id="run:one",
-    source_invocation_id="invocation:one",
-    snapshot_digest=_demo_snapshot().digest(),
-    actor_ref="agent:one",
-    profile_version="profile:v1",
-    continuation_event_ref="event:answer",
-    continuation_trigger_kind="continuation",
-    allowed_target_invocation_id="invocation:replacement",
-)
-
-
-def _demo_lease_binding(invocation: InvocationEnvelope) -> CanonicalLeaseBinding:
-    """Select one explicit fixture binding; never copy fields from the envelope."""
-
-    for binding in _DEMO_LEASE_BINDINGS:
-        if (binding.run_id, binding.invocation_id) == (invocation.run_id, invocation.invocation_id):
-            return binding
-    raise ContractError("demo host has no canonical lease fixture for this invocation")
-
-
-def _demo_checkpoint_attestation(invocation: InvocationEnvelope) -> CheckpointAttestation | None:
-    if invocation.checkpoint_ref is None:
-        return None
-    if (
-        invocation.run_id != "run:one"
-        or invocation.invocation_id != "invocation:replacement"
-        or invocation.checkpoint_ref != "checkpoint:one"
-        or invocation.trigger.kind != "continuation"
-        or invocation.trigger.event_ref != "event:answer"
-    ):
-        raise ContractError("demo host has no canonical checkpoint fixture for this invocation")
-    return _DEMO_CHECKPOINT_ATTESTATION
-
-
-def _fake_plan(raw: Any) -> FakeKernelPlan:
-    if raw is None:
-        return FakeKernelPlan()
-    if not isinstance(raw, dict):
-        raise ContractError("fakePlan must be an object")
-    fake_plan_size = len(
-        json.dumps(raw, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode(
-            "utf-8"
-        )
-    )
-    if fake_plan_size > MAX_FAKE_PLAN_BYTES:
-        raise ContractError("fakePlan exceeds its bounded service request surface")
-    unknown = sorted(set(raw).difference({
-        "transcript",
-        "transcriptRef",
-        "usage",
-        "terminalKind",
-        "inputRequest",
-        "inputRequestRef",
-        "outcomeSubmissionRequested",
-        "publicationRequested",
-        "holdAfterObservations",
-    }))
-    if unknown:
-        raise ContractError(f"fakePlan has unknown field(s): {', '.join(unknown)}")
-    defaults = FakeKernelPlan()
-    usage = raw.get("usage")
-    transcript = raw.get("transcript", defaults.transcript)
-    transcript_ref = raw.get("transcriptRef", defaults.transcript_ref)
-    terminal_kind = raw.get("terminalKind", defaults.terminal_kind)
-    input_request = raw.get("inputRequest")
-    input_request_ref = raw.get("inputRequestRef", defaults.input_request_ref)
-    outcome_submission_requested = raw.get(
-        "outcomeSubmissionRequested", defaults.outcome_submission_requested
-    )
-    publication_requested = raw.get("publicationRequested", False)
-    hold_after_observations = raw.get("holdAfterObservations")
-    if not isinstance(transcript, str) or not transcript:
-        raise ContractError("fakePlan.transcript must be a non-empty string")
-    if not isinstance(transcript_ref, str) or not transcript_ref:
-        raise ContractError("fakePlan.transcriptRef must be a non-empty string")
-    if not isinstance(terminal_kind, str):
-        raise ContractError("fakePlan.terminalKind must be a string")
-    if input_request is not None and (not isinstance(input_request, str) or not input_request):
-        raise ContractError("fakePlan.inputRequest must be a non-empty string")
-    if not isinstance(input_request_ref, str) or not input_request_ref:
-        raise ContractError("fakePlan.inputRequestRef must be a non-empty string")
-    if not isinstance(publication_requested, bool):
-        raise ContractError("fakePlan.publicationRequested must be a boolean")
-    if not isinstance(outcome_submission_requested, bool):
-        raise ContractError("fakePlan.outcomeSubmissionRequested must be a boolean")
-    if hold_after_observations is not None and (
-        isinstance(hold_after_observations, bool)
-        or not isinstance(hold_after_observations, int)
-        or hold_after_observations < 1
-    ):
-        raise ContractError("fakePlan.holdAfterObservations must be an integer >= 1")
-    return FakeKernelPlan(
-        transcript=transcript,
-        transcript_ref=transcript_ref,
-        usage=RuntimeBudget.from_dict(
-            usage
-            if usage is not None
-            else {"iterations": 1, "inputTokens": 0, "outputTokens": 4},
-            "fakePlan.usage",
-        ),
-        terminal_kind=terminal_kind,
-        input_request=input_request,
-        input_request_ref=input_request_ref,
-        outcome_submission_requested=outcome_submission_requested,
-        publication_requested=publication_requested,
-        hold_after_observations=hold_after_observations,
-    )
-
-
 def serve_once(
     request_line: str,
     output: TextIO,
@@ -568,7 +389,13 @@ def serve_once(
     internal_failure_hook: InternalFailureHook | None = None,
     emit_terminal_receipt: bool = False,
 ) -> int:
-    """Read one serialized invocation and write event/exit JSON lines."""
+    """Trusted-host convenience path that reconciles through ``terminal_port``.
+
+    The fixed container command never calls this function.  The production
+    child path is :func:`serve_once_proposal_only`, which has no terminal port.
+    The kernel is always injected; the production ``main`` path never
+    constructs a fixture kernel.
+    """
 
     run: RunSnapshot | None = None
     invocation: InvocationEnvelope | None = None
@@ -590,12 +417,11 @@ def serve_once(
         request = json.loads(request_line)
         if not isinstance(request, dict):
             raise ContractError("service request must be an object")
-        unknown = sorted(set(request).difference({"run", "invocation", "fakePlan"}))
+        unknown = sorted(set(request).difference({"run", "invocation"}))
         if unknown:
             raise ContractError(f"service request has unknown field(s): {', '.join(unknown)}")
         run = RunSnapshot.from_dict(request.get("run"))
         invocation = InvocationEnvelope.from_dict(request.get("invocation"))
-        plan = _fake_plan(request.get("fakePlan"))
         checkpoint_configuration_missing = invocation.checkpoint_ref is not None and (
             checkpoint_authority is None or checkpoint_attestation is None
         )
@@ -603,6 +429,7 @@ def serve_once(
             lease_authority is None
             or lease_binding is None
             or terminal_port is None
+            or kernel is None
             or checkpoint_configuration_missing
         ):
             output.write(
@@ -654,7 +481,7 @@ def serve_once(
             emit=emit,
             cancellation=cancellation,
             cancellation_authority=cancellation_authority,
-            kernel=kernel or FakeKernel(plan),
+            kernel=kernel,
             lease_authority=lease_authority,
             lease_binding=lease_binding,
             checkpoint_authority=checkpoint_authority,
@@ -745,6 +572,141 @@ def serve_once(
         )
 
 
+def serve_once_proposal_only(
+    request_line: str,
+    output: TextIO,
+    *,
+    lease_authority: CanonicalLeaseAuthority | None,
+    lease_binding: CanonicalLeaseBinding | None,
+    checkpoint_authority: CheckpointAuthority | None = None,
+    checkpoint_attestation: CheckpointAttestation | None = None,
+    cancellation: CancellationSignal | None = None,
+    cancellation_authority: CancellationAuthority | None = None,
+    kernel: KernelPort | None,
+    internal_failure_hook: InternalFailureHook | None = None,
+) -> int:
+    """Run one child invocation and emit observations, proposal, and exit only."""
+
+    run: RunSnapshot | None = None
+    invocation: InvocationEnvelope | None = None
+    collector: EventCollector | None = None
+    proposals: list[TerminalProposal] = []
+    try:
+        if "\n" in request_line:
+            if not request_line.endswith("\n") or request_line.count("\n") != 1:
+                raise ContractError("service request must be one JSON line")
+            request_line = request_line[:-1]
+            if request_line.endswith("\r"):
+                request_line = request_line[:-1]
+        request_line = _check_raw_wire_size(request_line, "serviceRequest", MAX_SERVICE_REQUEST_BYTES)
+        request = json.loads(request_line)
+        if not isinstance(request, dict):
+            raise ContractError("service request must be an object")
+        unknown = sorted(set(request).difference({"run", "invocation"}))
+        if unknown:
+            raise ContractError(f"service request has unknown field(s): {', '.join(unknown)}")
+        run = RunSnapshot.from_dict(request.get("run"))
+        invocation = InvocationEnvelope.from_dict(request.get("invocation"))
+        if kernel is None or lease_authority is None or lease_binding is None:
+            raise RuntimeConfigurationError("proposal-only execution has no injected runtime binding")
+        if invocation.checkpoint_ref is not None and (
+            checkpoint_authority is None or checkpoint_attestation is None
+        ):
+            raise RuntimeConfigurationError("proposal-only continuation has no checkpoint binding")
+    except (ContractError, TypeError, json.JSONDecodeError):
+        output.write(json.dumps({"type": "error", "error": {"code": "invalid_request", "message": "invalid runtime request"}}, sort_keys=True) + "\n")
+        output.flush()
+        raise
+
+    collector = EventCollector(
+        run_id=run.run_id,
+        invocation_id=invocation.invocation_id,
+        expected_causation_ref=invocation.causation_ref,
+    )
+
+    def emit(event) -> None:
+        collector.emit(event)
+        output.write(json.dumps({"type": "event", "event": event.to_dict()}, sort_keys=True) + "\n")
+        output.flush()
+
+    try:
+        exit_value = execute_proposal_only(
+            run=run,
+            invocation=invocation,
+            emit=emit,
+            cancellation=cancellation,
+            cancellation_authority=cancellation_authority,
+            kernel=kernel,
+            lease_authority=lease_authority,
+            lease_binding=lease_binding,
+            checkpoint_authority=checkpoint_authority,
+            checkpoint_attestation=checkpoint_attestation,
+            execution_phase=ExecutionPhase(),
+            proposal_sink=proposals.append,
+        )
+    except (BindingError, LeaseError):
+        output.write(json.dumps({"type": "error", "error": {"code": "binding_rejected", "message": "runtime binding rejected"}}, sort_keys=True) + "\n")
+        output.flush()
+        return 1
+    except RuntimeConfigurationError:
+        output.write(json.dumps({"type": "error", "error": {"code": "runtime_configuration", "message": "runtime dependencies are not configured"}}, sort_keys=True) + "\n")
+        output.flush()
+        return 1
+    except Exception as exc:
+        if internal_failure_hook is not None:
+            try:
+                internal_failure_hook(exc)
+            except Exception:
+                pass
+        proposals.append(
+            TerminalProposal(
+                run_id=run.run_id,
+                invocation_id=invocation.invocation_id,
+                actor_ref=run.actor_ref,
+                workspace_ref=run.workspace_ref,
+                snapshot_digest=run.digest(),
+                kind="failed",
+                final_sequence=collector.last_sequence,
+                evidence_event_ids=tuple(event.event_id for event in collector.events[-MAX_NEW_CONTEXT_EVENT_REFS:]),
+                failure=RuntimeFailure(
+                    code="runtime_exception",
+                    message="runtime execution failed; host reconciliation is required",
+                    retryable=True,
+                ),
+            )
+        )
+        exit_value = RuntimeExit(
+            kind="failed",
+            final_sequence=collector.last_sequence,
+            failure=RuntimeFailure(
+                code="runtime_exception",
+                message="runtime execution failed; host reconciliation is required",
+                retryable=True,
+            ),
+        )
+    if len(proposals) != 1:
+        output.write(json.dumps({"type": "error", "error": {"code": "proposal_missing", "message": "runtime did not emit exactly one terminal proposal"}}, sort_keys=True) + "\n")
+        output.flush()
+        return 1
+    output.write(json.dumps({"type": "proposal", "proposal": proposals[0].to_dict()}, sort_keys=True) + "\n")
+    output.write(json.dumps({"type": "exit", "exit": exit_value.to_dict()}, sort_keys=True) + "\n")
+    output.flush()
+    return 0
+
+
+class _ProductionBinding(Protocol):
+    """Future real-kernel binding; no production instance is configured here."""
+
+    kernel: KernelPort
+    lease_authority: CanonicalLeaseAuthority
+    lease_binding: CanonicalLeaseBinding
+    checkpoint_authority: CheckpointAuthority | None
+    checkpoint_attestation: CheckpointAttestation | None
+
+
+_PRODUCTION_BINDING: _ProductionBinding | None = None
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run one Plane Agent runtime invocation")
     parser.add_argument("--once", action="store_true", help="accept one JSON-lines invocation (the default)")
@@ -761,27 +723,26 @@ def main(argv: list[str] | None = None) -> int:
         request = json.loads(request_line)
         if not isinstance(request, dict):
             raise ContractError("service request must be an object")
-        run = RunSnapshot.from_dict(request.get("run"))
-        invocation = InvocationEnvelope.from_dict(request.get("invocation"))
-        lease_binding = _demo_lease_binding(invocation)
-        lease_authority = FixtureCanonicalLeaseAuthority(
-            _DEMO_LEASE_BINDINGS, clock=lambda: datetime.now(timezone.utc)
-        )
-        checkpoint_attestation = _demo_checkpoint_attestation(invocation)
-        checkpoint_authority = (
-            FixtureCheckpointAuthority([checkpoint_attestation])
-            if checkpoint_attestation is not None
-            else None
-        )
-        return serve_once(
+        if not isinstance(request, dict) or set(request) != {"run", "invocation"}:
+            raise ContractError("production runtime request has unsupported fields")
+        # Parsing proves the fixed command accepts arbitrary valid envelopes,
+        # but it does not authorize execution.  A real KernelPort binding must
+        # be installed by the future runtime service; fail closed otherwise.
+        RunSnapshot.from_dict(request.get("run"))
+        InvocationEnvelope.from_dict(request.get("invocation"))
+        binding = _PRODUCTION_BINDING
+        if binding is None:
+            sys.stdout.write(json.dumps({"type": "error", "error": {"code": "runtime_configuration", "message": "no real kernel binding is configured"}}, sort_keys=True) + "\n")
+            sys.stdout.flush()
+            return 2
+        return serve_once_proposal_only(
             request_line,
             sys.stdout,
-            lease_authority=lease_authority,
-            lease_binding=lease_binding,
-            checkpoint_authority=checkpoint_authority,
-            checkpoint_attestation=checkpoint_attestation,
-            terminal_port=_DemoTerminalPort(),
-            emit_terminal_receipt=True,
+            lease_authority=binding.lease_authority,
+            lease_binding=binding.lease_binding,
+            checkpoint_authority=binding.checkpoint_authority,
+            checkpoint_attestation=binding.checkpoint_attestation,
+            kernel=binding.kernel,
         )
     except Exception:
         return 2

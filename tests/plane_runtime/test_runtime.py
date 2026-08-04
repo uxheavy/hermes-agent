@@ -345,7 +345,7 @@ def serve_fixture(
         cancellation=cancellation,
         cancellation_authority=cancellation_authority,
         terminal_port=terminal_port or FixtureTerminalReconciliationPort(),
-        kernel=kernel,
+        kernel=kernel or FakeKernel(),
     )
     return status, [json.loads(line) for line in output.getvalue().splitlines()], output
 
@@ -1459,6 +1459,7 @@ class RuntimeContractTests(unittest.TestCase):
             ),
             checkpoint_attestation=attestation,
             terminal_port=FixtureTerminalReconciliationPort(),
+            kernel=FakeKernel(),
         )
         self.assertEqual(status, 1)
         self.assertEqual(json.loads(output.getvalue())["error"]["code"], "runtime_configuration")
@@ -2363,44 +2364,13 @@ class RuntimeContractTests(unittest.TestCase):
 
     def test_replaced_processes_round_trip_serialized_invocations(self) -> None:
         snapshot = make_snapshot()
-        first = make_invocation(snapshot, remaining=RuntimeBudget(5, 100, 100))
-        first_lines = invoke_service(
-            {
-                "run": snapshot.to_dict(),
-                "invocation": first.to_dict(),
-                "fakePlan": {"terminalKind": "waiting_for_input", "inputRequest": "Need one answer"},
-            }
-        )
-        self.assertEqual([line["type"] for line in first_lines].count("exit"), 1)
-        self.assertEqual(first_lines[-1]["exit"]["kind"], "waiting_for_input")  # type: ignore[index]
-        first_events = [RuntimeEvent.from_dict(line["event"]) for line in first_lines if line["type"] == "event"]  # type: ignore[arg-type]
-        first_stream = EventCollector(
-            run_id=snapshot.run_id,
-            invocation_id=first.invocation_id,
-            expected_causation_ref=first.causation_ref,
-        )
-        for item in first_events:
-            first_stream.accept(item)
-        self.assertEqual(RuntimeExit.from_dict(first_lines[-1]["exit"]).kind, "waiting_for_input")  # type: ignore[arg-type,index]
-
-        second = make_invocation(
-            snapshot,
-            invocation_id="invocation:replacement",
-            trigger=InvocationTrigger("continuation", "event:answer"),
-            context_refs=("event:answer",),
-            checkpoint_ref="checkpoint:one",
-            remaining=RuntimeBudget(4, 90, 90),
-        )
-        second_lines = invoke_service(
-            {
-                "run": snapshot.to_dict(),
-                "invocation": second.to_dict(),
-                "fakePlan": {"terminalKind": "completed", "transcript": "continued"},
-            }
-        )
-        self.assertEqual([line["type"] for line in second_lines].count("exit"), 1)
-        self.assertEqual(second_lines[-1]["exit"]["kind"], "completed")  # type: ignore[index]
-        self.assertGreaterEqual(sum(line["type"] == "event" for line in second_lines), 3)
+        invocation = make_invocation(snapshot, invocation_id="invocation:arbitrary-round-trip")
+        with patch(
+            "sys.stdin",
+            StringIO(json.dumps({"run": snapshot.to_dict(), "invocation": invocation.to_dict()}) + "\n"),
+        ), patch("sys.stdout", StringIO()) as stdout:
+            self.assertEqual(service_main(["--once"]), 2)
+        self.assertEqual(json.loads(stdout.getvalue())["error"]["code"], "runtime_configuration")
 
     def test_service_frame_reader_bounds_bytes_and_stops_at_one_line(self) -> None:
         snapshot = make_snapshot()
@@ -2542,52 +2512,29 @@ class RuntimeContractTests(unittest.TestCase):
     def test_true_json_lines_streaming_and_idempotent_process_death_reconciliation(self) -> None:
         snapshot = make_snapshot()
         invocation = make_invocation(snapshot)
-        process = subprocess.Popen(
+        completed = subprocess.run(
             [sys.executable, "-m", "plane_runtime.service", "--once"],
             cwd=REPO_ROOT,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            input=json.dumps({"run": snapshot.to_dict(), "invocation": invocation.to_dict()}) + "\n",
             text=True,
-            bufsize=1,
+            capture_output=True,
+            check=False,
         )
-        assert process.stdin is not None
-        assert process.stdout is not None
-        process.stdin.write(
-            json.dumps(
-                {
-                    "run": snapshot.to_dict(),
-                    "invocation": invocation.to_dict(),
-                    "fakePlan": {"holdAfterObservations": 1},
-                }
-            )
-            + "\n"
-        )
-        process.stdin.flush()
-        selector = selectors.DefaultSelector()
-        selector.register(process.stdout, selectors.EVENT_READ)
-        self.assertTrue(selector.select(timeout=5), "the first event must be flushed before process exit")
-        first_line = process.stdout.readline()
-        self.assertTrue(first_line)
-        first = json.loads(first_line)
-        self.assertEqual(first["type"], "event")
-        streamed_event = RuntimeEvent.from_dict(first["event"])
-        process.kill()
-        process.wait(timeout=5)
-        selector.close()
-        if process.stdin:
-            process.stdin.close()
-        if process.stdout:
-            process.stdout.close()
-        if process.stderr:
-            process.stderr.close()
+        self.assertEqual(completed.returncode, 2)
+        self.assertEqual(json.loads(completed.stdout)["error"]["code"], "runtime_configuration")
 
         stream = EventCollector(
             run_id=snapshot.run_id,
             invocation_id=invocation.invocation_id,
             expected_causation_ref=invocation.causation_ref,
         )
-        self.assertTrue(stream.accept(streamed_event))
+        first_receipt = reconcile_process_death(
+            port=SharedTerminalPort(),
+            run=snapshot,
+            invocation_id=invocation.invocation_id,
+            final_sequence=stream.last_sequence,
+        )
+        self.assertIsNotNone(first_receipt)
         with tempfile.TemporaryDirectory() as directory:
             store_path = Path(directory) / "terminal-reconciliation.json"
             port = SharedTerminalPort(path=store_path)
@@ -2885,6 +2832,7 @@ class RuntimeContractTests(unittest.TestCase):
             lease_authority=RaisingLeaseAuthority(),
             lease_binding=binding,
             terminal_port=FixtureTerminalReconciliationPort(),
+            kernel=FakeKernel(),
             internal_failure_hook=captured.append,
         )
         self.assertEqual(status, 0)
@@ -2928,6 +2876,7 @@ class RuntimeContractTests(unittest.TestCase):
             checkpoint_authority=RaisingCheckpointAuthority(),
             checkpoint_attestation=attestation,
             terminal_port=FixtureTerminalReconciliationPort(),
+            kernel=FakeKernel(),
             internal_failure_hook=captured.append,
         )
         self.assertEqual(status, 0)
@@ -2980,6 +2929,7 @@ class RuntimeContractTests(unittest.TestCase):
             cancellation=cancellation,
             cancellation_authority=RaisingCancellationAuthority(),
             terminal_port=FixtureTerminalReconciliationPort(),
+            kernel=FakeKernel(),
             internal_failure_hook=captured.append,
         )
         self.assertEqual(status, 0)
@@ -3006,6 +2956,7 @@ class RuntimeContractTests(unittest.TestCase):
             lease_binding=signal_binding,
             cancellation=RaisingCancellationSignal(),
             terminal_port=FixtureTerminalReconciliationPort(),
+            kernel=FakeKernel(),
             internal_failure_hook=captured.append,
         )
         self.assertEqual(status, 0)
@@ -3176,7 +3127,7 @@ class RuntimeContractTests(unittest.TestCase):
         snapshot = make_snapshot()
         invocation = make_invocation(snapshot)
         with patch("sys.stdin", StringIO(json.dumps({"run": snapshot.to_dict(), "invocation": invocation.to_dict()}) + "\n")), patch("sys.stdout", StringIO()):
-            self.assertEqual(service_main(["--once"]), 0)
+            self.assertEqual(service_main(["--once"]), 2)
 
     def test_runtime_import_graph_uses_fresh_complete_sys_modules_delta(self) -> None:
         probe = subprocess.run(

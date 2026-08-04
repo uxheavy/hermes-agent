@@ -80,20 +80,30 @@ are replaceable infrastructure, never run-owned state. A supervisor may use
 process-death proposal through the reconciliation port when a replaceable
 process dies before returning an exit.
 
-`invocation_supervisor.py` adds the first production-directed isolation slice.
-`InvocationPolicy` accepts only a digest-pinned image and emits one fixed
-`python3 -m plane_runtime.service --once` Docker command with network disabled,
-read-only rootfs, no-new-privileges, all capabilities dropped, a non-root
-user, bounded CPU/memory/PIDs/tmpfs, and no host mounts or ambient environment.
-The injected `DockerRunner` must explicitly advertise every required
-enforcement and cleanup capability; a missing capability rejects launch before
-Docker is called. `InvocationSupervisor.run_once()` bounds request, frame,
-stdout, stderr, and wall-time handling, always attempts stop/kill/remove for
-the derived invocation container, and requires both a valid `RuntimeExit` and
-an accepted terminal receipt before returning `completed`. Process death,
-malformed output, timeout, cancellation, and cleanup failure are non-success
-outcomes; death reconciliation is idempotent and never replays an
-`outcome_unknown` result.
+`invocation_supervisor.py` is a supervisor policy and host-reconciliation
+foundation. The child protocol emits bounded observations, one untrusted
+terminal proposal, and one exit; it never emits a reconciliation receipt or
+Plane proof. The trusted supervisor validates the exact run, invocation,
+snapshot, lease, sequence, and proposal bindings, then submits the proposal
+once through its injected `TerminalReconciliationPort`. Product status is
+derived only from the accepted host receipt.
+
+The fixed child command uses `docker create`, `start`, and `attach` with
+module-private network, namespace, privilege, mount, environment, logging,
+storage, and cleanup controls. `SubprocessDockerRunner` performs bounded
+daemon, image, and post-launch inspections and rejects ambiguity; injected
+test runners carry an explicit test trust classification and cannot produce a
+`production_completed` result. Cleanup proves deterministic container absence
+after stop/kill/remove-volume attempts.
+
+The package does not claim a real Hermes `KernelPort`, provider credentials,
+Operation Gateway, deployment, checkpoint service, or generated TypeScript
+isolation. Real Docker enforcement is unproven unless a local daemon and
+already-present digest-pinned image pass the inspection path; this slice does
+not pull images or contact a registry. The production CLI fails closed until a
+real kernel binding is installed. The trusted `serve_once` function remains a
+host/test convenience; fixture/demo authorities are not command-line runtime
+entrypoints.
 
 Verify the package from the repository root:
 

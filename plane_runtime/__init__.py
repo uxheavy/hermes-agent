@@ -23,8 +23,10 @@ from .adapter import (
     TerminalReconciliationRejected,
     classify_process_death,
     execute,
+    execute_proposal_only,
     reconcile_terminal_proposal,
     reconcile_process_death,
+    validate_terminal_proposal,
 )
 from .contract import (
     MAX_ACCEPTANCE_CRITERIA,
@@ -97,14 +99,6 @@ from .contract import (
     UsageObserved,
     VersionedContextRef,
     parse_utc_timestamp,
-)
-from .invocation_supervisor import (
-    DockerRunnerCapabilities,
-    InvocationPolicy,
-    InvocationResult,
-    InvocationSupervisor,
-    build_invocation_argv,
-    build_invocation_env,
 )
 
 __all__ = [
@@ -199,13 +193,9 @@ __all__ = [
     "VersionedContextRef",
     "classify_process_death",
     "execute",
+    "execute_proposal_only",
     "parse_utc_timestamp",
     "reconcile_terminal_proposal",
     "reconcile_process_death",
-    "DockerRunnerCapabilities",
-    "InvocationPolicy",
-    "InvocationResult",
-    "InvocationSupervisor",
-    "build_invocation_argv",
-    "build_invocation_env",
+    "validate_terminal_proposal",
 ]
