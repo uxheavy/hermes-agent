@@ -2,17 +2,28 @@
 
 from __future__ import annotations
 
-import ast
+import copy
+import importlib
 import json
+import selectors
 import subprocess
 import sys
+import unittest
 from dataclasses import replace
+from datetime import datetime, timezone
+from io import StringIO
 from pathlib import Path
-
-import pytest
+from types import ModuleType
 
 from plane_runtime import (
+    MAX_ACCEPTANCE_CRITERIA,
+    MAX_CONTEXT_REFS,
+    MAX_EAGER_OPERATIONS,
+    MAX_INVOCATION_BYTES,
+    MAX_NEW_CONTEXT_EVENT_REFS,
+    MAX_RUN_SNAPSHOT_BYTES,
     PROTOCOL,
+    ArtifactObserved,
     AssignmentSnapshot,
     BindingError,
     BoundsError,
@@ -23,9 +34,12 @@ from plane_runtime import (
     FakeKernelPlan,
     InvocationEnvelope,
     InvocationTrigger,
+    LeaseError,
     MutableCancellation,
     OperationDescriptor,
+    ProductReceipt,
     ProgressObserved,
+    PublicationReceipt,
     RecordingHost,
     RuntimeBudget,
     RuntimeBudgetPolicy,
@@ -36,13 +50,22 @@ from plane_runtime import (
     RuntimeModelRoute,
     RunSnapshot,
     SequenceError,
+    SupervisorReconciler,
     ToolPresentation,
     TranscriptObserved,
+    TrustedRuntimeSupervisor,
     UsageObserved,
     VersionedContextRef,
     classify_process_death,
     execute,
+    parse_utc_timestamp,
 )
+from plane_runtime.adapter import KernelObservation, KernelRequest, KernelResult
+from plane_runtime.service import serve_once
+
+
+TRUSTED_NOW = datetime(2026, 8, 4, tzinfo=timezone.utc)
+REPO_ROOT = Path(__file__).parents[2]
 
 
 def make_snapshot(*, total: RuntimeBudget | None = None) -> RunSnapshot:
@@ -93,17 +116,30 @@ def make_invocation(
     )
 
 
-def event(*, sequence: int, event_id: str = "event:one", run_id: str = "run:one") -> RuntimeEvent:
+def event(
+    *,
+    sequence: int,
+    event_id: str = "event:one",
+    idempotency_key: str | None = None,
+    run_id: str = "run:one",
+    correlation_ref: str = "cause:one",
+) -> RuntimeEvent:
     return RuntimeEvent(
         protocol=PROTOCOL,
         run_id=run_id,
         invocation_id="invocation:one",
         sequence=sequence,
         event_id=event_id,
-        correlation_ref="cause:one",
-        idempotency_key=event_id,
+        correlation_ref=correlation_ref,
+        idempotency_key=idempotency_key or event_id,
         body=ProgressObserved("observed"),
     )
+
+
+def run_execute(*, snapshot: RunSnapshot, invocation: InvocationEnvelope, **kwargs) -> RuntimeExit:
+    kwargs.setdefault("clock", lambda: TRUSTED_NOW)
+    kwargs.setdefault("host", RecordingHost())
+    return execute(run=snapshot, invocation=invocation, **kwargs)
 
 
 def invoke_service(request: dict[str, object]) -> list[dict[str, object]]:
@@ -113,289 +149,623 @@ def invoke_service(request: dict[str, object]) -> list[dict[str, object]]:
         text=True,
         capture_output=True,
         check=True,
+        cwd=REPO_ROOT,
     )
     return [json.loads(line) for line in completed.stdout.splitlines()]
 
 
-def test_run_snapshot_is_deeply_immutable() -> None:
-    criteria = ["one"]
-    context = [VersionedContextRef("context:one", "digest")]
-    snapshot = make_snapshot()
-    snapshot = RunSnapshot(
-        protocol=snapshot.protocol,
-        run_id=snapshot.run_id,
-        assignment=AssignmentSnapshot("v1", "target", "objective", criteria),
-        actor_ref=snapshot.actor_ref,
-        profile_version=snapshot.profile_version,
-        behavioral_prompt=snapshot.behavioral_prompt,
-        context=context,
-        tool_presentation=snapshot.tool_presentation,
-        model=snapshot.model,
-        total_budget_policy=snapshot.total_budget_policy,
-        contract_digests=snapshot.contract_digests,
-    )
-
-    criteria.append("mutated outside")
-    context.append(VersionedContextRef("context:two", "digest"))
-    assert snapshot.assignment.acceptance_criteria == ("one",)
-    assert snapshot.context == (VersionedContextRef("context:one", "digest"),)
-    with pytest.raises((AttributeError, TypeError)):
-        snapshot.run_id = "mutated"  # type: ignore[misc]
-    wire = snapshot.to_dict()
-    wire["assignment"]["acceptanceCriteria"].append("mutated wire")
-    assert snapshot.assignment.acceptance_criteria == ("one",)
+class ArtifactKernel:
+    def dispatch(self, request: KernelRequest, emit, cancellation) -> KernelResult:
+        del request, cancellation
+        emit(
+            KernelObservation(
+                kind="artifact",
+                artifact_ref="artifact:one",
+                artifact_digest="sha256:artifact",
+            )
+        )
+        return KernelResult("completed")
 
 
-def test_contracts_round_trip_through_json() -> None:
-    snapshot = make_snapshot()
-    invocation = make_invocation(snapshot)
-    transcript_event = RuntimeEvent(
-        PROTOCOL,
-        snapshot.run_id,
-        invocation.invocation_id,
-        1,
-        "event:transcript",
-        invocation.causation_ref,
-        "event:transcript",
-        TranscriptObserved("transcript:one", "final text is evidence"),
-    )
-    exit_value = RuntimeExit(
-        "failed",
-        1,
-        RuntimeFailure("process_died", "the replaceable process exited", True),
-    )
-
-    assert RunSnapshot.from_json(snapshot.to_json()) == snapshot
-    assert InvocationEnvelope.from_json(invocation.to_json()) == invocation
-    assert RuntimeEvent.from_json(transcript_event.to_json()) == transcript_event
-    assert RuntimeExit.from_json(exit_value.to_json()) == exit_value
+class BadInputReceiptHost(RecordingHost):
+    def request_input(self, **kwargs) -> ProductReceipt:
+        receipt = super().request_input(**kwargs)
+        return replace(receipt, resource_ref="input:forged")
 
 
-def test_later_input_is_an_event_reference_and_does_not_mutate_snapshot() -> None:
-    snapshot = make_snapshot()
-    before = snapshot.to_json()
-    invocation = make_invocation(
-        snapshot,
-        trigger=InvocationTrigger("human_input", "event:answer"),
-        context_refs=("event:answer",),
-        remaining=RuntimeBudget(4, 90, 90),
-    )
-    kernel = FakeKernel()
-    execute(run=snapshot, invocation=invocation, host=RecordingHost(), kernel=kernel)
-
-    assert snapshot.to_json() == before
-    assert invocation.trigger.event_ref == "event:answer"
-    assert "answer content" not in invocation.to_json()
-    assert kernel.requests[0].new_context_event_refs == ("event:answer",)
+class BadPublicationReceiptHost(RecordingHost):
+    def publish_transcript(self, **kwargs) -> PublicationReceipt:
+        receipt = super().publish_transcript(**kwargs)
+        return replace(receipt, invocation_id="invocation:forged")
 
 
-def test_remaining_budget_is_cumulative_across_invocations() -> None:
-    snapshot = make_snapshot(total=RuntimeBudget(5, 100, 100))
-    first = make_invocation(snapshot, remaining=RuntimeBudget(5, 100, 100))
-    first_kernel = FakeKernel(FakeKernelPlan(usage=RuntimeBudget(2, 10, 20)))
-    assert execute(run=snapshot, invocation=first, host=RecordingHost(), kernel=first_kernel).kind == "completed"
-
-    second = make_invocation(
-        snapshot,
-        invocation_id="invocation:two",
-        trigger=InvocationTrigger("continuation", "event:continuation"),
-        remaining=RuntimeBudget(3, 90, 80),
-    )
-    second_kernel = FakeKernel(FakeKernelPlan(usage=RuntimeBudget(3, 90, 80)))
-    assert execute(run=snapshot, invocation=second, host=RecordingHost(), kernel=second_kernel).kind == "completed"
-    assert second_kernel.requests[0].remaining_budget == RuntimeBudget(3, 90, 80)
-    with pytest.raises(ContractError):
-        execute(
-            run=snapshot,
-            invocation=make_invocation(snapshot, remaining=RuntimeBudget(6, 100, 100)),
-            host=RecordingHost(),
+class RuntimeContractTests(unittest.TestCase):
+    def test_run_snapshot_is_deeply_immutable(self) -> None:
+        criteria = ["one"]
+        context = [VersionedContextRef("context:one", "digest")]
+        base = make_snapshot()
+        snapshot = replace(
+            base,
+            assignment=AssignmentSnapshot("v1", "target", "objective", criteria),
+            context=context,
         )
 
+        criteria.append("mutated outside")
+        context.append(VersionedContextRef("context:two", "digest"))
+        self.assertEqual(snapshot.assignment.acceptance_criteria, ("one",))
+        self.assertEqual(snapshot.context, (VersionedContextRef("context:one", "digest"),))
+        with self.assertRaises((AttributeError, TypeError)):
+            snapshot.run_id = "mutated"  # type: ignore[misc]
+        wire = snapshot.to_dict()
+        wire["assignment"]["acceptanceCriteria"].append("mutated wire")
+        self.assertEqual(snapshot.assignment.acceptance_criteria, ("one",))
 
-def test_adapter_rejects_binding_mismatch() -> None:
-    snapshot = make_snapshot()
-    wrong_run = replace(make_invocation(snapshot), run_id="run:other")
-    with pytest.raises(BindingError):
-        execute(run=snapshot, invocation=wrong_run, host=RecordingHost())
+    def test_contracts_round_trip_through_json(self) -> None:
+        snapshot = make_snapshot()
+        invocation = make_invocation(snapshot)
+        transcript_event = RuntimeEvent(
+            PROTOCOL,
+            snapshot.run_id,
+            invocation.invocation_id,
+            1,
+            "event:transcript",
+            invocation.causation_ref,
+            "event:transcript",
+            TranscriptObserved("transcript:one", "final text is evidence"),
+        )
+        exit_value = RuntimeExit(
+            "failed",
+            1,
+            RuntimeFailure("process_died", "the replaceable process exited", True),
+        )
 
-    collector = EventCollector(run_id=snapshot.run_id, invocation_id="invocation:one")
-    with pytest.raises(BindingError):
-        collector.accept(event(sequence=1, run_id="run:other"))
+        self.assertEqual(RunSnapshot.from_json(snapshot.to_json()), snapshot)
+        self.assertEqual(InvocationEnvelope.from_json(invocation.to_json()), invocation)
+        self.assertEqual(RuntimeEvent.from_json(transcript_event.to_json()), transcript_event)
+        self.assertEqual(RuntimeExit.from_json(exit_value.to_json()), exit_value)
 
+    def test_all_wire_parsers_reject_unknown_fields_in_nested_objects(self) -> None:
+        snapshot = make_snapshot().to_dict()
+        snapshot_cases = [
+            ({**snapshot, "forged": True}, RunSnapshot),
+            ({**snapshot, "assignment": {**snapshot["assignment"], "forged": True}}, RunSnapshot),
+            ({**snapshot, "context": [{**snapshot["context"][0], "forged": True}]}, RunSnapshot),
+            (
+                {
+                    **snapshot,
+                    "toolPresentation": {
+                        **snapshot["toolPresentation"],
+                        "eagerOperations": [{**snapshot["toolPresentation"]["eagerOperations"][0], "forged": True}],
+                    },
+                },
+                RunSnapshot,
+            ),
+            ({**snapshot, "model": {**snapshot["model"], "forged": True}}, RunSnapshot),
+            (
+                {
+                    **snapshot,
+                    "totalBudgetPolicy": {
+                        "total": {**snapshot["totalBudgetPolicy"]["total"], "forged": True}
+                    },
+                },
+                RunSnapshot,
+            ),
+            (
+                {
+                    **snapshot,
+                    "contractDigests": {**snapshot["contractDigests"], "forged": True},
+                },
+                RunSnapshot,
+            ),
+        ]
+        for payload, parser in snapshot_cases:
+            with self.subTest(parser=parser.__name__, payload=payload):
+                with self.assertRaises(ContractError):
+                    parser.from_dict(payload)
 
-def test_event_stream_is_duplicate_safe_but_strictly_ordered() -> None:
-    collector = EventCollector(run_id="run:one", invocation_id="invocation:one")
-    first = event(sequence=1)
-    assert collector.accept(first) is True
-    assert collector.accept(first) is False
-    with pytest.raises(SequenceError):
-        collector.accept(event(sequence=3, event_id="event:three"))
-    with pytest.raises(SequenceError):
-        collector.accept(event(sequence=2, event_id="event:one"))
+        invocation = make_invocation(make_snapshot()).to_dict()
+        invocation_cases = [
+            ({**invocation, "forged": True}, InvocationEnvelope),
+            ({**invocation, "trigger": {**invocation["trigger"], "forged": True}}, InvocationEnvelope),
+            ({**invocation, "lease": {**invocation["lease"], "forged": True}}, InvocationEnvelope),
+            (
+                {
+                    **invocation,
+                    "remainingBudget": {**invocation["remainingBudget"], "forged": True},
+                },
+                InvocationEnvelope,
+            ),
+        ]
+        for payload, parser in invocation_cases:
+            with self.subTest(parser=parser.__name__, payload=payload):
+                with self.assertRaises(ContractError):
+                    parser.from_dict(payload)
 
+        runtime_event = event(sequence=1).to_dict()
+        event_cases = [
+            {**runtime_event, "forged": True},
+            {**runtime_event, "body": {**runtime_event["body"], "forged": True}},
+        ]
+        for payload in event_cases:
+            with self.subTest(payload=payload):
+                with self.assertRaises(ContractError):
+                    RuntimeEvent.from_dict(payload)
 
-def test_cancellation_is_invocation_scoped() -> None:
-    cancellation = MutableCancellation()
-    cancellation.cancel()
-    snapshot = make_snapshot()
-    events: list[RuntimeEvent] = []
-    exit_value = execute(
-        run=snapshot,
-        invocation=make_invocation(snapshot),
-        host=RecordingHost(),
-        emit=events.append,
-        cancellation=cancellation,
-    )
-    assert exit_value == RuntimeExit("cancelled", 0)
-    assert events == []
+        with self.assertRaises(ContractError):
+            RuntimeExit.from_dict({**RuntimeExit("completed", 0).to_dict(), "forged": True})
+        with self.assertRaises(ContractError):
+            RuntimeFailure.from_dict({"code": "x", "message": "x", "retryable": False, "forged": True})
 
-    cancellation = MutableCancellation()
-    kernel = FakeKernel(on_step=cancellation.cancel)
-    exit_value = execute(
-        run=snapshot,
-        invocation=make_invocation(snapshot, invocation_id="invocation:cancelled"),
-        host=RecordingHost(),
-        cancellation=cancellation,
-        kernel=kernel,
-    )
-    assert exit_value.kind == "cancelled"
-    assert exit_value.final_sequence == 1
+    def test_event_bodies_require_product_receipts(self) -> None:
+        input_body = {"kind": "input_request", "requestRef": "input:one", "prompt": "answer"}
+        artifact_body = {"kind": "artifact", "artifactRef": "artifact:one", "digest": "sha256:x"}
+        for body in (input_body, artifact_body):
+            with self.subTest(body=body):
+                with self.assertRaises(ContractError):
+                    RuntimeEvent.from_dict(
+                        {
+                            **event(sequence=1).to_dict(),
+                            "body": body,
+                        }
+                    )
 
+    def test_later_input_is_an_event_reference_and_does_not_mutate_snapshot(self) -> None:
+        snapshot = make_snapshot()
+        before = snapshot.to_json()
+        invocation = make_invocation(
+            snapshot,
+            trigger=InvocationTrigger("human_input", "event:answer"),
+            context_refs=("event:answer",),
+            remaining=RuntimeBudget(4, 90, 90),
+        )
+        kernel = FakeKernel()
+        run_execute(snapshot=snapshot, invocation=invocation, kernel=kernel)
 
-def test_checkpoint_continuation_is_passed_without_kernel_durable_state() -> None:
-    snapshot = make_snapshot()
-    invocation = make_invocation(
-        snapshot,
-        trigger=InvocationTrigger("recoverable_restart", "event:restart"),
-        checkpoint_ref="checkpoint:one",
-        context_refs=("event:restart",),
-        remaining=RuntimeBudget(3, 80, 80),
-    )
-    kernel = FakeKernel()
-    execute(run=snapshot, invocation=invocation, host=RecordingHost(), kernel=kernel)
-    request = kernel.requests[0]
-    assert request.checkpoint_ref == "checkpoint:one"
-    assert request.trigger_kind == "recoverable_restart"
-    assert request.new_context_event_refs == ("event:restart",)
+        self.assertEqual(snapshot.to_json(), before)
+        self.assertEqual(invocation.trigger.event_ref, "event:answer")
+        self.assertNotIn("answer content", invocation.to_json())
+        self.assertEqual(kernel.requests[0].new_context_event_refs, ("event:answer",))
 
+    def test_runtime_total_budget_cap_is_enforced_and_forwarded(self) -> None:
+        snapshot = make_snapshot(total=RuntimeBudget(5, 100, 100))
+        invocation = make_invocation(snapshot, remaining=RuntimeBudget(3, 90, 80))
+        kernel = FakeKernel(FakeKernelPlan(usage=RuntimeBudget(3, 90, 80)))
+        self.assertEqual(run_execute(snapshot=snapshot, invocation=invocation, kernel=kernel).kind, "completed")
+        self.assertEqual(kernel.requests[0].remaining_budget, RuntimeBudget(3, 90, 80))
+        with self.assertRaises(ContractError):
+            run_execute(
+                snapshot=snapshot,
+                invocation=make_invocation(snapshot, remaining=RuntimeBudget(6, 100, 100)),
+            )
 
-def test_transcript_is_not_published_without_explicit_action() -> None:
-    host = RecordingHost()
-    snapshot = make_snapshot()
-    events: list[RuntimeEvent] = []
-    exit_value = execute(
-        run=snapshot,
-        invocation=make_invocation(snapshot),
-        host=host,
-        emit=events.append,
-        kernel=FakeKernel(FakeKernelPlan(publication_requested=False)),
-    )
-    assert exit_value.kind == "completed"
-    assert any(isinstance(item.body, TranscriptObserved) for item in events)
-    assert not any(item.body.to_dict()["kind"] == "conversation_publication" for item in events)
-    assert host.publications == []
+    def test_runtime_does_not_claim_later_plane_cumulative_accounting(self) -> None:
+        snapshot = make_snapshot(total=RuntimeBudget(5, 100, 100))
+        first = make_invocation(snapshot, remaining=RuntimeBudget(5, 100, 100))
+        second = make_invocation(
+            snapshot,
+            invocation_id="invocation:two",
+            trigger=InvocationTrigger("continuation", "event:continuation"),
+            remaining=RuntimeBudget(3, 90, 80),
+        )
+        first_kernel = FakeKernel(FakeKernelPlan(usage=RuntimeBudget(2, 10, 20)))
+        second_kernel = FakeKernel(FakeKernelPlan(usage=RuntimeBudget(3, 90, 80)))
+        self.assertEqual(run_execute(snapshot=snapshot, invocation=first, kernel=first_kernel).kind, "completed")
+        self.assertEqual(run_execute(snapshot=snapshot, invocation=second, kernel=second_kernel).kind, "completed")
+        self.assertEqual(second_kernel.requests[0].remaining_budget, RuntimeBudget(3, 90, 80))
 
+    def test_event_stream_binds_correlation_and_idempotency(self) -> None:
+        collector = EventCollector(
+            run_id="run:one",
+            invocation_id="invocation:one",
+            expected_correlation_ref="cause:one",
+        )
+        first = event(sequence=1, idempotency_key="idem:one")
+        self.assertTrue(collector.accept(first))
+        self.assertFalse(collector.accept(first))
+        with self.assertRaises(BindingError):
+            collector.accept(event(sequence=2, event_id="event:two", correlation_ref="forged"))
+        with self.assertRaises(SequenceError):
+            collector.accept(event(sequence=2, event_id="event:two", idempotency_key="idem:one"))
+        with self.assertRaises(SequenceError):
+            collector.accept(event(sequence=3, event_id="event:three"))
+        with self.assertRaises(SequenceError):
+            collector.accept(event(sequence=2, event_id="event:one", idempotency_key="idem:changed"))
 
-def test_explicit_publication_requires_and_correlates_a_receipt() -> None:
-    snapshot = make_snapshot()
-    host = RecordingHost()
-    events: list[RuntimeEvent] = []
-    exit_value = execute(
-        run=snapshot,
-        invocation=make_invocation(snapshot),
-        host=host,
-        emit=events.append,
-        kernel=FakeKernel(FakeKernelPlan(publication_requested=True)),
-    )
-    assert exit_value.kind == "completed"
-    assert len(host.publications) == 1
-    publication = [item for item in events if item.body.to_dict()["kind"] == "conversation_publication"]
-    assert len(publication) == 1
-    assert publication[0].body.to_dict()["receiptRef"].startswith("receipt:")
+    def test_adapter_rejects_binding_mismatch(self) -> None:
+        snapshot = make_snapshot()
+        wrong_run = replace(make_invocation(snapshot), run_id="run:other")
+        with self.assertRaises(BindingError):
+            run_execute(snapshot=snapshot, invocation=wrong_run)
 
-    with pytest.raises(ContractError):
-        execute(
-            run=snapshot,
-            invocation=make_invocation(snapshot, invocation_id="invocation:no-host"),
-            host=None,
+        collector = EventCollector(run_id=snapshot.run_id, invocation_id="invocation:one")
+        with self.assertRaises(BindingError):
+            collector.accept(event(sequence=1, run_id="run:other"))
+
+    def test_cancellation_is_invocation_scoped(self) -> None:
+        cancellation = MutableCancellation()
+        cancellation.cancel()
+        snapshot = make_snapshot()
+        events: list[RuntimeEvent] = []
+        exit_value = run_execute(
+            snapshot=snapshot,
+            invocation=make_invocation(snapshot),
+            emit=events.append,
+            cancellation=cancellation,
+        )
+        self.assertEqual(exit_value, RuntimeExit("cancelled", 0))
+        self.assertEqual(events, [])
+
+        cancellation = MutableCancellation()
+        kernel = FakeKernel(on_step=cancellation.cancel)
+        exit_value = run_execute(
+            snapshot=snapshot,
+            invocation=make_invocation(snapshot, invocation_id="invocation:cancelled"),
+            cancellation=cancellation,
+            kernel=kernel,
+        )
+        self.assertEqual(exit_value.kind, "cancelled")
+        self.assertEqual(exit_value.final_sequence, 1)
+
+    def test_timestamp_and_lease_validation_use_trusted_authority(self) -> None:
+        self.assertEqual(parse_utc_timestamp("2026-08-04T00:00:00Z"), datetime(2026, 8, 4, tzinfo=timezone.utc))
+        for timestamp in ("2026-08-04T00:00:00+00:00", "2026-08-04T00:00:00", "2026-08-04T01:00:00+01:00"):
+            with self.subTest(timestamp=timestamp):
+                with self.assertRaises(ContractError):
+                    parse_utc_timestamp(timestamp)
+
+        snapshot = make_snapshot()
+        expired = replace(
+            make_invocation(snapshot),
+            lease=RuntimeLease("lease:one", "host:one", "2026-08-04T00:00:00Z"),
+        )
+        with self.assertRaises(LeaseError):
+            execute(run=snapshot, invocation=expired, host=RecordingHost(), clock=lambda: TRUSTED_NOW)
+        with self.assertRaises(LeaseError):
+            execute(run=snapshot, invocation=make_invocation(snapshot), host=RecordingHost())
+
+    def test_initial_checkpoint_is_rejected_and_continuation_requires_supervisor_attestation(self) -> None:
+        snapshot = make_snapshot()
+        with self.assertRaises(ContractError):
+            make_invocation(snapshot, checkpoint_ref="checkpoint:forged")
+        continuation = make_invocation(
+            snapshot,
+            trigger=InvocationTrigger("recoverable_restart", "event:restart"),
+            checkpoint_ref="checkpoint:one",
+            context_refs=("event:restart",),
+            remaining=RuntimeBudget(3, 80, 80),
+        )
+        with self.assertRaises(ContractError):
+            execute(run=snapshot, invocation=continuation, host=RecordingHost(), clock=lambda: TRUSTED_NOW)
+        kernel = FakeKernel()
+        run_execute(
+            snapshot=snapshot,
+            invocation=continuation,
+            kernel=kernel,
+            supervisor=TrustedRuntimeSupervisor(clock=lambda: TRUSTED_NOW, checkpoint_refs={"checkpoint:one"}),
+        )
+        self.assertEqual(kernel.requests[0].checkpoint_ref, "checkpoint:one")
+        with self.assertRaises(BindingError):
+            run_execute(
+                snapshot=snapshot,
+                invocation=replace(continuation, checkpoint_ref="checkpoint:forged"),
+                supervisor=TrustedRuntimeSupervisor(clock=lambda: TRUSTED_NOW, checkpoint_refs={"checkpoint:one"}),
+            )
+
+    def test_input_requests_are_authorized_receipt_correlated_and_terminally_consistent(self) -> None:
+        snapshot = make_snapshot()
+        host = RecordingHost()
+        events: list[RuntimeEvent] = []
+        exit_value = run_execute(
+            snapshot=snapshot,
+            invocation=make_invocation(snapshot),
+            host=host,
+            emit=events.append,
+            kernel=FakeKernel(FakeKernelPlan(terminal_kind="waiting_for_input", input_request="Need one answer")),
+        )
+        self.assertEqual(exit_value.kind, "waiting_for_input")
+        input_events = [item for item in events if item.body.to_dict()["kind"] == "input_request"]
+        self.assertEqual(len(input_events), 1)
+        self.assertEqual(input_events[0].body.to_dict()["receiptRef"], "receipt:invocation:one:input:input:fake")
+        self.assertEqual(len(host.input_requests), 1)
+
+        with self.assertRaises(ContractError):
+            run_execute(
+                snapshot=snapshot,
+                invocation=make_invocation(snapshot, invocation_id="invocation:completed-input"),
+                kernel=FakeKernel(FakeKernelPlan(terminal_kind="completed", input_request="Need one answer")),
+            )
+        with self.assertRaises(ContractError):
+            run_execute(
+                snapshot=snapshot,
+                invocation=make_invocation(snapshot, invocation_id="invocation:no-input"),
+                kernel=FakeKernel(FakeKernelPlan(terminal_kind="waiting_for_input")),
+            )
+        with self.assertRaises(BindingError):
+            run_execute(
+                snapshot=snapshot,
+                invocation=make_invocation(snapshot, invocation_id="invocation:forged-input"),
+                host=BadInputReceiptHost(),
+                kernel=FakeKernel(FakeKernelPlan(terminal_kind="waiting_for_input", input_request="Need one answer")),
+            )
+
+    def test_artifacts_are_authorized_receipt_correlated_and_not_a_second_mutation_path(self) -> None:
+        snapshot = make_snapshot()
+        host = RecordingHost()
+        events: list[RuntimeEvent] = []
+        exit_value = run_execute(
+            snapshot=snapshot,
+            invocation=make_invocation(snapshot),
+            host=host,
+            emit=events.append,
+            kernel=ArtifactKernel(),
+        )
+        self.assertEqual(exit_value.kind, "completed")
+        artifact = [item for item in events if isinstance(item.body, ArtifactObserved)]
+        self.assertEqual(len(artifact), 1)
+        self.assertEqual(artifact[0].body.receipt_ref, "receipt:invocation:one:artifact:artifact:one")
+        self.assertEqual(host.artifacts, [("run:one", "artifact:one", "invocation:one:artifact:artifact:one")])
+
+    def test_transcript_is_evidence_and_explicit_publication_requires_correlated_receipt(self) -> None:
+        host = RecordingHost()
+        snapshot = make_snapshot()
+        events: list[RuntimeEvent] = []
+        exit_value = run_execute(
+            snapshot=snapshot,
+            invocation=make_invocation(snapshot),
+            host=host,
+            emit=events.append,
+            kernel=FakeKernel(FakeKernelPlan(publication_requested=False)),
+        )
+        self.assertEqual(exit_value.kind, "completed")
+        self.assertTrue(any(isinstance(item.body, TranscriptObserved) for item in events))
+        self.assertFalse(any(item.body.to_dict()["kind"] == "conversation_publication" for item in events))
+        self.assertEqual(host.publications, [])
+
+        events = []
+        exit_value = run_execute(
+            snapshot=snapshot,
+            invocation=make_invocation(snapshot, invocation_id="invocation:published"),
+            host=host,
+            emit=events.append,
             kernel=FakeKernel(FakeKernelPlan(publication_requested=True)),
         )
+        self.assertEqual(exit_value.kind, "completed")
+        publication = [item for item in events if item.body.to_dict()["kind"] == "conversation_publication"]
+        self.assertEqual(len(publication), 1)
+        self.assertTrue(publication[0].body.to_dict()["receiptRef"].startswith("receipt:"))
+        with self.assertRaises(BindingError):
+            run_execute(
+                snapshot=snapshot,
+                invocation=make_invocation(snapshot, invocation_id="invocation:bad-publication"),
+                host=BadPublicationReceiptHost(),
+                kernel=FakeKernel(FakeKernelPlan(publication_requested=True)),
+            )
 
+    def test_payloads_are_bounded_at_event_and_contract_boundaries(self) -> None:
+        with self.assertRaises(BoundsError):
+            RuntimeEvent(
+                PROTOCOL,
+                "run:one",
+                "invocation:one",
+                1,
+                "event:large",
+                "cause:one",
+                "event:large",
+                TranscriptObserved("transcript:large", "x" * 40_000),
+            )
 
-def test_payloads_are_bounded_at_the_event_boundary() -> None:
-    with pytest.raises(BoundsError):
-        RuntimeEvent(
-            PROTOCOL,
-            "run:one",
-            "invocation:one",
-            1,
-            "event:large",
-            "cause:one",
-            "event:large",
-            TranscriptObserved("transcript:large", "x" * 40_000),
-        )
+        criteria = tuple("criterion" for _ in range(MAX_ACCEPTANCE_CRITERIA))
+        replace(make_snapshot(), assignment=replace(make_snapshot().assignment, acceptance_criteria=criteria))
+        with self.assertRaises(BoundsError):
+            AssignmentSnapshot("v1", "target", "objective", criteria + ("overflow",))
 
+        context = tuple(VersionedContextRef(f"context:{i}", "digest") for i in range(MAX_CONTEXT_REFS))
+        replace(make_snapshot(), context=context)
+        with self.assertRaises(BoundsError):
+            replace(make_snapshot(), context=context + (VersionedContextRef("context:overflow", "digest"),))
 
-def test_replaced_processes_round_trip_serialized_invocations() -> None:
-    snapshot = make_snapshot()
-    first = make_invocation(snapshot, remaining=RuntimeBudget(5, 100, 100))
-    first_lines = invoke_service(
-        {
-            "run": snapshot.to_dict(),
-            "invocation": first.to_dict(),
-            "fakePlan": {"terminalKind": "waiting_for_input", "inputRequest": "Need one answer"},
-        }
-    )
-    assert [line["type"] for line in first_lines].count("exit") == 1
-    assert first_lines[-1]["exit"]["kind"] == "waiting_for_input"  # type: ignore[index]
-    first_events = [
-        RuntimeEvent.from_dict(line["event"])
-        for line in first_lines
-        if line["type"] == "event"
-    ]
-    first_stream = EventCollector(run_id=snapshot.run_id, invocation_id=first.invocation_id)
-    for item in first_events:
-        first_stream.accept(item)
-    assert RuntimeExit.from_dict(first_lines[-1]["exit"]).kind == "waiting_for_input"  # type: ignore[arg-type,index]
+        operations = tuple(OperationDescriptor(f"operation:{i}", "digest") for i in range(MAX_EAGER_OPERATIONS))
+        replace(make_snapshot(), tool_presentation=ToolPresentation(operations, "catalog"))
+        with self.assertRaises(BoundsError):
+            ToolPresentation(operations + (OperationDescriptor("operation:overflow", "digest"),), "catalog")
 
-    second = make_invocation(
-        snapshot,
-        invocation_id="invocation:replacement",
-        trigger=InvocationTrigger("continuation", "event:answer"),
-        context_refs=("event:answer",),
-        checkpoint_ref="checkpoint:one",
-        remaining=RuntimeBudget(4, 90, 90),
-    )
-    second_lines = invoke_service(
-        {
-            "run": snapshot.to_dict(),
-            "invocation": second.to_dict(),
-            "fakePlan": {"terminalKind": "completed", "transcript": "continued"},
-        }
-    )
-    assert [line["type"] for line in second_lines].count("exit") == 1
-    assert second_lines[-1]["exit"]["kind"] == "completed"  # type: ignore[index]
-    assert sum(line["type"] == "event" for line in second_lines) >= 3
+        refs = tuple(f"event:{i}" for i in range(MAX_NEW_CONTEXT_EVENT_REFS))
+        replace(make_invocation(make_snapshot()), new_context_event_refs=refs)
+        with self.assertRaises(BoundsError):
+            replace(make_invocation(make_snapshot()), new_context_event_refs=refs + ("event:overflow",))
 
+    def test_snapshot_and_invocation_accept_exact_byte_boundary_and_reject_one_byte_over(self) -> None:
+        base = make_snapshot()
+        prefix = ("x" * 32_000,) * 4
+        def snapshot_for_length(length: int) -> RunSnapshot:
+            return replace(
+                base,
+                assignment=replace(base.assignment, acceptance_criteria=prefix + ("x" * length,)),
+            )
 
-def test_supervisor_classifies_process_death_as_one_terminal_exit() -> None:
-    exit_value = classify_process_death(final_sequence=2)
-    assert exit_value.kind == "failed"
-    assert exit_value.failure is not None
-    assert exit_value.failure.code == "process_died"
-    assert RuntimeExit.from_json(exit_value.to_json()) == exit_value
-
-
-def test_runtime_package_has_no_product_or_network_imports() -> None:
-    package = Path(__file__).parents[2] / "plane_runtime"
-    forbidden = {"run_agent", "model_tools", "gateway", "hermes_state", "requests", "httpx"}
-    for path in package.glob("*.py"):
-        tree = ast.parse(path.read_text())
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Import):
-                names = [alias.name.split(".")[0] for alias in node.names]
-            elif isinstance(node, ast.ImportFrom) and node.module:
-                names = [node.module.split(".")[0]]
+        low, high = 1, 32_000
+        while low < high:
+            middle = (low + high + 1) // 2
+            try:
+                snapshot_for_length(middle)
+            except BoundsError:
+                high = middle - 1
             else:
-                continue
-            assert not forbidden.intersection(names), f"forbidden import in {path}: {names}"
+                low = middle
+        exact_snapshot = snapshot_for_length(low)
+        if len(exact_snapshot.to_json().encode("utf-8")) != MAX_RUN_SNAPSHOT_BYTES:
+            exact_snapshot = None
+        self.assertIsNotNone(exact_snapshot, "the snapshot byte boundary must be reachable")
+        assert exact_snapshot is not None
+        self.assertEqual(len(exact_snapshot.to_json().encode("utf-8")), MAX_RUN_SNAPSHOT_BYTES)
+        last = exact_snapshot.assignment.acceptance_criteria[-1]
+        with self.assertRaises(BoundsError):
+            replace(
+                exact_snapshot,
+                assignment=replace(
+                    exact_snapshot.assignment,
+                    acceptance_criteria=exact_snapshot.assignment.acceptance_criteria[:-1] + (last + "x",),
+                ),
+            )
+
+        invocation_base = make_invocation(base)
+        ref_prefix = tuple(f"e{i}:" + ("x" * 252) for i in range(61))
+        def invocation_for_length(length: int) -> InvocationEnvelope:
+            return replace(
+                invocation_base,
+                new_context_event_refs=ref_prefix + ("last:" + "x" * length,),
+            )
+
+        low, high = 1, 251
+        while low < high:
+            middle = (low + high + 1) // 2
+            try:
+                invocation_for_length(middle)
+            except BoundsError:
+                high = middle - 1
+            else:
+                low = middle
+        exact_invocation = invocation_for_length(low)
+        if len(exact_invocation.to_json().encode("utf-8")) != MAX_INVOCATION_BYTES:
+            exact_invocation = None
+        self.assertIsNotNone(exact_invocation, "the invocation byte boundary must be reachable")
+        assert exact_invocation is not None
+        self.assertEqual(len(exact_invocation.to_json().encode("utf-8")), MAX_INVOCATION_BYTES)
+        last = exact_invocation.new_context_event_refs[-1]
+        with self.assertRaises(BoundsError):
+            replace(exact_invocation, new_context_event_refs=exact_invocation.new_context_event_refs[:-1] + (last + "x",))
+
+    def test_replaced_processes_round_trip_serialized_invocations(self) -> None:
+        snapshot = make_snapshot()
+        first = make_invocation(snapshot, remaining=RuntimeBudget(5, 100, 100))
+        first_lines = invoke_service(
+            {
+                "run": snapshot.to_dict(),
+                "invocation": first.to_dict(),
+                "fakePlan": {"terminalKind": "waiting_for_input", "inputRequest": "Need one answer"},
+            }
+        )
+        self.assertEqual([line["type"] for line in first_lines].count("exit"), 1)
+        self.assertEqual(first_lines[-1]["exit"]["kind"], "waiting_for_input")  # type: ignore[index]
+        first_events = [RuntimeEvent.from_dict(line["event"]) for line in first_lines if line["type"] == "event"]  # type: ignore[arg-type]
+        first_stream = EventCollector(
+            run_id=snapshot.run_id,
+            invocation_id=first.invocation_id,
+            expected_causation_ref=first.causation_ref,
+        )
+        for item in first_events:
+            first_stream.accept(item)
+        self.assertEqual(RuntimeExit.from_dict(first_lines[-1]["exit"]).kind, "waiting_for_input")  # type: ignore[arg-type,index]
+
+        second = make_invocation(
+            snapshot,
+            invocation_id="invocation:replacement",
+            trigger=InvocationTrigger("continuation", "event:answer"),
+            context_refs=("event:answer",),
+            checkpoint_ref="checkpoint:one",
+            remaining=RuntimeBudget(4, 90, 90),
+        )
+        second_lines = invoke_service(
+            {
+                "run": snapshot.to_dict(),
+                "invocation": second.to_dict(),
+                "fakePlan": {"terminalKind": "completed", "transcript": "continued"},
+            }
+        )
+        self.assertEqual([line["type"] for line in second_lines].count("exit"), 1)
+        self.assertEqual(second_lines[-1]["exit"]["kind"], "completed")  # type: ignore[index]
+        self.assertGreaterEqual(sum(line["type"] == "event" for line in second_lines), 3)
+
+    def test_service_request_rejects_unknown_fields(self) -> None:
+        snapshot = make_snapshot()
+        invocation = make_invocation(snapshot)
+        output = StringIO()
+        with self.assertRaises(ContractError):
+            serve_once(
+                json.dumps({"run": snapshot.to_dict(), "invocation": invocation.to_dict(), "forged": True}),
+                output,
+            )
+
+    def test_true_json_lines_streaming_and_idempotent_process_death_reconciliation(self) -> None:
+        snapshot = make_snapshot()
+        invocation = make_invocation(snapshot)
+        process = subprocess.Popen(
+            [sys.executable, "-m", "plane_runtime.service", "--once"],
+            cwd=REPO_ROOT,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+        assert process.stdin is not None
+        assert process.stdout is not None
+        process.stdin.write(
+            json.dumps(
+                {
+                    "run": snapshot.to_dict(),
+                    "invocation": invocation.to_dict(),
+                    "fakePlan": {"holdAfterObservations": 1},
+                }
+            )
+            + "\n"
+        )
+        process.stdin.flush()
+        selector = selectors.DefaultSelector()
+        selector.register(process.stdout, selectors.EVENT_READ)
+        self.assertTrue(selector.select(timeout=5), "the first event must be flushed before process exit")
+        first_line = process.stdout.readline()
+        self.assertTrue(first_line)
+        first = json.loads(first_line)
+        self.assertEqual(first["type"], "event")
+        streamed_event = RuntimeEvent.from_dict(first["event"])
+        process.kill()
+        process.wait(timeout=5)
+        selector.close()
+        if process.stdin:
+            process.stdin.close()
+        if process.stdout:
+            process.stdout.close()
+        if process.stderr:
+            process.stderr.close()
+
+        stream = EventCollector(
+            run_id=snapshot.run_id,
+            invocation_id=invocation.invocation_id,
+            expected_causation_ref=invocation.causation_ref,
+        )
+        self.assertTrue(stream.accept(streamed_event))
+        reconciler = SupervisorReconciler()
+        first_terminal = reconciler.reconcile_process_death(final_sequence=stream.last_sequence)
+        second_terminal = reconciler.reconcile_process_death(final_sequence=stream.last_sequence)
+        self.assertEqual(first_terminal, second_terminal)
+        self.assertIs(first_terminal, reconciler.terminal)
+        self.assertEqual(first_terminal.failure.code, "process_died")  # type: ignore[union-attr]
+        self.assertEqual(reconciler.reconciliation_count, 1)
+
+    def test_supervisor_classifies_process_death_as_one_terminal_exit(self) -> None:
+        exit_value = classify_process_death(final_sequence=2)
+        self.assertEqual(exit_value.kind, "failed")
+        self.assertIsNotNone(exit_value.failure)
+        self.assertEqual(exit_value.failure.code, "process_died")  # type: ignore[union-attr]
+        self.assertEqual(RuntimeExit.from_json(exit_value.to_json()), exit_value)
+
+    def test_runtime_import_graph_has_no_product_or_network_imports(self) -> None:
+        package = importlib.import_module("plane_runtime")
+        package_modules = [
+            module
+            for name, module in sys.modules.items()
+            if (name == "plane_runtime" or name.startswith("plane_runtime."))
+            and isinstance(module, ModuleType)
+        ]
+        self.assertIn(package, package_modules)
+        forbidden = {"run_agent", "model_tools", "gateway", "hermes_state", "requests", "httpx"}
+        for module in package_modules:
+            for value in vars(module).values():
+                if isinstance(value, ModuleType):
+                    root = value.__name__.split(".", 1)[0]
+                    self.assertNotIn(root, forbidden, f"forbidden runtime import graph edge: {module.__name__} -> {value.__name__}")
+
+
+if __name__ == "__main__":
+    unittest.main()

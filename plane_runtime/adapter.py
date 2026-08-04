@@ -8,6 +8,8 @@ implement :class:`KernelPort` without adding Plane vocabulary to Hermes core.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from threading import Event
 from typing import Callable, Mapping, Protocol
 
 from .contract import (
@@ -16,7 +18,9 @@ from .contract import (
     ContractError,
     ConversationPublicationObserved,
     InputRequestObserved,
+    LeaseError,
     ProgressObserved,
+    ProductReceipt,
     PublicationReceipt,
     RuntimeBudget,
     RuntimeEvent,
@@ -26,6 +30,7 @@ from .contract import (
     SequenceError,
     TranscriptObserved,
     UsageObserved,
+    parse_utc_timestamp,
 )
 from .contract import InvocationEnvelope, PROTOCOL
 
@@ -55,6 +60,43 @@ class RuntimeHost(Protocol):
         transcript: TranscriptObserved,
         idempotency_key: str,
     ) -> PublicationReceipt:
+        ...
+
+    def request_input(
+        self,
+        *,
+        run_id: str,
+        invocation_id: str,
+        request_ref: str,
+        prompt: str,
+        idempotency_key: str,
+    ) -> ProductReceipt:
+        ...
+
+    def record_artifact(
+        self,
+        *,
+        run_id: str,
+        invocation_id: str,
+        artifact_ref: str,
+        digest: str,
+        idempotency_key: str,
+    ) -> ProductReceipt:
+        ...
+
+
+class RuntimeSupervisor(Protocol):
+    """Trusted host seam for lease and checkpoint authority."""
+
+    def validate_lease(self, *, run: RunSnapshot, invocation: InvocationEnvelope) -> None:
+        ...
+
+    def validate_checkpoint(self, *, run: RunSnapshot, invocation: InvocationEnvelope) -> None:
+        ...
+
+
+class TrustedClock(Protocol):
+    def now(self) -> datetime:
         ...
 
 
@@ -147,12 +189,22 @@ class EventStream:
         run_id: str,
         invocation_id: str,
         sink: EventSink | None = None,
+        expected_correlation_ref: str | None = None,
+        expected_causation_ref: str | None = None,
     ) -> None:
+        if (
+            expected_correlation_ref is not None
+            and expected_causation_ref is not None
+            and expected_correlation_ref != expected_causation_ref
+        ):
+            raise BindingError("expected correlation and causation references disagree")
         self.run_id = run_id
         self.invocation_id = invocation_id
         self._sink = sink
+        self.expected_correlation_ref = expected_correlation_ref or expected_causation_ref
         self._events: list[RuntimeEvent] = []
         self._seen: dict[str, RuntimeEvent] = {}
+        self._seen_idempotency: dict[str, RuntimeEvent] = {}
 
     @property
     def events(self) -> tuple[RuntimeEvent, ...]:
@@ -168,11 +220,25 @@ class EventStream:
                 f"event {event.event_id!r} is bound to {event.run_id}/{event.invocation_id}, "
                 f"expected {self.run_id}/{self.invocation_id}"
             )
+        if (
+            self.expected_correlation_ref is not None
+            and event.correlation_ref != self.expected_correlation_ref
+        ):
+            raise BindingError(
+                f"event {event.event_id!r} has correlation {event.correlation_ref!r}, "
+                f"expected {self.expected_correlation_ref!r}"
+            )
         previous = self._seen.get(event.event_id)
         if previous is not None:
             if previous == event:
                 return False
             raise SequenceError(f"event id {event.event_id!r} was reused with different content")
+        previous_idempotency = self._seen_idempotency.get(event.idempotency_key)
+        if previous_idempotency is not None:
+            raise SequenceError(
+                f"idempotency key {event.idempotency_key!r} was reused by "
+                f"event {previous_idempotency.event_id!r}"
+            )
         if event.sequence != self.last_sequence + 1:
             raise SequenceError(
                 f"expected sequence {self.last_sequence + 1}, received {event.sequence}"
@@ -180,6 +246,7 @@ class EventStream:
         if self._sink is not None:
             self._sink(event)
         self._seen[event.event_id] = event
+        self._seen_idempotency[event.idempotency_key] = event
         self._events.append(event)
         return True
 
@@ -232,6 +299,61 @@ def _validate_inputs(run: RunSnapshot, invocation: InvocationEnvelope) -> None:
         raise ContractError("invocation remaining budget exceeds the run total budget")
 
 
+def _trusted_now(clock: TrustedClock | Callable[[], datetime]) -> datetime:
+    value = clock.now() if hasattr(clock, "now") else clock()
+    if not isinstance(value, datetime) or value.tzinfo is None:
+        raise LeaseError("trusted clock must return a timezone-aware datetime")
+    if value.utcoffset() != timedelta(0):
+        raise LeaseError("trusted clock must return UTC time")
+    value = value.astimezone(timezone.utc)
+    return value
+
+
+def _validate_lease_with_clock(invocation: InvocationEnvelope, clock: TrustedClock | Callable[[], datetime]) -> None:
+    expires_at = parse_utc_timestamp(invocation.lease.expires_at, "lease.expiresAt")
+    if expires_at <= _trusted_now(clock):
+        raise LeaseError("invocation lease is expired")
+
+
+def _validate_publication_receipt(
+    receipt: PublicationReceipt,
+    *,
+    run_id: str,
+    invocation_id: str,
+    transcript_ref: str,
+    idempotency_key: str,
+) -> None:
+    if not isinstance(receipt, PublicationReceipt):
+        raise ContractError("publication operation returned an invalid receipt")
+    if receipt.transcript_ref != transcript_ref:
+        raise BindingError("publication receipt references a different transcript")
+    if (
+        receipt.run_id != run_id
+        or receipt.invocation_id != invocation_id
+        or receipt.idempotency_key != idempotency_key
+    ):
+        raise BindingError("publication receipt is not bound to this invocation")
+
+
+def _validate_product_receipt(
+    receipt: ProductReceipt,
+    *,
+    run_id: str,
+    invocation_id: str,
+    resource_ref: str,
+    idempotency_key: str,
+) -> None:
+    if not isinstance(receipt, ProductReceipt):
+        raise ContractError("product operation returned an invalid receipt")
+    if (
+        receipt.run_id != run_id
+        or receipt.invocation_id != invocation_id
+        or receipt.resource_ref != resource_ref
+        or receipt.idempotency_key != idempotency_key
+    ):
+        raise BindingError("product receipt is not bound to this invocation and resource")
+
+
 def execute(
     *,
     run: RunSnapshot,
@@ -240,6 +362,8 @@ def execute(
     emit: EventSink | None = None,
     cancellation: CancellationSignal | None = None,
     kernel: KernelPort | None = None,
+    clock: TrustedClock | Callable[[], datetime] | None = None,
+    supervisor: RuntimeSupervisor | None = None,
 ) -> RuntimeExit:
     """Execute exactly one invocation through the replaceable kernel port.
 
@@ -249,8 +373,23 @@ def execute(
     """
 
     _validate_inputs(run, invocation)
+    if supervisor is not None:
+        supervisor.validate_lease(run=run, invocation=invocation)
+        if invocation.checkpoint_ref is not None:
+            supervisor.validate_checkpoint(run=run, invocation=invocation)
+    elif clock is not None:
+        _validate_lease_with_clock(invocation, clock)
+        if invocation.checkpoint_ref is not None:
+            raise ContractError("checkpoint continuation requires a trusted supervisor")
+    else:
+        raise LeaseError("execution requires an injected trusted clock or supervisor")
     cancellation = cancellation or NeverCancelled()
-    stream = EventStream(run_id=run.run_id, invocation_id=invocation.invocation_id, sink=emit)
+    stream = EventStream(
+        run_id=run.run_id,
+        invocation_id=invocation.invocation_id,
+        sink=emit,
+        expected_causation_ref=invocation.causation_ref,
+    )
     if cancellation.is_cancelled():
         return RuntimeExit(kind="cancelled", final_sequence=stream.last_sequence)
     kernel = kernel or FakeKernel()
@@ -268,6 +407,7 @@ def execute(
         trigger_kind=invocation.trigger.kind,
     )
     transcripts: dict[str, TranscriptObserved] = {}
+    pending_input_requests: set[str] = set()
     used = RuntimeBudget()
 
     def on_observation(observation: KernelObservation) -> None:
@@ -295,17 +435,58 @@ def execute(
             _next_event(stream, invocation, transcript)
             return
         if observation.kind == "input_request":
+            if host is None:
+                raise ContractError("input requests require a trusted runtime host")
             if observation.request_ref is None or observation.message is None:
                 raise ContractError("input request requires a reference and prompt")
-            _next_event(stream, invocation, InputRequestObserved(observation.request_ref, observation.message))
-            return
-        if observation.kind == "artifact":
-            if observation.artifact_ref is None or observation.artifact_digest is None:
-                raise ContractError("artifact observation requires a reference and digest")
+            if observation.request_ref in pending_input_requests:
+                raise SequenceError("input request reference was reused in one invocation")
+            event_id = f"{invocation.invocation_id}:input:{observation.request_ref}"
+            receipt = host.request_input(
+                run_id=run.run_id,
+                invocation_id=invocation.invocation_id,
+                request_ref=observation.request_ref,
+                prompt=observation.message,
+                idempotency_key=event_id,
+            )
+            _validate_product_receipt(
+                receipt,
+                run_id=run.run_id,
+                invocation_id=invocation.invocation_id,
+                resource_ref=observation.request_ref,
+                idempotency_key=event_id,
+            )
+            pending_input_requests.add(observation.request_ref)
             _next_event(
                 stream,
                 invocation,
-                ArtifactObserved(observation.artifact_ref, observation.artifact_digest),
+                InputRequestObserved(observation.request_ref, observation.message, receipt.receipt_ref),
+            )
+            return
+        if observation.kind == "artifact":
+            if host is None:
+                raise ContractError("artifacts require a trusted runtime host")
+            if observation.artifact_ref is None or observation.artifact_digest is None:
+                raise ContractError("artifact observation requires a reference and digest")
+            event_id = f"{invocation.invocation_id}:artifact:{observation.artifact_ref}"
+            receipt = host.record_artifact(
+                run_id=run.run_id,
+                invocation_id=invocation.invocation_id,
+                artifact_ref=observation.artifact_ref,
+                digest=observation.artifact_digest,
+                idempotency_key=event_id,
+            )
+            _validate_product_receipt(
+                receipt,
+                run_id=run.run_id,
+                invocation_id=invocation.invocation_id,
+                resource_ref=observation.artifact_ref,
+                idempotency_key=event_id,
+            )
+            _next_event(
+                stream,
+                invocation,
+                ArtifactObserved(observation.artifact_ref, observation.artifact_digest, receipt.receipt_ref),
             )
             return
         if observation.kind == "publication_request":
@@ -324,8 +505,13 @@ def execute(
                 transcript=transcript,
                 idempotency_key=event_id,
             )
-            if receipt.transcript_ref != transcript.transcript_ref:
-                raise BindingError("publication receipt references a different transcript")
+            _validate_publication_receipt(
+                receipt,
+                run_id=run.run_id,
+                invocation_id=invocation.invocation_id,
+                transcript_ref=transcript.transcript_ref,
+                idempotency_key=event_id,
+            )
             _next_event(
                 stream,
                 invocation,
@@ -344,6 +530,10 @@ def execute(
         return RuntimeExit(kind="cancelled", final_sequence=stream.last_sequence)
     if cancellation.is_cancelled():
         return RuntimeExit(kind="cancelled", final_sequence=stream.last_sequence)
+    if result.terminal_kind == "waiting_for_input" and not pending_input_requests:
+        raise ContractError("waiting_for_input requires a visible authorized input request")
+    if result.terminal_kind != "waiting_for_input" and pending_input_requests:
+        raise ContractError("terminal exit cannot leave an unresolved input request")
     return RuntimeExit(
         kind=result.terminal_kind,
         final_sequence=stream.last_sequence,
@@ -362,6 +552,7 @@ class FakeKernelPlan:
     input_request: str | None = None
     input_request_ref: str = "input:fake"
     publication_requested: bool = False
+    hold_after_observations: int | None = None
 
 
 class FakeKernel:
@@ -388,12 +579,14 @@ class FakeKernel:
                 text=self.plan.transcript,
             ),
         )
-        for observation in observations:
+        for index, observation in enumerate(observations, start=1):
             if cancellation.is_cancelled():
                 return KernelResult(terminal_kind="cancelled")
             emit(observation)
             if self.on_step is not None:
                 self.on_step()
+            if self.plan.hold_after_observations == index:
+                Event().wait()
         if self.plan.input_request is not None:
             emit(
                 KernelObservation(
@@ -414,6 +607,9 @@ class RecordingHost:
 
     def __init__(self) -> None:
         self.publications: list[tuple[str, str, str]] = []
+        self.input_requests: list[tuple[str, str, str]] = []
+        self.artifacts: list[tuple[str, str, str]] = []
+        self._receipts: dict[str, PublicationReceipt | ProductReceipt] = {}
 
     def publish_transcript(
         self,
@@ -423,12 +619,128 @@ class RecordingHost:
         transcript: TranscriptObserved,
         idempotency_key: str,
     ) -> PublicationReceipt:
+        prior = self._receipts.get(idempotency_key)
+        if prior is not None:
+            if not isinstance(prior, PublicationReceipt) or prior.transcript_ref != transcript.transcript_ref:
+                raise BindingError("publication idempotency key was reused for another operation")
+            return prior
         self.publications.append((run_id, invocation_id, idempotency_key))
-        return PublicationReceipt(
+        receipt = PublicationReceipt(
             publication_ref=f"publication:{transcript.transcript_ref}",
             receipt_ref=f"receipt:{idempotency_key}",
             transcript_ref=transcript.transcript_ref,
+            run_id=run_id,
+            invocation_id=invocation_id,
+            idempotency_key=idempotency_key,
         )
+        self._receipts[idempotency_key] = receipt
+        return receipt
+
+    def request_input(
+        self,
+        *,
+        run_id: str,
+        invocation_id: str,
+        request_ref: str,
+        prompt: str,
+        idempotency_key: str,
+    ) -> ProductReceipt:
+        prior = self._receipts.get(idempotency_key)
+        if prior is not None:
+            if not isinstance(prior, ProductReceipt) or prior.resource_ref != request_ref:
+                raise BindingError("input idempotency key was reused for another operation")
+            return prior
+        self.input_requests.append((run_id, request_ref, idempotency_key))
+        receipt = ProductReceipt(
+            resource_ref=request_ref,
+            receipt_ref=f"receipt:{idempotency_key}",
+            run_id=run_id,
+            invocation_id=invocation_id,
+            idempotency_key=idempotency_key,
+        )
+        self._receipts[idempotency_key] = receipt
+        return receipt
+
+    def record_artifact(
+        self,
+        *,
+        run_id: str,
+        invocation_id: str,
+        artifact_ref: str,
+        digest: str,
+        idempotency_key: str,
+    ) -> ProductReceipt:
+        prior = self._receipts.get(idempotency_key)
+        if prior is not None:
+            if not isinstance(prior, ProductReceipt) or prior.resource_ref != artifact_ref:
+                raise BindingError("artifact idempotency key was reused for another operation")
+            return prior
+        self.artifacts.append((run_id, artifact_ref, idempotency_key))
+        receipt = ProductReceipt(
+            resource_ref=artifact_ref,
+            receipt_ref=f"receipt:{idempotency_key}",
+            run_id=run_id,
+            invocation_id=invocation_id,
+            idempotency_key=idempotency_key,
+        )
+        self._receipts[idempotency_key] = receipt
+        return receipt
+
+
+class TrustedRuntimeSupervisor:
+    """Small deterministic supervisor adapter used by the service and tests."""
+
+    def __init__(
+        self,
+        *,
+        clock: TrustedClock | Callable[[], datetime],
+        checkpoint_refs: set[str] | frozenset[str] = frozenset(),
+    ) -> None:
+        self.clock = clock
+        self.checkpoint_refs = frozenset(checkpoint_refs)
+
+    def validate_lease(self, *, run: RunSnapshot, invocation: InvocationEnvelope) -> None:
+        del run
+        _validate_lease_with_clock(invocation, self.clock)
+
+    def validate_checkpoint(self, *, run: RunSnapshot, invocation: InvocationEnvelope) -> None:
+        del run
+        checkpoint_ref = invocation.checkpoint_ref
+        if checkpoint_ref is None or checkpoint_ref not in self.checkpoint_refs:
+            raise BindingError("checkpoint is not trusted for this continuation")
+
+
+class SupervisorReconciler:
+    """Idempotently records the one supervisor-classified terminal result."""
+
+    def __init__(self) -> None:
+        self._terminal: RuntimeExit | None = None
+        self._reconciliation_count = 0
+
+    @property
+    def terminal(self) -> RuntimeExit | None:
+        return self._terminal
+
+    @property
+    def reconciliation_count(self) -> int:
+        return self._reconciliation_count
+
+    def reconcile(self, exit_value: RuntimeExit) -> RuntimeExit:
+        if self._terminal is None:
+            self._terminal = exit_value
+            self._reconciliation_count = 1
+            return exit_value
+        if self._terminal != exit_value:
+            raise SequenceError("terminal reconciliation was attempted with different content")
+        return self._terminal
+
+    def reconcile_process_death(
+        self,
+        *,
+        final_sequence: int,
+        reason: str = "runtime process exited before returning an exit",
+    ) -> RuntimeExit:
+        return self.reconcile(classify_process_death(final_sequence=final_sequence, reason=reason))
 
 
 def classify_process_death(

@@ -16,6 +16,12 @@ budgets are supplied as remaining cumulative values. Transcript evidence is
 not publication: a publication observation is emitted only after a trusted
 host returns a receipt for an explicit publication action.
 
+The wire limits are deliberately finite: acceptance criteria are capped at 64
+items, context/eager-operation/new-event-reference lists at 128 items, event
+JSON at 16 KiB, invocation JSON at 16 KiB, and snapshot JSON at 128 KiB. The
+snapshot and invocation limits measure canonical UTF-8 JSON bytes, so the
+boundary is stable across transport implementations.
+
 `adapter.py` exposes the narrow `KernelPort` seam. `FakeKernel` is a
 deterministic implementation for contract tests; a real Hermes implementation
 can be added behind the same seam without changing Hermes core modules.
@@ -37,6 +43,6 @@ Verify the package from the repository root:
 ```bash
 python3 -c "import plane_runtime"
 python3 -m compileall -q plane_runtime
-python3 -m pytest -q tests/plane_runtime
+scripts/run_tests.sh tests/plane_runtime
 git diff --check -- plane_runtime tests/plane_runtime
 ```

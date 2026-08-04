@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Mapping, Union
@@ -20,6 +21,12 @@ MAX_REFERENCE_LENGTH = 256
 MAX_TEXT_LENGTH = 32_000
 MAX_PROGRESS_LENGTH = 4_000
 MAX_EVENT_BYTES = 16_384
+MAX_ACCEPTANCE_CRITERIA = 64
+MAX_CONTEXT_REFS = 128
+MAX_EAGER_OPERATIONS = 128
+MAX_NEW_CONTEXT_EVENT_REFS = 128
+MAX_RUN_SNAPSHOT_BYTES = 128 * 1024
+MAX_INVOCATION_BYTES = 16 * 1024
 
 
 class ContractError(ValueError):
@@ -36,6 +43,10 @@ class SequenceError(ContractError):
 
 class BoundsError(ContractError):
     """Raised when a contract payload exceeds its bounded surface."""
+
+
+class LeaseError(ContractError):
+    """Raised when an invocation lease is not valid for execution."""
 
 
 JSONScalar = Union[None, bool, int, float, str]
@@ -94,23 +105,64 @@ def _thaw_json(value: Any) -> Any:
 def _mapping(value: Any, name: str) -> Mapping[str, Any]:
     if not isinstance(value, Mapping):
         raise ContractError(f"{name} must be an object")
+    if any(not isinstance(key, str) for key in value):
+        raise ContractError(f"{name} keys must be strings")
     return value
 
 
-def _sequence(value: Any, name: str) -> tuple[Any, ...]:
+def _reject_unknown(data: Mapping[str, Any], allowed: set[str], name: str) -> None:
+    unknown = sorted(set(data).difference(allowed))
+    if unknown:
+        raise ContractError(f"{name} has unknown field(s): {', '.join(unknown)}")
+
+
+def _sequence(value: Any, name: str, *, maximum: int | None = None) -> tuple[Any, ...]:
     if not isinstance(value, (list, tuple)):
         raise ContractError(f"{name} must be an array")
-    return tuple(value)
+    result = tuple(value)
+    if maximum is not None and len(result) > maximum:
+        raise BoundsError(f"{name} exceeds {maximum} items")
+    return result
 
 
 def _canonical_json(value: Mapping[str, Any]) -> bytes:
-    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode(
-        "utf-8"
-    )
+    return json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False
+    ).encode("utf-8")
 
 
 def _digest(value: Mapping[str, Any]) -> str:
     return hashlib.sha256(_canonical_json(value)).hexdigest()
+
+
+def parse_utc_timestamp(value: Any, name: str = "timestamp") -> datetime:
+    """Parse the one canonical, timezone-aware UTC timestamp representation."""
+
+    if not isinstance(value, str) or not value:
+        raise ContractError(f"{name} must be a non-empty UTC timestamp")
+    if not value.endswith("Z"):
+        raise ContractError(f"{name} must use canonical UTC 'Z' notation")
+    try:
+        parsed = datetime.fromisoformat(value[:-1] + "+00:00")
+    except ValueError as exc:
+        raise ContractError(f"{name} must be a valid ISO-8601 timestamp") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() != timedelta(0):
+        raise ContractError(f"{name} must be timezone-aware UTC")
+    parsed = parsed.astimezone(timezone.utc)
+    canonical = parsed.isoformat(timespec="auto").replace("+00:00", "Z")
+    if value != canonical:
+        raise ContractError(f"{name} is not canonical: expected {canonical!r}")
+    return parsed
+
+
+def _canonical_utc_timestamp(value: Any, name: str) -> str:
+    return parse_utc_timestamp(value, name).isoformat(timespec="auto").replace("+00:00", "Z")
+
+
+def _check_wire_size(value: Mapping[str, Any], name: str, maximum: int) -> None:
+    size = len(_canonical_json(value))
+    if size > maximum:
+        raise BoundsError(f"{name} exceeds {maximum} canonical JSON bytes (got {size})")
 
 
 @dataclass(frozen=True)
@@ -136,6 +188,8 @@ class AssignmentSnapshot:
         )
         if not criteria:
             raise ContractError("assignment.acceptanceCriteria must not be empty")
+        if len(criteria) > MAX_ACCEPTANCE_CRITERIA:
+            raise BoundsError(f"assignment.acceptanceCriteria exceeds {MAX_ACCEPTANCE_CRITERIA} items")
         object.__setattr__(self, "acceptance_criteria", criteria)
 
     def to_dict(self) -> dict[str, Any]:
@@ -149,6 +203,7 @@ class AssignmentSnapshot:
     @classmethod
     def from_dict(cls, raw: Any) -> "AssignmentSnapshot":
         data = _mapping(raw, "assignment")
+        _reject_unknown(data, {"version", "targetRef", "objective", "acceptanceCriteria"}, "assignment")
         return cls(
             version=_require_text(data.get("version"), "assignment.version"),
             target_ref=_require_text(data.get("targetRef"), "assignment.targetRef"),
@@ -177,6 +232,7 @@ class VersionedContextRef:
     @classmethod
     def from_dict(cls, raw: Any) -> "VersionedContextRef":
         data = _mapping(raw, "context")
+        _reject_unknown(data, {"ref", "digest", "kind"}, "context")
         return cls(
             ref=_require_text(data.get("ref"), "context.ref"),
             digest=_require_text(data.get("digest"), "context.digest"),
@@ -201,6 +257,7 @@ class OperationDescriptor:
     @classmethod
     def from_dict(cls, raw: Any) -> "OperationDescriptor":
         data = _mapping(raw, "operation")
+        _reject_unknown(data, {"operationRef", "descriptorDigest"}, "operation")
         return cls(
             operation_ref=_require_text(data.get("operationRef"), "operation.ref"),
             descriptor_digest=_require_text(data.get("descriptorDigest"), "operation.digest"),
@@ -214,6 +271,8 @@ class ToolPresentation:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "eager_operations", tuple(self.eager_operations))
+        if len(self.eager_operations) > MAX_EAGER_OPERATIONS:
+            raise BoundsError(f"toolPresentation.eagerOperations exceeds {MAX_EAGER_OPERATIONS} items")
         object.__setattr__(self, "catalog_digest", _require_text(self.catalog_digest, "toolPresentation.catalogDigest"))
 
     def to_dict(self) -> dict[str, Any]:
@@ -225,10 +284,15 @@ class ToolPresentation:
     @classmethod
     def from_dict(cls, raw: Any) -> "ToolPresentation":
         data = _mapping(raw, "toolPresentation")
+        _reject_unknown(data, {"eagerOperations", "catalogDigest"}, "toolPresentation")
         return cls(
             eager_operations=tuple(
                 OperationDescriptor.from_dict(item)
-                for item in _sequence(data.get("eagerOperations"), "toolPresentation.eagerOperations")
+                for item in _sequence(
+                    data.get("eagerOperations"),
+                    "toolPresentation.eagerOperations",
+                    maximum=MAX_EAGER_OPERATIONS,
+                )
             ),
             catalog_digest=_require_text(data.get("catalogDigest"), "toolPresentation.catalogDigest"),
         )
@@ -249,6 +313,7 @@ class RuntimeModelRoute:
     @classmethod
     def from_dict(cls, raw: Any) -> "RuntimeModelRoute":
         data = _mapping(raw, "model")
+        _reject_unknown(data, {"model", "routeRef"}, "model")
         return cls(
             model=_require_text(data.get("model"), "model.model"),
             route_ref=_require_text(data.get("routeRef"), "model.routeRef"),
@@ -283,6 +348,7 @@ class RuntimeBudget:
     @classmethod
     def from_dict(cls, raw: Any, name: str = "budget") -> "RuntimeBudget":
         data = _mapping(raw, name)
+        _reject_unknown(data, {"iterations", "inputTokens", "outputTokens"}, name)
         return cls(
             iterations=_require_int(data.get("iterations"), f"{name}.iterations"),
             input_tokens=_require_int(data.get("inputTokens"), f"{name}.inputTokens"),
@@ -300,6 +366,7 @@ class RuntimeBudgetPolicy:
     @classmethod
     def from_dict(cls, raw: Any) -> "RuntimeBudgetPolicy":
         data = _mapping(raw, "totalBudgetPolicy")
+        _reject_unknown(data, {"total"}, "totalBudgetPolicy")
         return cls(total=RuntimeBudget.from_dict(data.get("total"), "totalBudgetPolicy.total"))
 
 
@@ -325,6 +392,7 @@ class ContractDigests:
     @classmethod
     def from_dict(cls, raw: Any) -> "ContractDigests":
         data = _mapping(raw, "contractDigests")
+        _reject_unknown(data, {"snapshot", "invocation", "event", "exit"}, "contractDigests")
         return cls(
             snapshot=_require_text(data.get("snapshot"), "contractDigests.snapshot"),
             invocation=_require_text(data.get("invocation"), "contractDigests.invocation"),
@@ -359,6 +427,9 @@ class RunSnapshot:
             _require_text(self.behavioral_prompt, "behavioralPrompt", max_length=MAX_TEXT_LENGTH),
         )
         object.__setattr__(self, "context", tuple(self.context))
+        if len(self.context) > MAX_CONTEXT_REFS:
+            raise BoundsError(f"context exceeds {MAX_CONTEXT_REFS} items")
+        _check_wire_size(self.to_dict(), "runSnapshot", MAX_RUN_SNAPSHOT_BYTES)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -384,6 +455,23 @@ class RunSnapshot:
     @classmethod
     def from_dict(cls, raw: Any) -> "RunSnapshot":
         data = _mapping(raw, "runSnapshot")
+        _reject_unknown(
+            data,
+            {
+                "protocol",
+                "runId",
+                "assignment",
+                "actorRef",
+                "profileVersion",
+                "behavioralPrompt",
+                "context",
+                "toolPresentation",
+                "model",
+                "totalBudgetPolicy",
+                "contractDigests",
+            },
+            "runSnapshot",
+        )
         protocol = data.get("protocol")
         if protocol != PROTOCOL:
             raise ContractError(f"unsupported protocol: {protocol!r}")
@@ -398,7 +486,7 @@ class RunSnapshot:
             ),
             context=tuple(
                 VersionedContextRef.from_dict(item)
-                for item in _sequence(data.get("context"), "context")
+                for item in _sequence(data.get("context"), "context", maximum=MAX_CONTEXT_REFS)
             ),
             tool_presentation=ToolPresentation.from_dict(data.get("toolPresentation")),
             model=RuntimeModelRoute.from_dict(data.get("model")),
@@ -440,6 +528,7 @@ class InvocationTrigger:
     @classmethod
     def from_dict(cls, raw: Any) -> "InvocationTrigger":
         data = _mapping(raw, "trigger")
+        _reject_unknown(data, {"kind", "eventRef"}, "trigger")
         return cls(
             kind=_require_text(data.get("kind"), "trigger.kind"),
             event_ref=_require_optional_text(data.get("eventRef"), "trigger.eventRef"),
@@ -455,7 +544,7 @@ class RuntimeLease:
     def __post_init__(self) -> None:
         object.__setattr__(self, "lease_id", _require_text(self.lease_id, "lease.leaseId"))
         object.__setattr__(self, "holder_ref", _require_text(self.holder_ref, "lease.holderRef"))
-        object.__setattr__(self, "expires_at", _require_text(self.expires_at, "lease.expiresAt"))
+        object.__setattr__(self, "expires_at", _canonical_utc_timestamp(self.expires_at, "lease.expiresAt"))
 
     def to_dict(self) -> dict[str, str]:
         return {"leaseId": self.lease_id, "holderRef": self.holder_ref, "expiresAt": self.expires_at}
@@ -463,6 +552,7 @@ class RuntimeLease:
     @classmethod
     def from_dict(cls, raw: Any) -> "RuntimeLease":
         data = _mapping(raw, "lease")
+        _reject_unknown(data, {"leaseId", "holderRef", "expiresAt"}, "lease")
         return cls(
             lease_id=_require_text(data.get("leaseId"), "lease.leaseId"),
             holder_ref=_require_text(data.get("holderRef"), "lease.holderRef"),
@@ -495,9 +585,18 @@ class InvocationEnvelope:
             "new_context_event_refs",
             tuple(_require_text(ref, "newContextEventRefs[]") for ref in self.new_context_event_refs),
         )
+        if len(self.new_context_event_refs) > MAX_NEW_CONTEXT_EVENT_REFS:
+            raise BoundsError(
+                f"newContextEventRefs exceeds {MAX_NEW_CONTEXT_EVENT_REFS} items"
+            )
+        if len(set(self.new_context_event_refs)) != len(self.new_context_event_refs):
+            raise ContractError("newContextEventRefs must be unique")
+        if self.trigger.kind == "initial" and self.checkpoint_ref is not None:
+            raise ContractError("initial trigger cannot carry a checkpoint reference")
         object.__setattr__(self, "checkpoint_ref", _require_optional_text(self.checkpoint_ref, "checkpointRef"))
         object.__setattr__(self, "causation_ref", _require_text(self.causation_ref, "causationRef"))
         object.__setattr__(self, "cancellation_ref", _require_text(self.cancellation_ref, "cancellationRef"))
+        _check_wire_size(self.to_dict(), "invocation", MAX_INVOCATION_BYTES)
 
     def to_dict(self) -> dict[str, Any]:
         data = {
@@ -521,6 +620,23 @@ class InvocationEnvelope:
     @classmethod
     def from_dict(cls, raw: Any) -> "InvocationEnvelope":
         data = _mapping(raw, "invocation")
+        _reject_unknown(
+            data,
+            {
+                "protocol",
+                "invocationId",
+                "runId",
+                "runSnapshotDigest",
+                "trigger",
+                "newContextEventRefs",
+                "checkpointRef",
+                "remainingBudget",
+                "lease",
+                "causationRef",
+                "cancellationRef",
+            },
+            "invocation",
+        )
         protocol = data.get("protocol")
         if protocol != PROTOCOL:
             raise ContractError(f"unsupported protocol: {protocol!r}")
@@ -532,7 +648,11 @@ class InvocationEnvelope:
             trigger=InvocationTrigger.from_dict(data.get("trigger")),
             new_context_event_refs=tuple(
                 _require_text(ref, "newContextEventRefs[]")
-                for ref in _sequence(data.get("newContextEventRefs"), "newContextEventRefs")
+                for ref in _sequence(
+                    data.get("newContextEventRefs"),
+                    "newContextEventRefs",
+                    maximum=MAX_NEW_CONTEXT_EVENT_REFS,
+                )
             ),
             checkpoint_ref=_require_optional_text(data.get("checkpointRef"), "checkpointRef"),
             remaining_budget=RuntimeBudget.from_dict(data.get("remainingBudget"), "remainingBudget"),
@@ -569,6 +689,7 @@ class RuntimeFailure:
     @classmethod
     def from_dict(cls, raw: Any) -> "RuntimeFailure":
         data = _mapping(raw, "failure")
+        _reject_unknown(data, {"code", "message", "retryable"}, "failure")
         return cls(
             code=_require_text(data.get("code"), "failure.code"),
             message=_require_text(data.get("message"), "failure.message", max_length=MAX_TEXT_LENGTH),
@@ -633,6 +754,7 @@ class ConversationPublicationObserved:
 class InputRequestObserved:
     request_ref: str
     prompt: str
+    receipt_ref: str
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "request_ref", _require_text(self.request_ref, "inputRequest.requestRef"))
@@ -641,23 +763,29 @@ class InputRequestObserved:
             "prompt",
             _require_text(self.prompt, "inputRequest.prompt", max_length=MAX_TEXT_LENGTH),
         )
+        object.__setattr__(self, "receipt_ref", _require_text(self.receipt_ref, "inputRequest.receiptRef"))
 
     def to_dict(self) -> dict[str, str]:
-        return {"kind": "input_request", "requestRef": self.request_ref, "prompt": self.prompt}
+        return {
+            "kind": "input_request",
+            "requestRef": self.request_ref,
+            "prompt": self.prompt,
+            "receiptRef": self.receipt_ref,
+        }
 
 
 @dataclass(frozen=True)
 class ArtifactObserved:
     artifact_ref: str
     digest: str
-    receipt_ref: str | None = None
+    receipt_ref: str
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "artifact_ref", _require_text(self.artifact_ref, "artifact.artifactRef"))
         object.__setattr__(self, "digest", _require_text(self.digest, "artifact.digest"))
-        object.__setattr__(self, "receipt_ref", _require_optional_text(self.receipt_ref, "artifact.receiptRef"))
+        object.__setattr__(self, "receipt_ref", _require_text(self.receipt_ref, "artifact.receiptRef"))
 
-    def to_dict(self) -> dict[str, str | None]:
+    def to_dict(self) -> dict[str, str]:
         return {
             "kind": "artifact",
             "artifactRef": self.artifact_ref,
@@ -751,24 +879,45 @@ def _event_body_from_dict(raw: Any) -> EventBody:
     except KeyError as exc:
         raise ContractError(f"unsupported event body kind: {kind!r}") from exc
     if kind == "progress":
+        _reject_unknown(data, {"kind", "message", "payload"}, "event.body.progress")
         return ProgressObserved(data.get("message"), data.get("payload", {}))
     if kind == "transcript":
+        _reject_unknown(data, {"kind", "transcriptRef", "text"}, "event.body.transcript")
         return TranscriptObserved(data.get("transcriptRef"), data.get("text"))
     if kind == "conversation_publication":
+        _reject_unknown(
+            data,
+            {"kind", "transcriptRef", "publicationRef", "receiptRef"},
+            "event.body.conversation_publication",
+        )
         return ConversationPublicationObserved(
             data.get("transcriptRef"), data.get("publicationRef"), data.get("receiptRef")
         )
     if kind == "input_request":
-        return InputRequestObserved(data.get("requestRef"), data.get("prompt"))
+        _reject_unknown(data, {"kind", "requestRef", "prompt", "receiptRef"}, "event.body.input_request")
+        return InputRequestObserved(data.get("requestRef"), data.get("prompt"), data.get("receiptRef"))
     if kind == "artifact":
+        _reject_unknown(
+            data,
+            {"kind", "artifactRef", "digest", "receiptRef"},
+            "event.body.artifact",
+        )
         return ArtifactObserved(data.get("artifactRef"), data.get("digest"), data.get("receiptRef"))
     if kind == "usage":
+        _reject_unknown(data, {"kind", "usage"}, "event.body.usage")
         return UsageObserved(RuntimeBudget.from_dict(data.get("usage"), "event.body.usage"))
     if kind == "outcome_submission":
+        _reject_unknown(
+            data,
+            {"kind", "submissionRef", "receiptRef"},
+            "event.body.outcome_submission",
+        )
         return OutcomeSubmissionObserved(data.get("submissionRef"), data.get("receiptRef"))
     if kind == "failure":
+        _reject_unknown(data, {"kind", "code", "message"}, "event.body.failure")
         return FailureObserved(data.get("code"), data.get("message"))
     if kind == "blocker":
+        _reject_unknown(data, {"kind", "code", "message"}, "event.body.blocker")
         return BlockerObserved(data.get("code"), data.get("message"))
     raise AssertionError(f"unhandled event body type: {body_type}")
 
@@ -817,6 +966,20 @@ class RuntimeEvent:
     @classmethod
     def from_dict(cls, raw: Any) -> "RuntimeEvent":
         data = _mapping(raw, "event")
+        _reject_unknown(
+            data,
+            {
+                "protocol",
+                "runId",
+                "invocationId",
+                "sequence",
+                "eventId",
+                "correlationRef",
+                "idempotencyKey",
+                "body",
+            },
+            "event",
+        )
         protocol = data.get("protocol")
         if protocol != PROTOCOL:
             raise ContractError(f"unsupported protocol: {protocol!r}")
@@ -850,7 +1013,7 @@ class RuntimeExit:
     def __post_init__(self) -> None:
         if self.kind not in {"completed", "waiting_for_input", "failed", "blocked", "cancelled"}:
             raise ContractError(f"unsupported exit kind: {self.kind!r}")
-        object.__setattr__(self, "final_sequence", _require_int(self.final_sequence, "finalSequence"))
+        object.__setattr__(self, "final_sequence", _require_int(self.final_sequence, "finalSequence", minimum=0))
         if self.kind in {"failed", "blocked"} and self.failure is None:
             raise ContractError(f"{self.kind} exit requires failure details")
         if self.kind not in {"failed", "blocked"} and self.failure is not None:
@@ -870,12 +1033,13 @@ class RuntimeExit:
     @classmethod
     def from_dict(cls, raw: Any) -> "RuntimeExit":
         data = _mapping(raw, "exit")
+        _reject_unknown(data, {"protocol", "kind", "finalSequence", "failure"}, "exit")
         if data.get("protocol") != PROTOCOL:
             raise ContractError(f"unsupported protocol: {data.get('protocol')!r}")
         failure = data.get("failure")
         return cls(
             kind=_require_text(data.get("kind"), "exit.kind"),
-            final_sequence=_require_int(data.get("finalSequence"), "exit.finalSequence"),
+            final_sequence=_require_int(data.get("finalSequence"), "exit.finalSequence", minimum=0),
             failure=RuntimeFailure.from_dict(failure) if failure is not None else None,
         )
 
@@ -894,8 +1058,32 @@ class PublicationReceipt:
     publication_ref: str
     receipt_ref: str
     transcript_ref: str
+    run_id: str | None = None
+    invocation_id: str | None = None
+    idempotency_key: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "publication_ref", _require_text(self.publication_ref, "receipt.publicationRef"))
         object.__setattr__(self, "receipt_ref", _require_text(self.receipt_ref, "receipt.receiptRef"))
         object.__setattr__(self, "transcript_ref", _require_text(self.transcript_ref, "receipt.transcriptRef"))
+        object.__setattr__(self, "run_id", _require_optional_text(self.run_id, "receipt.runId"))
+        object.__setattr__(self, "invocation_id", _require_optional_text(self.invocation_id, "receipt.invocationId"))
+        object.__setattr__(self, "idempotency_key", _require_optional_text(self.idempotency_key, "receipt.idempotencyKey"))
+
+
+@dataclass(frozen=True)
+class ProductReceipt:
+    """Receipt returned by one narrow, host-authorized product operation."""
+
+    resource_ref: str
+    receipt_ref: str
+    run_id: str
+    invocation_id: str
+    idempotency_key: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "resource_ref", _require_text(self.resource_ref, "receipt.resourceRef"))
+        object.__setattr__(self, "receipt_ref", _require_text(self.receipt_ref, "receipt.receiptRef"))
+        object.__setattr__(self, "run_id", _require_text(self.run_id, "receipt.runId"))
+        object.__setattr__(self, "invocation_id", _require_text(self.invocation_id, "receipt.invocationId"))
+        object.__setattr__(self, "idempotency_key", _require_text(self.idempotency_key, "receipt.idempotencyKey"))
