@@ -27,6 +27,7 @@ MAX_EAGER_OPERATIONS = 128
 MAX_NEW_CONTEXT_EVENT_REFS = 128
 MAX_RUN_SNAPSHOT_BYTES = 128 * 1024
 MAX_INVOCATION_BYTES = 16 * 1024
+MAX_TERMINAL_EVIDENCE = 128
 
 
 class ContractError(ValueError):
@@ -806,16 +807,23 @@ class UsageObserved:
 class OutcomeSubmissionObserved:
     submission_ref: str
     receipt_ref: str
+    content: str
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "submission_ref", _require_text(self.submission_ref, "submission.submissionRef"))
         object.__setattr__(self, "receipt_ref", _require_text(self.receipt_ref, "submission.receiptRef"))
+        object.__setattr__(
+            self,
+            "content",
+            _require_text(self.content, "submission.content", max_length=MAX_TEXT_LENGTH),
+        )
 
     def to_dict(self) -> dict[str, str]:
         return {
             "kind": "outcome_submission",
             "submissionRef": self.submission_ref,
             "receiptRef": self.receipt_ref,
+            "content": self.content,
         }
 
 
@@ -909,10 +917,12 @@ def _event_body_from_dict(raw: Any) -> EventBody:
     if kind == "outcome_submission":
         _reject_unknown(
             data,
-            {"kind", "submissionRef", "receiptRef"},
+            {"kind", "submissionRef", "receiptRef", "content"},
             "event.body.outcome_submission",
         )
-        return OutcomeSubmissionObserved(data.get("submissionRef"), data.get("receiptRef"))
+        return OutcomeSubmissionObserved(
+            data.get("submissionRef"), data.get("receiptRef"), data.get("content")
+        )
     if kind == "failure":
         _reject_unknown(data, {"kind", "code", "message"}, "event.body.failure")
         return FailureObserved(data.get("code"), data.get("message"))
@@ -1088,10 +1098,152 @@ class ProductReceipt:
         object.__setattr__(self, "invocation_id", _require_text(self.invocation_id, "receipt.invocationId"))
         object.__setattr__(self, "idempotency_key", _require_text(self.idempotency_key, "receipt.idempotencyKey"))
 
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "resourceRef": self.resource_ref,
+            "receiptRef": self.receipt_ref,
+            "runId": self.run_id,
+            "invocationId": self.invocation_id,
+            "idempotencyKey": self.idempotency_key,
+        }
+
+    @classmethod
+    def from_dict(cls, raw: Any) -> "ProductReceipt":
+        data = _mapping(raw, "productReceipt")
+        _reject_unknown(
+            data,
+            {"resourceRef", "receiptRef", "runId", "invocationId", "idempotencyKey"},
+            "productReceipt",
+        )
+        return cls(
+            resource_ref=_require_text(data.get("resourceRef"), "receipt.resourceRef"),
+            receipt_ref=_require_text(data.get("receiptRef"), "receipt.receiptRef"),
+            run_id=_require_text(data.get("runId"), "receipt.runId"),
+            invocation_id=_require_text(data.get("invocationId"), "receipt.invocationId"),
+            idempotency_key=_require_text(data.get("idempotencyKey"), "receipt.idempotencyKey"),
+        )
+
 
 TERMINAL_KINDS = frozenset(
     {"completed", "waiting_for_input", "failed", "blocked", "cancelled"}
 )
+
+
+@dataclass(frozen=True)
+class ArtifactProposal:
+    """Untrusted artifact input carried to the atomic terminal application."""
+
+    artifact_ref: str
+    digest: str
+    event_id: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "artifact_ref", _require_text(self.artifact_ref, "artifact.artifactRef"))
+        object.__setattr__(self, "digest", _require_text(self.digest, "artifact.digest"))
+        object.__setattr__(self, "event_id", _require_text(self.event_id, "artifact.eventId"))
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "artifactRef": self.artifact_ref,
+            "digest": self.digest,
+            "eventId": self.event_id,
+        }
+
+    @classmethod
+    def from_dict(cls, raw: Any) -> "ArtifactProposal":
+        data = _mapping(raw, "artifactProposal")
+        _reject_unknown(data, {"artifactRef", "digest", "eventId"}, "artifactProposal")
+        return cls(data.get("artifactRef"), data.get("digest"), data.get("eventId"))
+
+
+@dataclass(frozen=True)
+class OutcomeProposal:
+    """Required completed-terminal evidence; never stored only in an evidence tail."""
+
+    submission_ref: str
+    content: str
+    event_id: str
+    proposal_receipt_ref: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "submission_ref", _require_text(self.submission_ref, "outcome.submissionRef"))
+        object.__setattr__(
+            self,
+            "content",
+            _require_text(self.content, "outcome.content", max_length=MAX_TEXT_LENGTH),
+        )
+        object.__setattr__(self, "event_id", _require_text(self.event_id, "outcome.eventId"))
+        object.__setattr__(
+            self,
+            "proposal_receipt_ref",
+            _require_text(self.proposal_receipt_ref, "outcome.proposalReceiptRef"),
+        )
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "submissionRef": self.submission_ref,
+            "content": self.content,
+            "eventId": self.event_id,
+            "proposalReceiptRef": self.proposal_receipt_ref,
+        }
+
+    @classmethod
+    def from_dict(cls, raw: Any) -> "OutcomeProposal":
+        data = _mapping(raw, "outcomeProposal")
+        _reject_unknown(
+            data,
+            {"submissionRef", "content", "eventId", "proposalReceiptRef"},
+            "outcomeProposal",
+        )
+        return cls(
+            data.get("submissionRef"),
+            data.get("content"),
+            data.get("eventId"),
+            data.get("proposalReceiptRef"),
+        )
+
+
+@dataclass(frozen=True)
+class InputRequestProposal:
+    """Required waiting-terminal evidence; product state is applied by the port."""
+
+    request_ref: str
+    prompt: str
+    event_id: str
+    proposal_receipt_ref: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "request_ref", _require_text(self.request_ref, "input.requestRef"))
+        object.__setattr__(self, "prompt", _require_text(self.prompt, "input.prompt", max_length=MAX_TEXT_LENGTH))
+        object.__setattr__(self, "event_id", _require_text(self.event_id, "input.eventId"))
+        object.__setattr__(
+            self,
+            "proposal_receipt_ref",
+            _require_text(self.proposal_receipt_ref, "input.proposalReceiptRef"),
+        )
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "requestRef": self.request_ref,
+            "prompt": self.prompt,
+            "eventId": self.event_id,
+            "proposalReceiptRef": self.proposal_receipt_ref,
+        }
+
+    @classmethod
+    def from_dict(cls, raw: Any) -> "InputRequestProposal":
+        data = _mapping(raw, "inputRequestProposal")
+        _reject_unknown(
+            data,
+            {"requestRef", "prompt", "eventId", "proposalReceiptRef"},
+            "inputRequestProposal",
+        )
+        return cls(
+            data.get("requestRef"),
+            data.get("prompt"),
+            data.get("eventId"),
+            data.get("proposalReceiptRef"),
+        )
 
 
 @dataclass(frozen=True)
@@ -1112,6 +1264,10 @@ class TerminalProposal:
     evidence_receipt_refs: tuple[str, ...] = ()
     failure: RuntimeFailure | None = None
     source: str = "runtime"
+    outcome_proposal: OutcomeProposal | None = None
+    input_request_proposal: InputRequestProposal | None = None
+    cancellation_receipt: ProductReceipt | None = None
+    artifact_proposals: tuple[ArtifactProposal, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "run_id", _require_text(self.run_id, "terminal.runId"))
@@ -1132,13 +1288,13 @@ class TerminalProposal:
             _require_text(value, "terminal.evidenceReceiptRefs[]")
             for value in self.evidence_receipt_refs
         )
-        if len(event_ids) > MAX_NEW_CONTEXT_EVENT_REFS:
+        if len(event_ids) > MAX_TERMINAL_EVIDENCE:
             raise BoundsError(
-                f"terminal.evidenceEventIds exceeds {MAX_NEW_CONTEXT_EVENT_REFS} items"
+                f"terminal.evidenceEventIds exceeds {MAX_TERMINAL_EVIDENCE} items"
             )
-        if len(receipt_refs) > MAX_NEW_CONTEXT_EVENT_REFS:
+        if len(receipt_refs) > MAX_TERMINAL_EVIDENCE:
             raise BoundsError(
-                f"terminal.evidenceReceiptRefs exceeds {MAX_NEW_CONTEXT_EVENT_REFS} items"
+                f"terminal.evidenceReceiptRefs exceeds {MAX_TERMINAL_EVIDENCE} items"
             )
         if len(set(event_ids)) != len(event_ids):
             raise ContractError("terminal.evidenceEventIds must be unique")
@@ -1146,10 +1302,51 @@ class TerminalProposal:
             raise ContractError("terminal.evidenceReceiptRefs must be unique")
         object.__setattr__(self, "evidence_event_ids", event_ids)
         object.__setattr__(self, "evidence_receipt_refs", receipt_refs)
+        artifacts = tuple(self.artifact_proposals)
+        if len(artifacts) > MAX_TERMINAL_EVIDENCE:
+            raise BoundsError(
+                f"terminal.artifactProposals exceeds {MAX_TERMINAL_EVIDENCE} items"
+            )
+        if not all(isinstance(item, ArtifactProposal) for item in artifacts):
+            raise ContractError("terminal.artifactProposals contains an unsupported value")
+        if len({item.artifact_ref for item in artifacts}) != len(artifacts):
+            raise ContractError("terminal.artifactProposals must contain unique artifact references")
+        object.__setattr__(self, "artifact_proposals", artifacts)
         if self.kind in {"failed", "blocked"} and self.failure is None:
             raise ContractError(f"{self.kind} terminal proposal requires failure details")
         if self.kind not in {"failed", "blocked"} and self.failure is not None:
             raise ContractError(f"{self.kind} terminal proposal cannot carry failure details")
+        if self.kind == "completed":
+            if self.outcome_proposal is None:
+                raise ContractError("completed terminal proposal requires outcome evidence")
+            if self.input_request_proposal is not None or self.cancellation_receipt is not None:
+                raise ContractError("completed terminal proposal has wrong-kind evidence")
+            if (
+                self.outcome_proposal.event_id not in event_ids
+                or self.outcome_proposal.proposal_receipt_ref not in receipt_refs
+            ):
+                raise ContractError("completed terminal proposal evicted mandatory outcome evidence")
+        elif self.kind == "waiting_for_input":
+            if self.input_request_proposal is None:
+                raise ContractError("waiting_for_input terminal proposal requires input evidence")
+            if self.outcome_proposal is not None or self.cancellation_receipt is not None:
+                raise ContractError("waiting_for_input terminal proposal has wrong-kind evidence")
+            if (
+                self.input_request_proposal.event_id not in event_ids
+                or self.input_request_proposal.proposal_receipt_ref not in receipt_refs
+            ):
+                raise ContractError("waiting terminal proposal evicted mandatory input evidence")
+        elif self.kind == "cancelled":
+            if self.cancellation_receipt is None:
+                raise ContractError("cancelled terminal proposal requires cancellation authority evidence")
+            if self.outcome_proposal is not None or self.input_request_proposal is not None:
+                raise ContractError("cancelled terminal proposal has wrong-kind evidence")
+            if self.cancellation_receipt.run_id != self.run_id or self.cancellation_receipt.invocation_id != self.invocation_id:
+                raise BindingError("cancellation evidence is bound to a different invocation")
+            if self.cancellation_receipt.receipt_ref not in receipt_refs:
+                raise ContractError("cancelled terminal proposal evicted mandatory cancellation evidence")
+        elif self.outcome_proposal is not None or self.input_request_proposal is not None or self.cancellation_receipt is not None:
+            raise ContractError(f"{self.kind} terminal proposal has wrong-kind evidence")
         if self.source not in {"runtime", "supervisor"}:
             raise ContractError(f"unsupported terminal proposal source: {self.source!r}")
         if self.source == "supervisor" and (
@@ -1159,6 +1356,117 @@ class TerminalProposal:
         ):
             raise ContractError("supervisor terminal proposals must synthesize process death")
         object.__setattr__(self, "source", self.source)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "runId": self.run_id,
+            "invocationId": self.invocation_id,
+            "kind": self.kind,
+            "finalSequence": self.final_sequence,
+            "evidenceEventIds": list(self.evidence_event_ids),
+            "evidenceReceiptRefs": list(self.evidence_receipt_refs),
+            "failure": self.failure.to_dict() if self.failure is not None else None,
+            "source": self.source,
+            "outcomeProposal": self.outcome_proposal.to_dict() if self.outcome_proposal else None,
+            "inputRequestProposal": (
+                self.input_request_proposal.to_dict() if self.input_request_proposal else None
+            ),
+            "cancellationReceipt": (
+                {
+                    "resourceRef": self.cancellation_receipt.resource_ref,
+                    "receiptRef": self.cancellation_receipt.receipt_ref,
+                    "runId": self.cancellation_receipt.run_id,
+                    "invocationId": self.cancellation_receipt.invocation_id,
+                    "idempotencyKey": self.cancellation_receipt.idempotency_key,
+                }
+                if self.cancellation_receipt
+                else None
+            ),
+            "artifactProposals": [item.to_dict() for item in self.artifact_proposals],
+        }
+
+    @classmethod
+    def from_dict(cls, raw: Any) -> "TerminalProposal":
+        data = _mapping(raw, "terminalProposal")
+        _reject_unknown(
+            data,
+            {
+                "runId",
+                "invocationId",
+                "kind",
+                "finalSequence",
+                "evidenceEventIds",
+                "evidenceReceiptRefs",
+                "failure",
+                "source",
+                "outcomeProposal",
+                "inputRequestProposal",
+                "cancellationReceipt",
+                "artifactProposals",
+            },
+            "terminalProposal",
+        )
+        failure = data.get("failure")
+        cancellation = data.get("cancellationReceipt")
+        return cls(
+            run_id=_require_text(data.get("runId"), "terminal.runId"),
+            invocation_id=_require_text(data.get("invocationId"), "terminal.invocationId"),
+            kind=_require_text(data.get("kind"), "terminal.kind"),
+            final_sequence=_require_int(data.get("finalSequence"), "terminal.finalSequence"),
+            evidence_event_ids=tuple(
+                _require_text(item, "terminal.evidenceEventIds[]")
+                for item in _sequence(
+                    data.get("evidenceEventIds"),
+                    "terminal.evidenceEventIds",
+                    maximum=MAX_TERMINAL_EVIDENCE,
+                )
+            ),
+            evidence_receipt_refs=tuple(
+                _require_text(item, "terminal.evidenceReceiptRefs[]")
+                for item in _sequence(
+                    data.get("evidenceReceiptRefs"),
+                    "terminal.evidenceReceiptRefs",
+                    maximum=MAX_TERMINAL_EVIDENCE,
+                )
+            ),
+            failure=RuntimeFailure.from_dict(failure) if failure is not None else None,
+            source=_require_text(data.get("source", "runtime"), "terminal.source"),
+            outcome_proposal=(
+                OutcomeProposal.from_dict(data.get("outcomeProposal"))
+                if data.get("outcomeProposal") is not None
+                else None
+            ),
+            input_request_proposal=(
+                InputRequestProposal.from_dict(data.get("inputRequestProposal"))
+                if data.get("inputRequestProposal") is not None
+                else None
+            ),
+            cancellation_receipt=(
+                ProductReceipt.from_dict(cancellation)
+                if cancellation is not None
+                else None
+            ),
+            artifact_proposals=tuple(
+                ArtifactProposal.from_dict(item)
+                for item in _sequence(
+                    data.get("artifactProposals"),
+                    "terminal.artifactProposals",
+                    maximum=MAX_TERMINAL_EVIDENCE,
+                )
+            ),
+        )
+
+    def to_json(self) -> str:
+        return json.dumps(self.to_dict(), sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+    @classmethod
+    def from_json(cls, raw: str) -> "TerminalProposal":
+        try:
+            return cls.from_dict(json.loads(raw))
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            if isinstance(exc, ContractError):
+                raise
+            raise ContractError(f"invalid terminal proposal JSON: {exc}") from exc
 
     @property
     def idempotency_key(self) -> str:
@@ -1185,6 +1493,9 @@ class TerminalReconciliationReceipt:
     idempotency_key: str
     accepted: bool
     legal_transition: bool
+    operation_ref: str | None = None
+    product_event_ref: str | None = None
+    product_receipts: tuple[ProductReceipt, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "receipt_ref", _require_text(self.receipt_ref, "terminalReceipt.receiptRef"))
@@ -1204,3 +1515,92 @@ class TerminalReconciliationReceipt:
         )
         if not isinstance(self.accepted, bool) or not isinstance(self.legal_transition, bool):
             raise ContractError("terminal receipt decisions must be booleans")
+        object.__setattr__(self, "operation_ref", _require_optional_text(self.operation_ref, "terminalReceipt.operationRef"))
+        object.__setattr__(
+            self,
+            "product_event_ref",
+            _require_optional_text(self.product_event_ref, "terminalReceipt.productEventRef"),
+        )
+        product_receipts = tuple(self.product_receipts)
+        if len(product_receipts) > MAX_TERMINAL_EVIDENCE:
+            raise BoundsError(
+                f"terminalReceipt.productReceipts exceeds {MAX_TERMINAL_EVIDENCE} items"
+            )
+        if not all(isinstance(item, ProductReceipt) for item in product_receipts):
+            raise ContractError("terminalReceipt.productReceipts contains an unsupported value")
+        if any(
+            item.run_id != self.run_id or item.invocation_id != self.invocation_id
+            for item in product_receipts
+        ):
+            raise BindingError("terminal product receipt is not bound to the terminal slot")
+        object.__setattr__(self, "product_receipts", product_receipts)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "receiptRef": self.receipt_ref,
+            "auditRef": self.audit_ref,
+            "runId": self.run_id,
+            "invocationId": self.invocation_id,
+            "kind": self.kind,
+            "idempotencyKey": self.idempotency_key,
+            "accepted": self.accepted,
+            "legalTransition": self.legal_transition,
+            "operationRef": self.operation_ref,
+            "productEventRef": self.product_event_ref,
+            "productReceipts": [item.to_dict() for item in self.product_receipts],
+        }
+
+    @classmethod
+    def from_dict(cls, raw: Any) -> "TerminalReconciliationReceipt":
+        data = _mapping(raw, "terminalReceipt")
+        _reject_unknown(
+            data,
+            {
+                "receiptRef",
+                "auditRef",
+                "runId",
+                "invocationId",
+                "kind",
+                "idempotencyKey",
+                "accepted",
+                "legalTransition",
+                "operationRef",
+                "productEventRef",
+                "productReceipts",
+            },
+            "terminalReceipt",
+        )
+        return cls(
+            receipt_ref=_require_text(data.get("receiptRef"), "terminalReceipt.receiptRef"),
+            audit_ref=_require_text(data.get("auditRef"), "terminalReceipt.auditRef"),
+            run_id=_require_text(data.get("runId"), "terminalReceipt.runId"),
+            invocation_id=_require_text(data.get("invocationId"), "terminalReceipt.invocationId"),
+            kind=_require_text(data.get("kind"), "terminalReceipt.kind"),
+            idempotency_key=_require_text(data.get("idempotencyKey"), "terminalReceipt.idempotencyKey"),
+            accepted=data.get("accepted"),
+            legal_transition=data.get("legalTransition"),
+            operation_ref=_require_optional_text(data.get("operationRef"), "terminalReceipt.operationRef"),
+            product_event_ref=_require_optional_text(
+                data.get("productEventRef"), "terminalReceipt.productEventRef"
+            ),
+            product_receipts=tuple(
+                ProductReceipt.from_dict(item)
+                for item in _sequence(
+                    data.get("productReceipts"),
+                    "terminalReceipt.productReceipts",
+                    maximum=MAX_TERMINAL_EVIDENCE,
+                )
+            ),
+        )
+
+    def to_json(self) -> str:
+        return json.dumps(self.to_dict(), sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+    @classmethod
+    def from_json(cls, raw: str) -> "TerminalReconciliationReceipt":
+        try:
+            return cls.from_dict(json.loads(raw))
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            if isinstance(exc, ContractError):
+                raise
+            raise ContractError(f"invalid terminal receipt JSON: {exc}") from exc

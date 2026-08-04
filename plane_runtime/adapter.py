@@ -14,6 +14,7 @@ from typing import Callable, Iterable, Mapping, Protocol
 
 from .contract import (
     ArtifactObserved,
+    ArtifactProposal,
     BindingError,
     BoundsError,
     ContractError,
@@ -21,6 +22,8 @@ from .contract import (
     InputRequestObserved,
     LeaseError,
     OutcomeSubmissionObserved,
+    OutcomeProposal,
+    InputRequestProposal,
     ProgressObserved,
     ProductReceipt,
     PublicationReceipt,
@@ -37,7 +40,7 @@ from .contract import (
     UsageObserved,
     RuntimeLease,
     MAX_REFERENCE_LENGTH,
-    MAX_NEW_CONTEXT_EVENT_REFS,
+    MAX_TERMINAL_EVIDENCE,
     parse_utc_timestamp,
 )
 from .contract import InvocationEnvelope, PROTOCOL
@@ -54,11 +57,7 @@ class CancellationSignal(Protocol):
 
 
 class RuntimeHost(Protocol):
-    """Trusted host actions available to the adapter.
-
-    The host returns a Plane receipt for an explicit publication action.  The
-    adapter never treats a final transcript as publication by itself.
-    """
+    """Trusted host action for explicit non-terminal publication only."""
 
     def publish_transcript(
         self,
@@ -69,39 +68,6 @@ class RuntimeHost(Protocol):
         idempotency_key: str,
     ) -> PublicationReceipt:
         ...
-
-    def request_input(
-        self,
-        *,
-        run_id: str,
-        invocation_id: str,
-        request_ref: str,
-        prompt: str,
-        idempotency_key: str,
-    ) -> ProductReceipt:
-        ...
-
-    def record_artifact(
-        self,
-        *,
-        run_id: str,
-        invocation_id: str,
-        artifact_ref: str,
-        digest: str,
-        idempotency_key: str,
-    ) -> ProductReceipt:
-        ...
-
-    def submit_outcome(
-        self,
-        *,
-        run_id: str,
-        invocation_id: str,
-        submission_ref: str,
-        idempotency_key: str,
-    ) -> ProductReceipt:
-        ...
-
 
 class CancellationAuthority(Protocol):
     """Plane-owned cancellation correlation authority."""
@@ -264,6 +230,7 @@ class KernelObservation:
     artifact_ref: str | None = None
     artifact_digest: str | None = None
     submission_ref: str | None = None
+    outcome_content: str | None = None
     usage: RuntimeBudget | None = None
 
 
@@ -285,12 +252,23 @@ class CancellationRequested(Exception):
     """Internal control flow for an invocation cancelled during dispatch."""
 
 
+@dataclass
+class ExecutionPhase:
+    """Observable phase marker used only by the process boundary classifier."""
+
+    execution_started: bool = False
+
+
 class TerminalReconciliationError(ContractError):
     """Raised when Plane does not accept the proposed terminal transition."""
 
-    def __init__(self, receipt: TerminalReconciliationReceipt) -> None:
+    def __init__(
+        self,
+        receipt: TerminalReconciliationReceipt | None = None,
+        message: str = "Plane did not accept the terminal reconciliation proposal",
+    ) -> None:
         self.receipt = receipt
-        super().__init__("Plane did not accept the terminal reconciliation proposal")
+        super().__init__(message)
 
 
 class NeverCancelled:
@@ -618,29 +596,57 @@ def _terminal_proposal(
     exit_value: RuntimeExit,
     stream: EventStream,
     source: str = "runtime",
-    extra_receipt_refs: Iterable[str] = (),
+    outcome_proposal: OutcomeProposal | None = None,
+    input_request_proposal: InputRequestProposal | None = None,
+    cancellation_receipt: ProductReceipt | None = None,
+    artifact_proposals: Iterable[ArtifactProposal] = (),
 ) -> TerminalProposal:
-    receipt_refs = tuple(
+    all_receipt_refs = tuple(
         receipt_ref
         for event in stream.events
         for receipt_ref in (getattr(event.body, "receipt_ref", None),)
         if receipt_ref is not None
     )
-    receipt_refs += tuple(extra_receipt_refs)
-    receipt_refs = receipt_refs[-MAX_NEW_CONTEXT_EVENT_REFS:]
-    if len(set(receipt_refs)) != len(receipt_refs):
-        raise SequenceError("terminal evidence receipt references must be unique")
+    required_event_ids = tuple(
+        item.event_id
+        for item in (outcome_proposal, input_request_proposal)
+        if item is not None
+    )
+    required_receipt_refs = tuple(
+        item.proposal_receipt_ref
+        for item in (outcome_proposal, input_request_proposal)
+        if item is not None
+    )
+    if cancellation_receipt is not None:
+        required_receipt_refs += (cancellation_receipt.receipt_ref,)
+
+    def preserve_required(required: Iterable[str], optional: Iterable[str]) -> tuple[str, ...]:
+        required_values = tuple(dict.fromkeys(required))
+        if len(required_values) > MAX_TERMINAL_EVIDENCE:
+            raise BoundsError("terminal required evidence exceeds the bounded terminal surface")
+        optional_values = tuple(
+            value for value in optional if value not in set(required_values)
+        )
+        room = MAX_TERMINAL_EVIDENCE - len(required_values)
+        return required_values + optional_values[-room:]
+
+    artifacts = tuple(artifact_proposals)
+    artifacts = artifacts[-MAX_TERMINAL_EVIDENCE:]
     return TerminalProposal(
         run_id=run.run_id,
         invocation_id=invocation.invocation_id,
         kind=exit_value.kind,
         final_sequence=exit_value.final_sequence,
-        evidence_event_ids=tuple(
-            event.event_id for event in stream.events[-MAX_NEW_CONTEXT_EVENT_REFS:]
+        evidence_event_ids=preserve_required(
+            required_event_ids, (event.event_id for event in stream.events)
         ),
-        evidence_receipt_refs=receipt_refs,
+        evidence_receipt_refs=preserve_required(required_receipt_refs, all_receipt_refs),
         failure=exit_value.failure,
         source=source,
+        outcome_proposal=outcome_proposal,
+        input_request_proposal=input_request_proposal,
+        cancellation_receipt=cancellation_receipt,
+        artifact_proposals=artifacts,
     )
 
 
@@ -650,16 +656,25 @@ def _reconcile_terminal(
 ) -> TerminalReconciliationReceipt:
     if port is None:
         raise ContractError("execution requires an injected terminal reconciliation port")
-    receipt = port.reconcile_terminal(proposal)
+    try:
+        receipt = port.reconcile_terminal(proposal)
+    except Exception as exc:
+        raise TerminalReconciliationError(
+            message="terminal reconciliation was unavailable",
+        ) from exc
     if not isinstance(receipt, TerminalReconciliationReceipt):
-        raise ContractError("terminal reconciliation returned an invalid receipt")
+        raise TerminalReconciliationError(
+            message="terminal reconciliation returned an invalid receipt",
+        )
     if (
         receipt.run_id != proposal.run_id
         or receipt.invocation_id != proposal.invocation_id
         or receipt.kind != proposal.kind
         or receipt.idempotency_key != proposal.idempotency_key
     ):
-        raise BindingError("terminal reconciliation receipt is not bound to this proposal")
+        raise TerminalReconciliationError(
+            message="terminal reconciliation receipt is not bound to this proposal",
+        )
     return receipt
 
 
@@ -676,26 +691,67 @@ def reconcile_terminal_proposal(
 def _validate_terminal_evidence(
     *,
     kind: str,
+    proposal: TerminalProposal,
     stream: EventStream,
     cancellation_receipt: ProductReceipt | None,
 ) -> None:
-    bodies = tuple(event.body for event in stream.events)
-    submissions = tuple(
-        body for body in bodies if isinstance(body, OutcomeSubmissionObserved)
-    )
-    input_requests = tuple(
-        body for body in bodies if isinstance(body, InputRequestObserved)
-    )
-    if kind == "completed" and len(submissions) != 1:
-        raise ContractError(
-            "completed requires exactly one verified outcome-submission receipt"
-        )
-    if kind == "waiting_for_input" and not input_requests:
-        raise ContractError(
-            "waiting_for_input requires a correlated input-request receipt"
-        )
+    if proposal.kind != kind:
+        raise BindingError("terminal proposal kind does not match the exit")
+    if proposal.final_sequence != stream.last_sequence:
+        raise ContractError("terminal proposal final sequence does not match finalized evidence")
+    known_events = {event.event_id: event for event in stream.events}
+    if any(event_id not in known_events for event_id in proposal.evidence_event_ids):
+        raise ContractError("terminal proposal contains forged event evidence")
+    known_receipts = {
+        receipt_ref
+        for event in stream.events
+        for receipt_ref in (getattr(event.body, "receipt_ref", None),)
+        if receipt_ref is not None
+    }
+    allowed_receipts = set(known_receipts)
+    if cancellation_receipt is not None:
+        allowed_receipts.add(cancellation_receipt.receipt_ref)
+    if any(receipt_ref not in allowed_receipts for receipt_ref in proposal.evidence_receipt_refs):
+        raise ContractError("terminal proposal contains forged receipt evidence")
+    if kind == "completed" and proposal.outcome_proposal is None:
+        raise ContractError("completed requires one finalized outcome proposal")
+    if kind == "completed":
+        outcome = proposal.outcome_proposal
+        assert outcome is not None
+        outcome_event = known_events.get(outcome.event_id)
+        if outcome_event is None or not isinstance(outcome_event.body, OutcomeSubmissionObserved):
+            raise ContractError("completed outcome evidence does not bind to an outcome event")
+        if (
+            outcome_event.body.submission_ref != outcome.submission_ref
+            or outcome_event.body.content != outcome.content
+            or outcome_event.body.receipt_ref != outcome.proposal_receipt_ref
+        ):
+            raise ContractError("completed outcome evidence was forged")
+    if kind == "waiting_for_input" and proposal.input_request_proposal is None:
+        raise ContractError("waiting_for_input requires one finalized input proposal")
+    if kind == "waiting_for_input":
+        input_request = proposal.input_request_proposal
+        assert input_request is not None
+        input_event = known_events.get(input_request.event_id)
+        if input_event is None or not isinstance(input_event.body, InputRequestObserved):
+            raise ContractError("waiting evidence does not bind to an input event")
+        if (
+            input_event.body.request_ref != input_request.request_ref
+            or input_event.body.prompt != input_request.prompt
+            or input_event.body.receipt_ref != input_request.proposal_receipt_ref
+        ):
+            raise ContractError("waiting evidence was forged")
     if kind == "cancelled" and cancellation_receipt is None:
         raise ContractError("cancelled requires an authoritative cancellation correlation")
+    for artifact in proposal.artifact_proposals:
+        artifact_event = known_events.get(artifact.event_id)
+        if artifact_event is None or not isinstance(artifact_event.body, ArtifactObserved):
+            raise ContractError("artifact proposal does not bind to an artifact event")
+        if (
+            artifact_event.body.artifact_ref != artifact.artifact_ref
+            or artifact_event.body.digest != artifact.digest
+        ):
+            raise ContractError("artifact evidence was forged")
 
 
 def _return_terminal(
@@ -706,25 +762,29 @@ def _return_terminal(
     stream: EventStream,
     exit_value: RuntimeExit,
     cancellation_receipt: ProductReceipt | None = None,
+    outcome_proposal: OutcomeProposal | None = None,
+    input_request_proposal: InputRequestProposal | None = None,
+    artifact_proposals: Iterable[ArtifactProposal] = (),
 ) -> RuntimeExit:
+    proposal = _terminal_proposal(
+        run=run,
+        invocation=invocation,
+        exit_value=exit_value,
+        stream=stream,
+        outcome_proposal=outcome_proposal,
+        input_request_proposal=input_request_proposal,
+        cancellation_receipt=cancellation_receipt,
+        artifact_proposals=artifact_proposals,
+    )
     _validate_terminal_evidence(
         kind=exit_value.kind,
+        proposal=proposal,
         stream=stream,
         cancellation_receipt=cancellation_receipt,
     )
     receipt = _reconcile_terminal(
         port,
-        _terminal_proposal(
-            run=run,
-            invocation=invocation,
-            exit_value=exit_value,
-            stream=stream,
-            extra_receipt_refs=(
-                (cancellation_receipt.receipt_ref,)
-                if cancellation_receipt is not None
-                else ()
-            ),
-        ),
+        proposal,
     )
     if not receipt.accepted or not receipt.legal_transition:
         raise TerminalReconciliationError(receipt)
@@ -765,6 +825,7 @@ def execute(
     checkpoint_authority: CheckpointAuthority | None = None,
     checkpoint_attestation: CheckpointAttestation | None = None,
     terminal_port: TerminalReconciliationPort | None = None,
+    execution_phase: ExecutionPhase | None = None,
 ) -> RuntimeExit:
     """Execute exactly one invocation through the replaceable kernel port.
 
@@ -792,6 +853,8 @@ def execute(
     if terminal_port is None:
         raise ContractError("execution requires an injected terminal reconciliation port")
     cancellation = cancellation or NeverCancelled()
+    if execution_phase is not None:
+        execution_phase.execution_started = True
     stream = EventStream(
         run_id=run.run_id,
         invocation_id=invocation.invocation_id,
@@ -829,10 +892,13 @@ def execute(
     transcripts: dict[str, TranscriptObserved] = {}
     pending_input_requests: set[str] = set()
     outcome_submissions: set[str] = set()
+    artifact_proposals: list[ArtifactProposal] = []
+    outcome_proposal: OutcomeProposal | None = None
+    input_request_proposal: InputRequestProposal | None = None
     used = RuntimeBudget()
 
     def on_observation(observation: KernelObservation) -> None:
-        nonlocal used
+        nonlocal used, outcome_proposal, input_request_proposal
         if cancellation.is_cancelled():
             raise CancellationRequested
         if observation.kind == "progress":
@@ -856,89 +922,79 @@ def execute(
             _next_event(stream, invocation, transcript)
             return
         if observation.kind == "input_request":
-            if host is None:
-                raise ContractError("input requests require a trusted runtime host")
             if observation.request_ref is None or observation.message is None:
                 raise ContractError("input request requires a reference and prompt")
             if observation.request_ref in pending_input_requests:
                 raise SequenceError("input request reference was reused in one invocation")
-            event_id = f"{invocation.invocation_id}:input:{observation.request_ref}"
-            receipt = host.request_input(
-                run_id=run.run_id,
-                invocation_id=invocation.invocation_id,
-                request_ref=observation.request_ref,
-                prompt=observation.message,
-                idempotency_key=event_id,
-            )
-            _validate_product_receipt(
-                receipt,
-                run_id=run.run_id,
-                invocation_id=invocation.invocation_id,
-                resource_ref=observation.request_ref,
-                idempotency_key=event_id,
-            )
             pending_input_requests.add(observation.request_ref)
-            _next_event(
+            event = _next_event(
                 stream,
                 invocation,
-                InputRequestObserved(observation.request_ref, observation.message, receipt.receipt_ref),
+                InputRequestObserved(
+                    observation.request_ref,
+                    observation.message,
+                    f"proposal:{invocation.invocation_id}:input:{observation.request_ref}",
+                ),
+            )
+            input_request_proposal = InputRequestProposal(
+                request_ref=observation.request_ref,
+                prompt=observation.message,
+                event_id=event.event_id,
+                proposal_receipt_ref=event.body.receipt_ref,  # type: ignore[union-attr]
             )
             return
         if observation.kind == "artifact":
-            if host is None:
-                raise ContractError("artifacts require a trusted runtime host")
             if observation.artifact_ref is None or observation.artifact_digest is None:
                 raise ContractError("artifact observation requires a reference and digest")
-            event_id = f"{invocation.invocation_id}:artifact:{observation.artifact_ref}"
-            receipt = host.record_artifact(
-                run_id=run.run_id,
-                invocation_id=invocation.invocation_id,
-                artifact_ref=observation.artifact_ref,
-                digest=observation.artifact_digest,
-                idempotency_key=event_id,
-            )
-            _validate_product_receipt(
-                receipt,
-                run_id=run.run_id,
-                invocation_id=invocation.invocation_id,
-                resource_ref=observation.artifact_ref,
-                idempotency_key=event_id,
-            )
-            _next_event(
+            event = _next_event(
                 stream,
                 invocation,
-                ArtifactObserved(observation.artifact_ref, observation.artifact_digest, receipt.receipt_ref),
+                ArtifactObserved(
+                    observation.artifact_ref,
+                    observation.artifact_digest,
+                    f"proposal:{invocation.invocation_id}:artifact:{observation.artifact_ref}",
+                ),
+            )
+            artifact_proposals.append(
+                ArtifactProposal(
+                    artifact_ref=observation.artifact_ref,
+                    digest=observation.artifact_digest,
+                    event_id=event.event_id,
+                )
             )
             return
         if observation.kind == "outcome_submission":
-            if host is None:
-                raise ContractError("outcome submissions require a trusted runtime host")
             if observation.submission_ref is None:
                 raise ContractError("outcome submission requires a submission reference")
             if observation.submission_ref in outcome_submissions:
                 raise SequenceError("outcome submission reference was reused in one invocation")
-            event_id = f"{invocation.invocation_id}:outcome:{observation.submission_ref}"
-            receipt = host.submit_outcome(
-                run_id=run.run_id,
-                invocation_id=invocation.invocation_id,
-                submission_ref=observation.submission_ref,
-                idempotency_key=event_id,
-            )
-            _validate_product_receipt(
-                receipt,
-                run_id=run.run_id,
-                invocation_id=invocation.invocation_id,
-                resource_ref=observation.submission_ref,
-                idempotency_key=event_id,
-            )
             outcome_submissions.add(observation.submission_ref)
-            _next_event(
+            content = observation.outcome_content
+            matching: TranscriptObserved | None = None
+            if not content:
+                matching = transcripts.get(observation.transcript_ref or "")
+            if matching is None and transcripts:
+                matching = next(reversed(transcripts.values()))
+            if not content:
+                content = matching.text if matching is not None else None
+            if not content:
+                raise ContractError("outcome submission requires explicit outcome content")
+            event = _next_event(
                 stream,
                 invocation,
                 OutcomeSubmissionObserved(
                     submission_ref=observation.submission_ref,
-                    receipt_ref=receipt.receipt_ref,
+                    receipt_ref=(
+                        f"proposal:{invocation.invocation_id}:outcome:{observation.submission_ref}"
+                    ),
+                    content=content,
                 ),
+            )
+            outcome_proposal = OutcomeProposal(
+                submission_ref=observation.submission_ref,
+                content=content,
+                event_id=event.event_id,
+                proposal_receipt_ref=event.body.receipt_ref,  # type: ignore[union-attr]
             )
             return
         if observation.kind == "publication_request":
@@ -991,6 +1047,7 @@ def execute(
             stream=stream,
             exit_value=RuntimeExit(kind="cancelled", final_sequence=stream.last_sequence),
             cancellation_receipt=cancellation_receipt,
+            artifact_proposals=artifact_proposals,
         )
     if cancellation.is_cancelled():
         cancellation_receipt = _cancellation_receipt(
@@ -1005,11 +1062,29 @@ def execute(
             stream=stream,
             exit_value=RuntimeExit(kind="cancelled", final_sequence=stream.last_sequence),
             cancellation_receipt=cancellation_receipt,
+            artifact_proposals=artifact_proposals,
         )
     if result.terminal_kind == "waiting_for_input" and not pending_input_requests:
         raise ContractError("waiting_for_input requires a visible authorized input request")
     if result.terminal_kind != "waiting_for_input" and pending_input_requests:
         raise ContractError("terminal exit cannot leave an unresolved input request")
+    if result.terminal_kind == "completed" and len(outcome_submissions) != 1:
+        raise ContractError("completed requires exactly one untrusted outcome proposal")
+    if result.terminal_kind == "cancelled":
+        cancellation_receipt = _cancellation_receipt(
+            authority=cancellation_authority,
+            run=run,
+            invocation=invocation,
+        )
+        return _return_terminal(
+            port=terminal_port,
+            run=run,
+            invocation=invocation,
+            stream=stream,
+            exit_value=RuntimeExit(kind="cancelled", final_sequence=stream.last_sequence),
+            cancellation_receipt=cancellation_receipt,
+            artifact_proposals=artifact_proposals,
+        )
     return _return_terminal(
         port=terminal_port,
         run=run,
@@ -1020,6 +1095,9 @@ def execute(
             final_sequence=stream.last_sequence,
             failure=result.failure,
         ),
+        outcome_proposal=outcome_proposal,
+        input_request_proposal=input_request_proposal,
+        artifact_proposals=artifact_proposals,
     )
 
 
@@ -1093,14 +1171,11 @@ class FakeKernel:
 
 
 class RecordingHost:
-    """Deterministic trusted host used by the fake service and tests."""
+    """Deterministic host for explicit non-terminal transcript publication."""
 
     def __init__(self) -> None:
         self.publications: list[tuple[str, str, str]] = []
-        self.input_requests: list[tuple[str, str, str]] = []
-        self.artifacts: list[tuple[str, str, str]] = []
-        self.outcomes: list[tuple[str, str, str]] = []
-        self._receipts: dict[str, PublicationReceipt | ProductReceipt] = {}
+        self._receipts: dict[str, PublicationReceipt] = {}
 
     def publish_transcript(
         self,
@@ -1127,79 +1202,148 @@ class RecordingHost:
         self._receipts[idempotency_key] = receipt
         return receipt
 
-    def request_input(
-        self,
-        *,
-        run_id: str,
-        invocation_id: str,
-        request_ref: str,
-        prompt: str,
-        idempotency_key: str,
-    ) -> ProductReceipt:
-        prior = self._receipts.get(idempotency_key)
-        if prior is not None:
-            if not isinstance(prior, ProductReceipt) or prior.resource_ref != request_ref:
-                raise BindingError("input idempotency key was reused for another operation")
-            return prior
-        self.input_requests.append((run_id, request_ref, idempotency_key))
-        receipt = ProductReceipt(
-            resource_ref=request_ref,
-            receipt_ref=f"receipt:{idempotency_key}",
-            run_id=run_id,
-            invocation_id=invocation_id,
-            idempotency_key=idempotency_key,
-        )
-        self._receipts[idempotency_key] = receipt
-        return receipt
 
-    def record_artifact(
-        self,
-        *,
-        run_id: str,
-        invocation_id: str,
-        artifact_ref: str,
-        digest: str,
-        idempotency_key: str,
-    ) -> ProductReceipt:
-        prior = self._receipts.get(idempotency_key)
-        if prior is not None:
-            if not isinstance(prior, ProductReceipt) or prior.resource_ref != artifact_ref:
-                raise BindingError("artifact idempotency key was reused for another operation")
-            return prior
-        self.artifacts.append((run_id, artifact_ref, idempotency_key))
-        receipt = ProductReceipt(
-            resource_ref=artifact_ref,
-            receipt_ref=f"receipt:{idempotency_key}",
-            run_id=run_id,
-            invocation_id=invocation_id,
-            idempotency_key=idempotency_key,
-        )
-        self._receipts[idempotency_key] = receipt
-        return receipt
+class FixtureTerminalReconciliationPort:
+    """Explicit atomic fixture for tests and the demo service.
 
-    def submit_outcome(
+    The fixture intentionally has no separate outcome, artifact, or input
+    mutation methods.  All visible terminal product events are applied while
+    holding the same slot lock as the idempotency decision.
+    """
+
+    def __init__(self) -> None:
+        self._lock = RLock()
+        self._slots: dict[str, tuple[TerminalProposal, TerminalReconciliationReceipt]] = {}
+        self.accepted: list[str] = []
+        self.product_events: list[tuple[str, str]] = []
+        self.product_event_payloads: list[dict[str, object]] = []
+        self.proposals: list[TerminalProposal] = []
+        self.receipts: list[TerminalReconciliationReceipt] = []
+
+    def _receipt(
         self,
+        proposal: TerminalProposal,
         *,
-        run_id: str,
-        invocation_id: str,
-        submission_ref: str,
-        idempotency_key: str,
-    ) -> ProductReceipt:
-        prior = self._receipts.get(idempotency_key)
-        if prior is not None:
-            if not isinstance(prior, ProductReceipt) or prior.resource_ref != submission_ref:
-                raise BindingError("outcome idempotency key was reused for another operation")
-            return prior
-        self.outcomes.append((run_id, submission_ref, idempotency_key))
-        receipt = ProductReceipt(
-            resource_ref=submission_ref,
-            receipt_ref=f"receipt:{idempotency_key}",
-            run_id=run_id,
-            invocation_id=invocation_id,
-            idempotency_key=idempotency_key,
+        accepted: bool,
+        legal_transition: bool,
+        product_receipts: tuple[ProductReceipt, ...] = (),
+    ) -> TerminalReconciliationReceipt:
+        key = proposal.idempotency_key
+        return TerminalReconciliationReceipt(
+            receipt_ref=f"terminal-receipt:{key}",
+            audit_ref=f"audit:{key}",
+            run_id=proposal.run_id,
+            invocation_id=proposal.invocation_id,
+            kind=proposal.kind,
+            idempotency_key=key,
+            accepted=accepted,
+            legal_transition=legal_transition,
+            operation_ref=f"operation:{key}",
+            product_event_ref=f"product-event:{key}",
+            product_receipts=product_receipts,
         )
-        self._receipts[idempotency_key] = receipt
-        return receipt
+
+    def _product_receipt(self, proposal: TerminalProposal, resource_ref: str, suffix: str) -> ProductReceipt:
+        key = f"{proposal.idempotency_key}:{suffix}"
+        return ProductReceipt(
+            resource_ref=resource_ref,
+            receipt_ref=f"product-receipt:{key}",
+            run_id=proposal.run_id,
+            invocation_id=proposal.invocation_id,
+            idempotency_key=key,
+        )
+
+    def reconcile_terminal(self, proposal: TerminalProposal) -> TerminalReconciliationReceipt:
+        with self._lock:
+            key = proposal.idempotency_key
+            prior = self._slots.get(key)
+            if prior is not None:
+                prior_proposal, prior_receipt = prior
+                if prior_proposal == proposal:
+                    return prior_receipt
+                return self._receipt(proposal, accepted=False, legal_transition=False)
+
+            product_receipts: list[ProductReceipt] = []
+            if proposal.kind == "completed":
+                assert proposal.outcome_proposal is not None
+                product_receipts.append(
+                    self._product_receipt(
+                        proposal,
+                        proposal.outcome_proposal.submission_ref,
+                        "outcome",
+                    )
+                )
+            elif proposal.kind == "waiting_for_input":
+                assert proposal.input_request_proposal is not None
+                product_receipts.append(
+                    self._product_receipt(
+                        proposal,
+                        proposal.input_request_proposal.request_ref,
+                        "input",
+                    )
+                )
+            elif proposal.kind == "cancelled":
+                assert proposal.cancellation_receipt is not None
+                product_receipts.append(
+                    self._product_receipt(
+                        proposal,
+                        proposal.cancellation_receipt.resource_ref,
+                        "cancelled",
+                    )
+                )
+            else:
+                product_receipts.append(
+                    self._product_receipt(proposal, f"terminal:{proposal.kind}", proposal.kind)
+                )
+            artifact_items = proposal.artifact_proposals[-(
+                MAX_TERMINAL_EVIDENCE - len(product_receipts)
+            ):]
+            product_receipts.extend(
+                self._product_receipt(proposal, item.artifact_ref, f"artifact:{index}")
+                for index, item in enumerate(artifact_items)
+            )
+            product_event_kind = {
+                "completed": "OutcomeSubmission",
+                "waiting_for_input": "InputRequest",
+                "cancelled": "Cancellation",
+                "failed": "TerminalFailure",
+                "blocked": "TerminalBlock",
+            }[proposal.kind]
+            product_event_payload: dict[str, object] = {
+                "kind": product_event_kind,
+                "runId": proposal.run_id,
+                "invocationId": proposal.invocation_id,
+                "artifactRefs": [item.artifact_ref for item in artifact_items],
+            }
+            if proposal.outcome_proposal is not None:
+                product_event_payload.update(
+                    {
+                        "submissionRef": proposal.outcome_proposal.submission_ref,
+                        "content": proposal.outcome_proposal.content,
+                    }
+                )
+            elif proposal.input_request_proposal is not None:
+                product_event_payload.update(
+                    {
+                        "requestRef": proposal.input_request_proposal.request_ref,
+                        "prompt": proposal.input_request_proposal.prompt,
+                    }
+                )
+            elif proposal.cancellation_receipt is not None:
+                product_event_payload["cancellationRef"] = proposal.cancellation_receipt.resource_ref
+            receipt = self._receipt(
+                proposal,
+                accepted=True,
+                legal_transition=True,
+                product_receipts=tuple(product_receipts),
+            )
+            self._slots[key] = (proposal, receipt)
+            self.accepted.append(key)
+            self.product_events.append((key, proposal.kind))
+            self.product_event_payloads.append(product_event_payload)
+            self.proposals.append(proposal)
+            self.receipts.append(receipt)
+            return receipt
 
 
 def classify_process_death(

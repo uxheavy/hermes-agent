@@ -11,7 +11,6 @@ import argparse
 import json
 import sys
 from datetime import datetime, timezone
-from threading import RLock
 from typing import Any, Callable, TextIO
 
 from .adapter import (
@@ -20,13 +19,18 @@ from .adapter import (
     CheckpointAuthority,
     CheckpointAttestation,
     EventCollector,
+    ExecutionPhase,
     FixtureCanonicalLeaseAuthority,
     FixtureCheckpointAuthority,
+    FixtureTerminalReconciliationPort,
     FakeKernel,
     FakeKernelPlan,
     KernelPort,
     RecordingHost,
     RuntimeHost,
+    CancellationAuthority,
+    CancellationSignal,
+    TerminalReconciliationError,
     TerminalReconciliationPort,
     execute,
     reconcile_terminal_proposal,
@@ -35,6 +39,7 @@ from .contract import (
     AssignmentSnapshot,
     ContractDigests,
     ContractError,
+    BindingError,
     InvocationEnvelope,
     MAX_NEW_CONTEXT_EVENT_REFS,
     OperationDescriptor,
@@ -44,7 +49,6 @@ from .contract import (
     RunSnapshot,
     RuntimeBudget,
     TerminalProposal,
-    TerminalReconciliationReceipt,
     ToolPresentation,
     VersionedContextRef,
 )
@@ -54,42 +58,111 @@ GENERIC_RUNTIME_FAILURE = "runtime execution failed; Plane reconciliation is req
 InternalFailureHook = Callable[[Exception], None]
 
 
-class _DemoTerminalPort:
-    """Explicit demo-only terminal fixture, not production durability."""
+class _DemoTerminalPort(FixtureTerminalReconciliationPort):
+    """Explicit demo-only atomic fixture, not production durability."""
 
-    def __init__(self) -> None:
-        self._lock = RLock()
-        self._proposals: dict[str, tuple[TerminalProposal, TerminalReconciliationReceipt]] = {}
 
-    def reconcile_terminal(self, proposal: TerminalProposal) -> TerminalReconciliationReceipt:
-        with self._lock:
-            prior = self._proposals.get(proposal.idempotency_key)
-            if prior is not None:
-                prior_proposal, prior_receipt = prior
-                if prior_proposal == proposal:
-                    return prior_receipt
-                return TerminalReconciliationReceipt(
-                    receipt_ref=f"rejected:{proposal.idempotency_key}",
-                    audit_ref=f"audit:{proposal.idempotency_key}:conflict",
-                    run_id=proposal.run_id,
-                    invocation_id=proposal.invocation_id,
-                    kind=proposal.kind,
-                    idempotency_key=proposal.idempotency_key,
-                    accepted=False,
-                    legal_transition=False,
-                )
-            receipt = TerminalReconciliationReceipt(
-                receipt_ref=f"receipt:{proposal.idempotency_key}",
-                audit_ref=f"audit:{proposal.idempotency_key}",
-                run_id=proposal.run_id,
-                invocation_id=proposal.invocation_id,
-                kind=proposal.kind,
-                idempotency_key=proposal.idempotency_key,
-                accepted=True,
-                legal_transition=True,
+def _handle_runtime_failure(
+    *,
+    exc: Exception,
+    run: RunSnapshot,
+    invocation: InvocationEnvelope,
+    collector: EventCollector,
+    terminal_port: TerminalReconciliationPort,
+    output: TextIO,
+    internal_failure_hook: InternalFailureHook | None,
+) -> int:
+    """Keep raw failure detail local and require a bounded terminal handoff."""
+
+    if internal_failure_hook is not None:
+        try:
+            internal_failure_hook(exc)
+        except Exception:
+            pass
+    proposal = TerminalProposal(
+        run_id=run.run_id,
+        invocation_id=invocation.invocation_id,
+        kind="failed",
+        final_sequence=collector.last_sequence,
+        evidence_event_ids=tuple(
+            event.event_id for event in collector.events[-MAX_NEW_CONTEXT_EVENT_REFS:]
+        ),
+        failure=RuntimeFailure(
+            code="runtime_exception",
+            message=GENERIC_RUNTIME_FAILURE,
+            retryable=True,
+        ),
+    )
+    try:
+        receipt = reconcile_terminal_proposal(port=terminal_port, proposal=proposal)
+    except Exception:
+        receipt = None
+    if receipt is not None and receipt.accepted and receipt.legal_transition:
+        output.write(
+            json.dumps(
+                {"type": "reconciliation", "receipt": receipt.to_dict()},
+                sort_keys=True,
             )
-            self._proposals[proposal.idempotency_key] = (proposal, receipt)
-            return receipt
+            + "\n"
+        )
+        output.flush()
+        return 0
+    output.write(
+        json.dumps(
+            {
+                "type": "reconciliation_request",
+                "request": {
+                    "kind": "failed",
+                    "code": "runtime_exception",
+                    "message": GENERIC_RUNTIME_FAILURE,
+                    "runId": run.run_id,
+                    "invocationId": invocation.invocation_id,
+                    "finalSequence": collector.last_sequence,
+                },
+            },
+            sort_keys=True,
+        )
+        + "\n"
+    )
+    output.flush()
+    return 1
+
+
+def _handle_terminal_reconciliation_failure(
+    *,
+    exc: TerminalReconciliationError,
+    run: RunSnapshot,
+    invocation: InvocationEnvelope,
+    collector: EventCollector,
+    output: TextIO,
+    internal_failure_hook: InternalFailureHook | None,
+) -> int:
+    """Leave rejected/unavailable terminal application for the supervisor."""
+
+    if internal_failure_hook is not None:
+        try:
+            internal_failure_hook(exc)
+        except Exception:
+            pass
+    output.write(
+        json.dumps(
+            {
+                "type": "reconciliation_request",
+                "request": {
+                    "kind": "failed",
+                    "code": "terminal_reconciliation_unavailable",
+                    "message": "terminal reconciliation is unavailable; supervisor action is required",
+                    "runId": run.run_id,
+                    "invocationId": invocation.invocation_id,
+                    "finalSequence": collector.last_sequence,
+                },
+            },
+            sort_keys=True,
+        )
+        + "\n"
+    )
+    output.flush()
+    return 1
 
 
 _DEMO_LEASE_BINDINGS = (
@@ -251,6 +324,8 @@ def serve_once(
     lease_binding: CanonicalLeaseBinding | None = None,
     checkpoint_authority: CheckpointAuthority | None = None,
     checkpoint_attestation: CheckpointAttestation | None = None,
+    cancellation: CancellationSignal | None = None,
+    cancellation_authority: CancellationAuthority | None = None,
     terminal_port: TerminalReconciliationPort | None = None,
     kernel: KernelPort | None = None,
     internal_failure_hook: InternalFailureHook | None = None,
@@ -280,32 +355,7 @@ def serve_once(
                 "service requires separately injected host, canonical lease authority/binding, "
                 "and terminal reconciliation port"
             )
-        collector = EventCollector(
-            run_id=run.run_id,
-            invocation_id=invocation.invocation_id,
-            expected_causation_ref=invocation.causation_ref,
-        )
-        def emit(event) -> None:
-            collector.emit(event)
-            output.write(json.dumps({"type": "event", "event": event.to_dict()}, sort_keys=True) + "\n")
-            output.flush()
-
-        exit_value = execute(
-            run=run,
-            invocation=invocation,
-            host=host,
-            emit=emit,
-            kernel=kernel or FakeKernel(plan),
-            lease_authority=lease_authority,
-            lease_binding=lease_binding,
-            checkpoint_authority=checkpoint_authority,
-            checkpoint_attestation=checkpoint_attestation,
-            terminal_port=terminal_port,
-        )
-        output.write(json.dumps({"type": "exit", "exit": exit_value.to_dict()}, sort_keys=True) + "\n")
-        output.flush()
-        return 0
-    except (ContractError, TypeError, ValueError, json.JSONDecodeError) as exc:
+    except (ContractError, TypeError, ValueError, json.JSONDecodeError):
         output.write(
             json.dumps(
                 {"type": "error", "error": {"code": "invalid_request", "message": "invalid runtime request"}},
@@ -315,64 +365,93 @@ def serve_once(
         )
         output.flush()
         raise
-    except Exception as exc:
-        if internal_failure_hook is not None:
-            try:
-                internal_failure_hook(exc)
-            except Exception:
-                pass
-        receipt: TerminalReconciliationReceipt | None = None
-        if run is not None and invocation is not None and terminal_port is not None:
-            proposal = TerminalProposal(
-                run_id=run.run_id,
-                invocation_id=invocation.invocation_id,
-                kind="failed",
-                final_sequence=collector.last_sequence if collector is not None else 0,
-                evidence_event_ids=tuple(
-                    event.event_id
-                    for event in collector.events[-MAX_NEW_CONTEXT_EVENT_REFS:]
-                )
-                if collector is not None
-                else (),
-                failure=RuntimeFailure(
-                    code="runtime_exception",
-                    message=GENERIC_RUNTIME_FAILURE,
-                    retryable=True,
-                ),
-            )
-            try:
-                receipt = reconcile_terminal_proposal(port=terminal_port, proposal=proposal)
-            except Exception:
-                receipt = None
-        if receipt is not None and receipt.accepted and receipt.legal_transition:
-            output.write(
-                json.dumps(
-                    {"type": "reconciliation", "receipt": receipt.__dict__},
-                    sort_keys=True,
-                )
-                + "\n"
-            )
-            output.flush()
-            return 0
+
+    # Everything after parsing is execution.  In particular, ValueError and
+    # TypeError from a kernel or host callback are runtime failures, not bad
+    # request data.
+    collector = EventCollector(
+        run_id=run.run_id,
+        invocation_id=invocation.invocation_id,
+        expected_causation_ref=invocation.causation_ref,
+    )
+    phase = ExecutionPhase()
+
+    def emit(event) -> None:
+        collector.emit(event)
+        output.write(json.dumps({"type": "event", "event": event.to_dict()}, sort_keys=True) + "\n")
+        output.flush()
+
+    try:
+        exit_value = execute(
+            run=run,
+            invocation=invocation,
+            host=host,
+            emit=emit,
+            cancellation=cancellation,
+            cancellation_authority=cancellation_authority,
+            kernel=kernel or FakeKernel(plan),
+            lease_authority=lease_authority,
+            lease_binding=lease_binding,
+            checkpoint_authority=checkpoint_authority,
+            checkpoint_attestation=checkpoint_attestation,
+            terminal_port=terminal_port,
+            execution_phase=phase,
+        )
+        output.write(json.dumps({"type": "exit", "exit": exit_value.to_dict()}, sort_keys=True) + "\n")
+        output.flush()
+        return 0
+    except BindingError:
         output.write(
             json.dumps(
-                {
-                    "type": "reconciliation_request",
-                    "request": {
-                        "kind": "failed",
-                        "code": "runtime_exception",
-                        "message": GENERIC_RUNTIME_FAILURE,
-                        "runId": run.run_id if run is not None else None,
-                        "invocationId": invocation.invocation_id if invocation is not None else None,
-                        "finalSequence": collector.last_sequence if collector is not None else 0,
-                    },
-                },
+                {"type": "error", "error": {"code": "binding_rejected", "message": "runtime binding rejected"}},
                 sort_keys=True,
             )
             + "\n"
         )
         output.flush()
         return 1
+    except TerminalReconciliationError as exc:
+        return _handle_terminal_reconciliation_failure(
+            exc=exc,
+            run=run,
+            invocation=invocation,
+            collector=collector,
+            output=output,
+            internal_failure_hook=internal_failure_hook,
+        )
+    except (ContractError, TypeError, ValueError) as exc:
+        if not phase.execution_started:
+            output.write(
+                json.dumps(
+                    {
+                        "type": "error",
+                        "error": {"code": "binding_rejected", "message": "runtime binding rejected"},
+                    },
+                    sort_keys=True,
+                )
+                + "\n"
+            )
+            output.flush()
+            return 1
+        return _handle_runtime_failure(
+            exc=exc,
+            run=run,
+            invocation=invocation,
+            collector=collector,
+            terminal_port=terminal_port,
+            output=output,
+            internal_failure_hook=internal_failure_hook,
+        )
+    except Exception as exc:
+        return _handle_runtime_failure(
+            exc=exc,
+            run=run,
+            invocation=invocation,
+            collector=collector,
+            terminal_port=terminal_port,
+            output=output,
+            internal_failure_hook=internal_failure_hook,
+        )
 
 
 def main(argv: list[str] | None = None) -> int:

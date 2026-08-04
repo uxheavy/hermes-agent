@@ -13,21 +13,25 @@ and durable recovery.
 Execution requires host-injected `CanonicalLeaseAuthority` and
 `CanonicalLeaseBinding` values. Continuations additionally require a complete,
 single-use host `CheckpointAttestation` claim through `CheckpointAuthority`;
-the envelope's lease and checkpoint references are never authorities. A
-completed exit requires an explicit host outcome-submission receipt, waiting
-requires an input-request receipt, and cancellation requires an authoritative
+the envelope's lease and checkpoint references are never authorities. Runtime
+observations, outcome content, artifact references, and evidence are proposal
+inputs only. A completed exit carries typed outcome content/evidence, waiting
+carries typed input evidence, and cancellation carries an authoritative
 cancellation correlation. Every runtime exit is submitted through the
-injected `TerminalReconciliationPort`, whose durable implementation must use
-one atomic `(run, invocation)` terminal slot and return a receipt, audit
-reference, and legal-transition result. A supervisor classifying process death
-uses the same port through `reconcile_process_death()`.
+injected `TerminalReconciliationPort`, whose durable implementation must claim
+one atomic `(run, invocation)` terminal slot, apply the kind-specific visible
+product event (including the outcome submission), and return operation, audit,
+and product receipts. A supervisor classifying process death uses the same port
+through `reconcile_process_death()`.
 
 The v1 contract contains immutable `RunSnapshot` and `InvocationEnvelope`
-values, bounded `RuntimeEvent` observations/proposals, and one `RuntimeExit`.
+values, bounded `RuntimeEvent` observations/proposals, typed `TerminalProposal`
+values, and one `RuntimeExit`.
 Later Plane input is represented only by event references in an invocation;
 budgets are supplied as remaining cumulative values. Transcript evidence is
 not publication: a publication observation is emitted only after a trusted
-host returns a receipt for an explicit publication action.
+host returns a receipt for an explicit non-terminal publication action.
+Terminal product mutations never use that host seam.
 
 The wire limits are deliberately finite: acceptance criteria are capped at 64
 items, context/eager-operation/new-event-reference lists at 128 items, event
@@ -38,7 +42,9 @@ boundary is stable across transport implementations.
 `adapter.py` exposes the narrow `KernelPort` seam. `FakeKernel` is a
 deterministic implementation for contract tests; a real Hermes implementation
 can be added behind the same seam without changing Hermes core modules.
-`service.py` provides a deliberately minimal one-invocation JSON-lines host.
+`service.py` provides a deliberately minimal one-invocation JSON-lines host and
+accepts an injected cancellation signal plus an independent canonical
+cancellation authority. The signal is never treated as authority.
 Unexpected internal exceptions are retained only by the protected failure hook
 and become a bounded generic failed proposal; if that proposal is not
 accepted, the service returns status 1 so a trusted supervisor can reconcile
