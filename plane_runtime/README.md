@@ -80,6 +80,21 @@ are replaceable infrastructure, never run-owned state. A supervisor may use
 process-death proposal through the reconciliation port when a replaceable
 process dies before returning an exit.
 
+`invocation_supervisor.py` adds the first production-directed isolation slice.
+`InvocationPolicy` accepts only a digest-pinned image and emits one fixed
+`python3 -m plane_runtime.service --once` Docker command with network disabled,
+read-only rootfs, no-new-privileges, all capabilities dropped, a non-root
+user, bounded CPU/memory/PIDs/tmpfs, and no host mounts or ambient environment.
+The injected `DockerRunner` must explicitly advertise every required
+enforcement and cleanup capability; a missing capability rejects launch before
+Docker is called. `InvocationSupervisor.run_once()` bounds request, frame,
+stdout, stderr, and wall-time handling, always attempts stop/kill/remove for
+the derived invocation container, and requires both a valid `RuntimeExit` and
+an accepted terminal receipt before returning `completed`. Process death,
+malformed output, timeout, cancellation, and cleanup failure are non-success
+outcomes; death reconciliation is idempotent and never replays an
+`outcome_unknown` result.
+
 Verify the package from the repository root:
 
 ```bash

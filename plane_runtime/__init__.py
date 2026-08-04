@@ -98,6 +98,14 @@ from .contract import (
     VersionedContextRef,
     parse_utc_timestamp,
 )
+from .invocation_supervisor import (
+    DockerRunnerCapabilities,
+    InvocationPolicy,
+    InvocationResult,
+    InvocationSupervisor,
+    build_invocation_argv,
+    build_invocation_env,
+)
 
 __all__ = [
     "PROTOCOL",
@@ -194,4 +202,10 @@ __all__ = [
     "parse_utc_timestamp",
     "reconcile_terminal_proposal",
     "reconcile_process_death",
+    "DockerRunnerCapabilities",
+    "InvocationPolicy",
+    "InvocationResult",
+    "InvocationSupervisor",
+    "build_invocation_argv",
+    "build_invocation_env",
 ]

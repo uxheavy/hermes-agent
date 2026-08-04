@@ -238,6 +238,19 @@ class _DemoTerminalPort(FixtureTerminalReconciliationPort):
     """Explicit demo-only atomic fixture, not production durability."""
 
 
+class _CapturingTerminalPort:
+    """Capture the one accepted receipt for the supervised process seam."""
+
+    def __init__(self, delegate: TerminalReconciliationPort) -> None:
+        self._delegate = delegate
+        self.receipt = None
+
+    def reconcile_terminal(self, proposal: TerminalProposal):
+        receipt = self._delegate.reconcile_terminal(proposal)
+        self.receipt = receipt
+        return receipt
+
+
 def _handle_runtime_failure(
     *,
     exc: Exception,
@@ -553,12 +566,17 @@ def serve_once(
     terminal_port: TerminalReconciliationPort | None = None,
     kernel: KernelPort | None = None,
     internal_failure_hook: InternalFailureHook | None = None,
+    emit_terminal_receipt: bool = False,
 ) -> int:
     """Read one serialized invocation and write event/exit JSON lines."""
 
     run: RunSnapshot | None = None
     invocation: InvocationEnvelope | None = None
     collector: EventCollector | None = None
+    receipt_capture = (
+        _CapturingTerminalPort(terminal_port) if emit_terminal_receipt and terminal_port is not None else None
+    )
+    execution_terminal_port = receipt_capture or terminal_port
     try:
         if "\n" in request_line:
             if not request_line.endswith("\n") or request_line.count("\n") != 1:
@@ -641,7 +659,7 @@ def serve_once(
             lease_binding=lease_binding,
             checkpoint_authority=checkpoint_authority,
             checkpoint_attestation=checkpoint_attestation,
-            terminal_port=terminal_port,
+            terminal_port=execution_terminal_port,
             execution_phase=phase,
             _terminal_rejection_sink=terminal_rejections.append,
         )
@@ -658,6 +676,15 @@ def serve_once(
                 output=output,
                 internal_failure_hook=internal_failure_hook,
             )
+        if receipt_capture is not None and receipt_capture.receipt is not None:
+            output.write(
+                json.dumps(
+                    {"type": "reconciliation", "receipt": receipt_capture.receipt.to_dict()},
+                    sort_keys=True,
+                )
+                + "\n"
+            )
+            output.flush()
         output.write(json.dumps({"type": "exit", "exit": exit_value.to_dict()}, sort_keys=True) + "\n")
         output.flush()
         return 0
@@ -702,7 +729,7 @@ def serve_once(
             run=run,
             invocation=invocation,
             collector=collector,
-            terminal_port=terminal_port,
+            terminal_port=execution_terminal_port,
             output=output,
             internal_failure_hook=internal_failure_hook,
         )
@@ -712,7 +739,7 @@ def serve_once(
             run=run,
             invocation=invocation,
             collector=collector,
-            terminal_port=terminal_port,
+            terminal_port=execution_terminal_port,
             output=output,
             internal_failure_hook=internal_failure_hook,
         )
@@ -754,6 +781,7 @@ def main(argv: list[str] | None = None) -> int:
             checkpoint_authority=checkpoint_authority,
             checkpoint_attestation=checkpoint_attestation,
             terminal_port=_DemoTerminalPort(),
+            emit_terminal_receipt=True,
         )
     except Exception:
         return 2
