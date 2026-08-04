@@ -55,14 +55,20 @@ receipt also carries exact kind-specific product receipts with the same
 binding. Cancellation uses a dedicated `CancellationAuthorityReceipt`; its
 resource, principal, snapshot, idempotency, gateway, and audit fields are
 serialized losslessly and validated before the terminal slot is reconciled.
+The proposal-only child path never receives this authority and emits a
+cancelled proposal without a cancellation receipt; the trusted host or
+supervisor must synthesize the receipt from host-owned cancellation state.
 
 `adapter.py` exposes the narrow `KernelPort` seam. `FakeKernel` is a
 deterministic implementation for contract tests; a real Hermes implementation
 can be added behind the same seam without changing Hermes core modules.
 `service.py` provides a deliberately minimal one-invocation JSON-lines host,
-with a finite composite request bound and a bounded byte/frame reader, and
-accepts an injected cancellation signal plus an independent canonical
-cancellation authority. The signal is never treated as authority.
+with a finite composite request bound and a bounded byte/frame reader. Its
+proposal-only child entrypoint accepts only an invocation-scoped cancellation
+signal; the signal is an observation and is never treated as authority. The
+trusted `serve_once` convenience path may additionally receive an independent
+canonical cancellation authority and is the only service path that can emit a
+host-authorized cancellation receipt.
 Unexpected internal exceptions are retained only by the protected failure hook
 and become a bounded generic failed proposal; if that proposal is not
 accepted, the service returns status 1 so a trusted supervisor can reconcile
@@ -91,10 +97,14 @@ derived only from the accepted host receipt.
 The fixed child command uses `docker create`, `start`, and `attach` with
 module-private network, namespace, privilege, mount, environment, logging,
 storage, and cleanup controls. `SubprocessDockerRunner` performs bounded
-daemon, image, and post-launch inspections and rejects ambiguity; injected
-test runners carry an explicit test trust classification and cannot produce a
-`production_completed` result. Cleanup proves deterministic container absence
-after stop/kill/remove-volume attempts.
+daemon, image, and post-launch inspections and rejects ambiguity. Caller-owned
+runners are explicit test seams and cannot produce a `production_completed`
+result; the only production path is an internal closed runner whose concrete
+Docker evidence is inspected before launch. The attach client is terminated,
+killed if necessary, and reaped on every collector exit before container
+cleanup. Results are retained under a fixed bound, with overflow returned as
+supervisor action required without inserting past the cap. Cleanup proves
+deterministic container absence after stop/kill/remove-volume attempts.
 
 The package does not claim a real Hermes `KernelPort`, provider credentials,
 Operation Gateway, deployment, checkpoint service, or generated TypeScript

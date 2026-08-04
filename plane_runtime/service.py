@@ -581,7 +581,6 @@ def serve_once_proposal_only(
     checkpoint_authority: CheckpointAuthority | None = None,
     checkpoint_attestation: CheckpointAttestation | None = None,
     cancellation: CancellationSignal | None = None,
-    cancellation_authority: CancellationAuthority | None = None,
     kernel: KernelPort | None,
     internal_failure_hook: InternalFailureHook | None = None,
 ) -> int:
@@ -635,7 +634,6 @@ def serve_once_proposal_only(
             invocation=invocation,
             emit=emit,
             cancellation=cancellation,
-            cancellation_authority=cancellation_authority,
             kernel=kernel,
             lease_authority=lease_authority,
             lease_binding=lease_binding,

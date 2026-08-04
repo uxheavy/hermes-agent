@@ -1757,16 +1757,20 @@ class TerminalProposal:
                 raise ContractError("waiting terminal proposal evicted mandatory input evidence")
         elif self.kind == "cancelled":
             if self.cancellation_receipt is None:
-                raise ContractError("cancelled terminal proposal requires cancellation authority evidence")
+                if self.source != "runtime":
+                    raise ContractError(
+                        "cancelled terminal proposal requires host cancellation authority evidence"
+                    )
             if self.outcome_proposal is not None or self.input_request_proposal is not None:
                 raise ContractError("cancelled terminal proposal has wrong-kind evidence")
-            if (
-                self.cancellation_receipt.run_id != self.run_id
-                or self.cancellation_receipt.invocation_id != self.invocation_id
-            ):
-                raise BindingError("cancellation evidence is bound to a different invocation")
-            if self.cancellation_receipt.receipt_ref not in receipt_refs:
-                raise ContractError("cancelled terminal proposal evicted mandatory cancellation evidence")
+            if self.cancellation_receipt is not None:
+                if (
+                    self.cancellation_receipt.run_id != self.run_id
+                    or self.cancellation_receipt.invocation_id != self.invocation_id
+                ):
+                    raise BindingError("cancellation evidence is bound to a different invocation")
+                if self.cancellation_receipt.receipt_ref not in receipt_refs:
+                    raise ContractError("cancelled terminal proposal evicted mandatory cancellation evidence")
         elif self.outcome_proposal is not None or self.input_request_proposal is not None or self.cancellation_receipt is not None:
             raise ContractError(f"{self.kind} terminal proposal has wrong-kind evidence")
         if self.source not in {"runtime", "supervisor"}:

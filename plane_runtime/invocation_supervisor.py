@@ -29,9 +29,12 @@ from typing import Callable, Mapping, Protocol, Sequence
 from .adapter import (
     CanonicalLeaseAuthority,
     CanonicalLeaseBinding,
+    CancellationAuthority,
+    ChildCancellationProposalRejected,
     CancellationSignal,
     EventCollector,
     TerminalReconciliationPort,
+    build_host_cancellation_proposal,
     classify_process_death,
     reconcile_process_death,
     reconcile_terminal_proposal,
@@ -105,6 +108,8 @@ _SAFE_DEATH_REASONS = frozenset(
 )
 _MAX_RETAINED_INVOCATIONS = 1024
 _MAX_DOCKER_INSPECTION_BYTES = 128 * 1024
+_ATTACH_TERMINATE_TIMEOUT_SECONDS = 0.5
+_ATTACH_KILL_TIMEOUT_SECONDS = 0.5
 _POLICY_FINGERPRINTS: dict[int, tuple[object, ...]] = {}
 
 
@@ -358,6 +363,7 @@ class ProcessCapture:
     timed_out: bool = False
     cancelled: bool = False
     output_exceeded: bool = False
+    reaped: bool = True
 
 
 class InvocationProcess(Protocol):
@@ -647,14 +653,25 @@ def _parse_child_output(
         elif kind == "proposal":
             if proposal is not None:
                 raise ContractError("child emitted duplicate terminal proposals")
-            proposal = TerminalProposal.from_dict(frame.get("proposal"))
-            validate_terminal_proposal(
-                run=run,
-                invocation=invocation,
-                kind=proposal.kind,
-                proposal=proposal,
-                stream=collector,
-            )
+            raw_proposal = frame.get("proposal")
+            raw_kind = raw_proposal.get("kind") if isinstance(raw_proposal, dict) else None
+            try:
+                proposal = TerminalProposal.from_dict(raw_proposal)
+                validate_terminal_proposal(
+                    run=run,
+                    invocation=invocation,
+                    kind=proposal.kind,
+                    proposal=proposal,
+                    stream=collector,
+                )
+            except ChildCancellationProposalRejected:
+                raise
+            except Exception as exc:
+                if raw_kind == "cancelled":
+                    raise ChildCancellationProposalRejected(
+                        "child cancellation proposal failed host-only validation"
+                    ) from exc
+                raise
         elif kind == "exit":
             if proposal is None:
                 raise ContractError("child emitted exit before its terminal proposal")
@@ -678,6 +695,41 @@ class _SubprocessDockerProcess:
     def __init__(self, process: subprocess.Popen[bytes]) -> None:
         self._process = process
 
+    def _close_streams(self) -> None:
+        for stream in (self._process.stdin, self._process.stdout, self._process.stderr):
+            if stream is not None:
+                try:
+                    stream.close()
+                except OSError:
+                    pass
+
+    def _terminate_and_reap(self) -> bool:
+        """End the attach client and reap it under fixed, bounded deadlines."""
+
+        if self._process.poll() is None:
+            try:
+                self._process.terminate()
+            except OSError:
+                pass
+            try:
+                self._process.wait(timeout=_ATTACH_TERMINATE_TIMEOUT_SECONDS)
+            except (OSError, subprocess.TimeoutExpired):
+                if self._process.poll() is None:
+                    try:
+                        self._process.kill()
+                    except OSError:
+                        pass
+                    try:
+                        self._process.wait(timeout=_ATTACH_KILL_TIMEOUT_SECONDS)
+                    except (OSError, subprocess.TimeoutExpired):
+                        pass
+        else:
+            try:
+                self._process.wait(timeout=_ATTACH_KILL_TIMEOUT_SECONDS)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        return self._process.poll() is not None
+
     def collect(
         self,
         *,
@@ -691,6 +743,13 @@ class _SubprocessDockerProcess:
         stdout = bytearray()
         stderr = bytearray()
         pending = memoryview(input_bytes)
+        capture: ProcessCapture | None = None
+
+        def finish(**kwargs: object) -> ProcessCapture:
+            nonlocal capture
+            capture = ProcessCapture(**kwargs)  # type: ignore[arg-type]
+            return capture
+
         try:
             if self._process.stdin is not None:
                 selector.register(self._process.stdin, selectors.EVENT_WRITE, "stdin")
@@ -704,10 +763,20 @@ class _SubprocessDockerProcess:
                 except Exception:
                     cancelled = True
                 if cancelled:
-                    return ProcessCapture(self._process.poll(), bytes(stdout), bytes(stderr), cancelled=True)
+                    return finish(
+                        returncode=self._process.poll(),
+                        stdout=bytes(stdout),
+                        stderr=bytes(stderr),
+                        cancelled=True,
+                    )
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    return ProcessCapture(self._process.poll(), bytes(stdout), bytes(stderr), timed_out=True)
+                    return finish(
+                        returncode=self._process.poll(),
+                        stdout=bytes(stdout),
+                        stderr=bytes(stderr),
+                        timed_out=True,
+                    )
                 for key, mask in selector.select(min(remaining, 0.1)):
                     if key.data == "stdin" and mask & selectors.EVENT_WRITE:
                         if not pending:
@@ -736,8 +805,11 @@ class _SubprocessDockerProcess:
                         target = stdout if key.data == "stdout" else stderr
                         limit = stdout_limit_bytes if key.data == "stdout" else stderr_limit_bytes
                         if len(target) + len(chunk) > limit:
-                            return ProcessCapture(
-                                self._process.poll(), bytes(stdout), bytes(stderr), output_exceeded=True
+                            return finish(
+                                returncode=self._process.poll(),
+                                stdout=bytes(stdout),
+                                stderr=bytes(stderr),
+                                output_exceeded=True,
                             )
                         target.extend(chunk)
                 if self._process.poll() is not None and "stdin" in {
@@ -746,15 +818,17 @@ class _SubprocessDockerProcess:
                     key = next(item for item in selector.get_map().values() if item.data == "stdin")
                     selector.unregister(key.fileobj)
                     key.fileobj.close()
-            return ProcessCapture(self._process.poll(), bytes(stdout), bytes(stderr))
+            return finish(
+                returncode=self._process.poll(),
+                stdout=bytes(stdout),
+                stderr=bytes(stderr),
+            )
         finally:
             selector.close()
-            for stream in (self._process.stdin, self._process.stdout, self._process.stderr):
-                if stream is not None:
-                    try:
-                        stream.close()
-                    except OSError:
-                        pass
+            self._close_streams()
+            reaped = self._terminate_and_reap()
+            if capture is not None:
+                object.__setattr__(capture, "reaped", reaped)
 
 
 def _json_object(raw: bytes, label: str) -> dict[str, object]:
@@ -1212,6 +1286,63 @@ class SubprocessDockerRunner:
             raise RuntimeConfigurationError("Docker cleanup command failed")
 
 
+class _ClosedProductionRunner:
+    """The only runner path that may produce a production attestation.
+
+    The supervisor never accepts this object from a caller.  Its entrypoints
+    are captured from the concrete Docker adapter at module construction time,
+    and the adapter itself must obtain the attestation from bounded Docker
+    daemon/image inspection before it can create or attach to a container.
+    Caller-owned runners therefore remain test seams even when they imitate
+    the concrete adapter or return a production-shaped value.
+    """
+
+    _ATTEST = SubprocessDockerRunner.attest_invocation
+    _LAUNCH = SubprocessDockerRunner.launch
+    _CLEANUP = SubprocessDockerRunner.cleanup
+
+    def __init__(self) -> None:
+        self._implementation = SubprocessDockerRunner()
+
+    def attest_invocation(
+        self,
+        argv: Sequence[str],
+        *,
+        client_env: Mapping[str, str],
+    ) -> EnforcementAttestation:
+        return self._ATTEST(self._implementation, argv, client_env=client_env)
+
+    def launch(
+        self,
+        argv: Sequence[str],
+        *,
+        client_env: Mapping[str, str],
+        input_bytes: bytes,
+    ) -> InvocationProcess:
+        return self._LAUNCH(
+            self._implementation,
+            argv,
+            client_env=client_env,
+            input_bytes=input_bytes,
+        )
+
+    def cleanup(
+        self,
+        container_name: str,
+        *,
+        stop_timeout_seconds: float,
+        kill_timeout_seconds: float,
+        remove_timeout_seconds: float,
+    ) -> CleanupReport:
+        return self._CLEANUP(
+            self._implementation,
+            container_name,
+            stop_timeout_seconds=stop_timeout_seconds,
+            kill_timeout_seconds=kill_timeout_seconds,
+            remove_timeout_seconds=remove_timeout_seconds,
+        )
+
+
 class InvocationSupervisor:
     """Run, bound, reconcile, and dispose of exactly one invocation."""
 
@@ -1219,10 +1350,11 @@ class InvocationSupervisor:
         self,
         *,
         policy: InvocationPolicy,
-        runner: DockerRunner,
+        runner: DockerRunner | None = None,
         terminal_port: TerminalReconciliationPort,
         lease_authority: CanonicalLeaseAuthority,
         lease_binding: CanonicalLeaseBinding,
+        cancellation_authority: CancellationAuthority | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         _validate_policy(policy)
@@ -1232,9 +1364,12 @@ class InvocationSupervisor:
             raise RuntimeConfigurationError("invocation supervisor requires host lease authority")
         self.policy = policy
         self.runner = runner
+        self._runner_is_injected = runner is not None
+        self._production_runner = _ClosedProductionRunner() if runner is None else None
         self.terminal_port = terminal_port
         self.lease_authority = lease_authority
         self.lease_binding = lease_binding
+        self.cancellation_authority = cancellation_authority
         self._lease_fingerprint = (
             lease_binding.run_id,
             lease_binding.invocation_id,
@@ -1249,7 +1384,8 @@ class InvocationSupervisor:
         self._death_receipts: dict[tuple[str, str], TerminalReconciliationReceipt | None] = {}
 
     def _attest(self, argv: Sequence[str]) -> EnforcementAttestation:
-        attest = getattr(self.runner, "attest_invocation", None)
+        runner = self.runner if self._runner_is_injected else self._production_runner
+        attest = getattr(runner, "attest_invocation", None)
         if not callable(attest):
             raise RuntimeConfigurationError("runner has no evidence-based enforcement attestation")
         result = attest(argv, client_env=dict(_DOCKER_CLIENT_ENV))
@@ -1258,9 +1394,29 @@ class InvocationSupervisor:
         expected_name = self._container_name_from_argv(argv)
         if result.argv_digest != _argv_digest(argv) or result.container_name != expected_name:
             raise BindingError("runner enforcement attestation is not bound to exact argv")
-        if result.is_production and type(self.runner) is not SubprocessDockerRunner:
-            raise RuntimeConfigurationError("only the inspected subprocess Docker runner may attest production enforcement")
+        if self._runner_is_injected:
+            if result.is_production:
+                raise RuntimeConfigurationError(
+                    "caller-supplied runners are test-classified and cannot attest production enforcement"
+                )
+        else:
+            required_evidence = {
+                "daemon_inspected",
+                "image_digest_inspected",
+                "image_config_inspected",
+                "fixed_argv",
+            }
+            if not result.is_production or not required_evidence.issubset(result.evidence):
+                raise RuntimeConfigurationError(
+                    "closed production runner did not prove concrete Docker enforcement"
+                )
         return result
+
+    def _active_runner(self) -> DockerRunner:
+        runner = self.runner if self._runner_is_injected else self._production_runner
+        if runner is None:  # pragma: no cover - constructor establishes this invariant
+            raise RuntimeConfigurationError("invocation runner is not configured")
+        return runner
 
     @staticmethod
     def _container_name_from_argv(argv: Sequence[str]) -> str:
@@ -1274,7 +1430,7 @@ class InvocationSupervisor:
 
     def _cleanup(self, name: str) -> CleanupReport:
         _validate_policy(self.policy)
-        cleanup = getattr(self.runner, "cleanup", None)
+        cleanup = getattr(self._active_runner(), "cleanup", None)
         if not callable(cleanup):
             return CleanupReport(name, False, False, False, ("cleanup_not_supported",), False)
         try:
@@ -1289,6 +1445,78 @@ class InvocationSupervisor:
         if not isinstance(report, CleanupReport) or report.container_name != name:
             return CleanupReport(name, False, False, False, ("invalid_cleanup_report",), False)
         return report
+
+    def _result_for_host_cancellation(
+        self,
+        run: RunSnapshot,
+        invocation: InvocationEnvelope,
+        *,
+        name: str,
+        final_sequence: int,
+        cleanup: CleanupReport | None,
+        enforcement: EnforcementAttestation | None,
+        evidence: tuple[str, ...],
+    ) -> InvocationResult:
+        """Reconcile cancellation from host state, never child evidence."""
+
+        if self.cancellation_authority is None:
+            return InvocationResult(
+                status="supervisor_action_required",
+                container_name=name,
+                exit=RuntimeExit("cancelled", final_sequence),
+                cleanup=cleanup,
+                enforcement=enforcement,
+                evidence=tuple(dict.fromkeys((*evidence, "cancellation_authority_missing", "supervisor_action_required"))),
+            )
+        try:
+            proposal = build_host_cancellation_proposal(
+                run=run,
+                invocation=invocation,
+                cancellation_authority=self.cancellation_authority,
+                final_sequence=final_sequence,
+            )
+            receipt = reconcile_terminal_proposal(port=self.terminal_port, proposal=proposal)
+        except Exception:
+            return InvocationResult(
+                status="supervisor_action_required",
+                container_name=name,
+                exit=RuntimeExit("cancelled", final_sequence),
+                cleanup=cleanup,
+                enforcement=enforcement,
+                evidence=tuple(dict.fromkeys((*evidence, "host_cancellation_reconciliation_failed", "supervisor_action_required"))),
+            )
+        if not receipt.accepted or not receipt.legal_transition:
+            return InvocationResult(
+                status="supervisor_action_required",
+                container_name=name,
+                exit=RuntimeExit("cancelled", final_sequence),
+                proposal=proposal,
+                receipt=receipt,
+                cleanup=cleanup,
+                enforcement=enforcement,
+                evidence=tuple(dict.fromkeys((*evidence, "host_cancellation_rejected", "supervisor_action_required"))),
+            )
+        if cleanup is not None and not cleanup.succeeded:
+            return InvocationResult(
+                status="supervisor_action_required",
+                container_name=name,
+                exit=RuntimeExit("cancelled", final_sequence),
+                proposal=proposal,
+                receipt=receipt,
+                cleanup=cleanup,
+                enforcement=enforcement,
+                evidence=tuple(dict.fromkeys((*evidence, "host_cancellation", "cleanup_failed", "supervisor_action_required"))),
+            )
+        return InvocationResult(
+            status="cancelled",
+            container_name=name,
+            exit=RuntimeExit("cancelled", final_sequence),
+            proposal=proposal,
+            receipt=receipt,
+            cleanup=cleanup,
+            enforcement=enforcement,
+            evidence=tuple(dict.fromkeys((*evidence, "host_cancellation", "host_reconciliation"))),
+        )
 
     def _validate_host_lease(self, run: RunSnapshot, invocation: InvocationEnvelope) -> None:
         binding = self.lease_binding
@@ -1379,6 +1607,16 @@ class InvocationSupervisor:
         cleanup: CleanupReport,
         enforcement: EnforcementAttestation,
     ) -> InvocationResult:
+        if parsed.proposal.kind == "cancelled":
+            return InvocationResult(
+                status="rejected",
+                container_name=name,
+                exit=parsed.exit,
+                proposal=parsed.proposal,
+                cleanup=cleanup,
+                enforcement=enforcement,
+                evidence=("child_cancellation_untrusted", "supervisor_action_required"),
+            )
         try:
             receipt = reconcile_terminal_proposal(port=self.terminal_port, proposal=parsed.proposal)
         except Exception:
@@ -1442,9 +1680,11 @@ class InvocationSupervisor:
             if prior is not None:
                 return prior
             if len(self._results) >= _MAX_RETAINED_INVOCATIONS:
-                result = InvocationResult("supervisor_action_required", name, evidence=("supervisor_action_required",))
-                self._results[key] = result
-                return result
+                return InvocationResult(
+                    "supervisor_action_required",
+                    name,
+                    evidence=("result_not_retained", "supervisor_action_required"),
+                )
             try:
                 self._validate_host_lease(run, invocation)
             except (BindingError, ContractError, RuntimeConfigurationError):
@@ -1454,11 +1694,14 @@ class InvocationSupervisor:
             signal = cancellation or _NeverCancelled()
             cancelled, signal_error = _safe_cancel_check(signal)
             if cancelled:
-                result = InvocationResult(
-                    "supervisor_action_required",
-                    name,
-                    evidence=(("cancellation_signal_unavailable",) if signal_error else ("cancellation_signal",))
-                    + ("supervisor_action_required",),
+                result = self._result_for_host_cancellation(
+                    run,
+                    invocation,
+                    name=name,
+                    final_sequence=0,
+                    cleanup=None,
+                    enforcement=None,
+                    evidence=("cancellation_signal_unavailable",) if signal_error else ("cancellation_signal",),
                 )
                 self._results[key] = result
                 return result
@@ -1471,7 +1714,7 @@ class InvocationSupervisor:
                 self._results[key] = result
                 return result
             try:
-                process = self.runner.launch(
+                process = self._active_runner().launch(
                     argv,
                     client_env=dict(_DOCKER_CLIENT_ENV),
                     input_bytes=request,
@@ -1502,13 +1745,36 @@ class InvocationSupervisor:
                     is_cancelled=lambda: _safe_cancel_check(signal)[0],
                 )
             except Exception:
-                capture = ProcessCapture(None)
+                capture = ProcessCapture(None, reaped=False)
                 collection_failed = True
             cleanup = self._cleanup(name)
             final_sequence = 0
+            post_cancelled, post_cancel_error = _safe_cancel_check(signal)
+            # The collector's ``cancelled`` bit is process evidence and cannot
+            # authorize a visible terminal transition.  Only the host-owned
+            # signal, rechecked after collection, can select cancellation.
+            active_cancellation = not collection_failed and post_cancelled and not post_cancel_error
+            if active_cancellation and self.cancellation_authority is not None:
+                result = self._result_for_host_cancellation(
+                    run,
+                    invocation,
+                    name=name,
+                    final_sequence=0,
+                    cleanup=cleanup,
+                    enforcement=enforcement,
+                    evidence=("cancellation_signal",),
+                )
+                self._results[key] = result
+                return result
             if collection_failed:
                 reason = "runtime output was malformed or lacked terminal evidence"
                 evidence = ("collection_failed",)
+            elif active_cancellation:
+                reason = "runtime invocation was stopped by a cancellation signal"
+                evidence = ("cancellation_signal", "cancellation_authority_missing")
+            elif not capture.reaped:
+                reason = "runtime output was malformed or lacked terminal evidence"
+                evidence = ("attach_process_not_reaped", "supervisor_action_required")
             elif capture.output_exceeded or len(capture.stdout) > int(self.policy.stdout_limit_bytes) or len(capture.stderr) > int(self.policy.stderr_limit_bytes):
                 reason = "runtime output exceeded supervisor bounds"
                 evidence = ("output_limit_exceeded",)
@@ -1524,6 +1790,16 @@ class InvocationSupervisor:
             else:
                 try:
                     parsed = _parse_child_output(capture.stdout, run=run, invocation=invocation, policy=self.policy)
+                except ChildCancellationProposalRejected:
+                    result = InvocationResult(
+                        status="rejected",
+                        container_name=name,
+                        cleanup=cleanup,
+                        enforcement=enforcement,
+                        evidence=("child_cancellation_untrusted", "supervisor_action_required"),
+                    )
+                    self._results[key] = result
+                    return result
                 except Exception:
                     reason = "runtime output was malformed or lacked terminal evidence"
                     evidence = ("invalid_child_output",)

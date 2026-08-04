@@ -67,7 +67,6 @@ from .contract import InvocationEnvelope, PROTOCOL
 
 EventSink = Callable[[RuntimeEvent], None]
 TerminalProposalSink = Callable[[TerminalProposal], None]
-TerminalProposalSink = Callable[[TerminalProposal], None]
 
 
 class CancellationSignal(Protocol):
@@ -97,6 +96,104 @@ class CancellationAuthority(Protocol):
         invocation: InvocationEnvelope,
     ) -> CancellationAuthorityReceipt:
         ...
+
+
+@dataclass(frozen=True)
+class CanonicalCancellationBinding:
+    """Immutable host cancellation state bound to the complete invocation lease."""
+
+    run_id: str
+    invocation_id: str
+    actor_ref: str
+    workspace_ref: str
+    snapshot_digest: str
+    lease_id: str
+    lease_holder_ref: str
+    lease_expires_at: str
+    cancellation_ref: str
+    idempotency_key: str
+    gateway_receipt_ref: str
+    audit_ref: str
+    receipt_ref: str
+    active: bool = True
+
+    def __post_init__(self) -> None:
+        RuntimeLease(self.lease_id, self.lease_holder_ref, self.lease_expires_at)
+        CancellationAuthorityReceipt(
+            resource_ref=self.cancellation_ref,
+            receipt_ref=self.receipt_ref,
+            run_id=self.run_id,
+            invocation_id=self.invocation_id,
+            actor_ref=self.actor_ref,
+            workspace_ref=self.workspace_ref,
+            snapshot_digest=self.snapshot_digest,
+            idempotency_key=self.idempotency_key,
+            gateway_receipt_ref=self.gateway_receipt_ref,
+            audit_ref=self.audit_ref,
+        )
+        if not isinstance(self.active, bool):
+            raise ContractError("cancellation binding active must be a boolean")
+
+    def matches(self, run: RunSnapshot, invocation: InvocationEnvelope) -> bool:
+        lease = invocation.lease
+        return (
+            self.run_id == run.run_id
+            and self.invocation_id == invocation.invocation_id
+            and self.actor_ref == run.actor_ref
+            and self.workspace_ref == run.workspace_ref
+            and self.snapshot_digest == run.digest()
+            and self.lease_id == lease.lease_id
+            and self.lease_holder_ref == lease.holder_ref
+            and self.lease_expires_at == lease.expires_at
+            and self.cancellation_ref == invocation.cancellation_ref
+            and self.idempotency_key == f"cancel:{run.run_id}:{invocation.invocation_id}"
+            and self.gateway_receipt_ref == f"gateway:{self.idempotency_key}"
+            and self.audit_ref == f"audit:{self.idempotency_key}"
+            and self.receipt_ref == f"cancel-receipt:{invocation.invocation_id}"
+        )
+
+    def receipt(self) -> CancellationAuthorityReceipt:
+        return CancellationAuthorityReceipt(
+            resource_ref=self.cancellation_ref,
+            receipt_ref=self.receipt_ref,
+            run_id=self.run_id,
+            invocation_id=self.invocation_id,
+            actor_ref=self.actor_ref,
+            workspace_ref=self.workspace_ref,
+            snapshot_digest=self.snapshot_digest,
+            idempotency_key=self.idempotency_key,
+            gateway_receipt_ref=self.gateway_receipt_ref,
+            audit_ref=self.audit_ref,
+        )
+
+
+class CanonicalCancellationAuthority:
+    """Trusted host port for exact, idempotent cancellation authority state."""
+
+    def __init__(self, bindings: Iterable[CanonicalCancellationBinding]) -> None:
+        self._lock = RLock()
+        self._bindings: dict[tuple[str, str], CanonicalCancellationBinding] = {}
+        for binding in bindings:
+            key = (binding.run_id, binding.invocation_id)
+            if key in self._bindings:
+                raise ContractError("duplicate canonical cancellation binding")
+            self._bindings[key] = binding
+
+    def validate_cancellation(
+        self,
+        *,
+        run: RunSnapshot,
+        invocation: InvocationEnvelope,
+    ) -> CancellationAuthorityReceipt:
+        with self._lock:
+            binding = self._bindings.get((run.run_id, invocation.invocation_id))
+            if binding is None:
+                raise BindingError("no canonical cancellation binding exists for this invocation")
+            if not binding.active:
+                raise BindingError("canonical cancellation authority is inactive")
+            if not binding.matches(run, invocation):
+                raise BindingError("canonical cancellation binding does not match the invocation")
+            return binding.receipt()
 
 
 @dataclass(frozen=True)
@@ -301,6 +398,10 @@ class TerminalReconciliationRejected(Exception):
             raise ValueError("terminal rejection receipt must be proofless")
         self.receipt = receipt
         super().__init__("Plane legally rejected the terminal reconciliation proposal")
+
+
+class ChildCancellationProposalRejected(BindingError):
+    """A child tried to provide authority for a host-owned cancellation."""
 
 
 _TerminalRejectionSink = Callable[[TerminalReconciliationRejected], None]
@@ -795,6 +896,10 @@ def _reconcile_terminal(
 ) -> TerminalReconciliationReceipt:
     if port is None:
         raise ContractError("execution requires an injected terminal reconciliation port")
+    if proposal.kind == "cancelled" and proposal.cancellation_receipt is None:
+        raise TerminalReconciliationError(
+            message="host cancellation authority is required before terminal reconciliation",
+        )
     try:
         receipt = port.reconcile_terminal(proposal)
     except Exception as exc:
@@ -952,6 +1057,7 @@ def _validate_terminal_evidence(
     proposal: TerminalProposal,
     stream: EventStream,
     cancellation_receipt: CancellationAuthorityReceipt | None,
+    allow_untrusted_cancellation: bool = False,
 ) -> None:
     if (
         proposal.run_id != run.run_id
@@ -1007,8 +1113,12 @@ def _validate_terminal_evidence(
             or input_event.body.receipt_ref != input_request.proposal_receipt_ref
         ):
             raise ContractError("waiting evidence was forged")
-    if kind == "cancelled" and cancellation_receipt is None:
-        raise ContractError("cancelled requires an authoritative cancellation correlation")
+    if kind == "cancelled":
+        if cancellation_receipt is None:
+            if not allow_untrusted_cancellation or proposal.cancellation_receipt is not None:
+                raise ContractError("cancelled requires host-owned cancellation state")
+        elif proposal.cancellation_receipt != cancellation_receipt:
+            raise BindingError("terminal cancellation authority does not match host state")
     for artifact in proposal.artifact_proposals:
         artifact_event = known_events.get(artifact.event_id)
         if artifact_event is None or not isinstance(artifact_event.body, ArtifactObserved):
@@ -1040,13 +1150,19 @@ def validate_terminal_proposal(
 ) -> None:
     """Validate a child proposal without giving it a reconciliation port."""
 
+    if proposal.kind == "cancelled" and proposal.cancellation_receipt is not None:
+        raise ChildCancellationProposalRejected(
+            "child cancellation proposals cannot carry cancellation authority"
+        )
+
     _validate_terminal_evidence(
         run=run,
         invocation=invocation,
         kind=kind,
         proposal=proposal,
         stream=stream,
-        cancellation_receipt=proposal.cancellation_receipt,
+        cancellation_receipt=None,
+        allow_untrusted_cancellation=proposal.kind == "cancelled",
     )
 
 
@@ -1082,6 +1198,9 @@ def _return_terminal(
         proposal=proposal,
         stream=stream,
         cancellation_receipt=cancellation_receipt,
+        allow_untrusted_cancellation=(
+            proposal_sink is not None and proposal.kind == "cancelled"
+        ),
     )
     if proposal_sink is not None:
         if port is not None:
@@ -1179,6 +1298,41 @@ def _cancellation_receipt(
     return receipt
 
 
+def build_host_cancellation_proposal(
+    *,
+    run: RunSnapshot,
+    invocation: InvocationEnvelope,
+    cancellation_authority: CancellationAuthority,
+    final_sequence: int = 0,
+) -> TerminalProposal:
+    """Synthesize a cancellation proposal only from trusted host state."""
+
+    if isinstance(final_sequence, bool) or not isinstance(final_sequence, int) or final_sequence < 0:
+        raise ContractError("host cancellation final sequence must be a non-negative integer")
+    receipt = _cancellation_receipt(
+        authority=cancellation_authority,
+        run=run,
+        invocation=invocation,
+    )
+    stream = EventStream(run_id=run.run_id, invocation_id=invocation.invocation_id)
+    proposal = _terminal_proposal(
+        run=run,
+        invocation=invocation,
+        exit_value=RuntimeExit(kind="cancelled", final_sequence=final_sequence),
+        stream=stream,
+        cancellation_receipt=receipt,
+    )
+    _validate_terminal_evidence(
+        run=run,
+        invocation=invocation,
+        kind="cancelled",
+        proposal=proposal,
+        stream=stream,
+        cancellation_receipt=receipt,
+    )
+    return proposal
+
+
 def execute(
     *,
     run: RunSnapshot,
@@ -1223,7 +1377,11 @@ def execute(
         )
     if terminal_port is not None and terminal_proposal_sink is not None:
         raise ContractError("execution cannot reconcile and emit a proposal in the same path")
-    if initially_cancelled and cancellation_authority is None:
+    if terminal_proposal_sink is not None and cancellation_authority is not None:
+        raise RuntimeConfigurationError(
+            "proposal-only execution cannot accept a cancellation authority"
+        )
+    if terminal_proposal_sink is None and initially_cancelled and cancellation_authority is None:
         raise RuntimeConfigurationError(
             "signalled cancellation requires an injected cancellation authority"
         )
@@ -1255,10 +1413,14 @@ def execute(
         expected_causation_ref=invocation.causation_ref,
     )
     if initially_cancelled:
-        cancellation_receipt = _cancellation_receipt(
-            authority=cancellation_authority,
-            run=run,
-            invocation=invocation,
+        cancellation_receipt = (
+            None
+            if terminal_proposal_sink is not None
+            else _cancellation_receipt(
+                authority=cancellation_authority,
+                run=run,
+                invocation=invocation,
+            )
         )
         return _return_terminal_safely(
             port=terminal_port,
@@ -1440,10 +1602,14 @@ def execute(
     try:
         result = kernel.dispatch(request, on_observation, cancellation)
     except CancellationRequested:
-        cancellation_receipt = _cancellation_receipt(
-            authority=cancellation_authority,
-            run=run,
-            invocation=invocation,
+        cancellation_receipt = (
+            None
+            if terminal_proposal_sink is not None
+            else _cancellation_receipt(
+                authority=cancellation_authority,
+                run=run,
+                invocation=invocation,
+            )
         )
         return _return_terminal_safely(
             port=terminal_port,
@@ -1479,10 +1645,14 @@ def execute(
             proposal_sink=terminal_proposal_sink,
         )
     if cancellation.is_cancelled():
-        cancellation_receipt = _cancellation_receipt(
-            authority=cancellation_authority,
-            run=run,
-            invocation=invocation,
+        cancellation_receipt = (
+            None
+            if terminal_proposal_sink is not None
+            else _cancellation_receipt(
+                authority=cancellation_authority,
+                run=run,
+                invocation=invocation,
+            )
         )
         return _return_terminal_safely(
             port=terminal_port,
@@ -1503,10 +1673,14 @@ def execute(
     if result.terminal_kind == "completed" and len(outcome_submissions) != 1:
         raise ContractError("completed requires exactly one untrusted outcome proposal")
     if result.terminal_kind == "cancelled":
-        cancellation_receipt = _cancellation_receipt(
-            authority=cancellation_authority,
-            run=run,
-            invocation=invocation,
+        cancellation_receipt = (
+            None
+            if terminal_proposal_sink is not None
+            else _cancellation_receipt(
+                authority=cancellation_authority,
+                run=run,
+                invocation=invocation,
+            )
         )
         return _return_terminal_safely(
             port=terminal_port,
@@ -1545,7 +1719,6 @@ def execute_proposal_only(
     invocation: InvocationEnvelope,
     emit: EventSink | None = None,
     cancellation: CancellationSignal | None = None,
-    cancellation_authority: CancellationAuthority | None = None,
     kernel: KernelPort,
     lease_authority: CanonicalLeaseAuthority,
     lease_binding: CanonicalLeaseBinding,
@@ -1570,7 +1743,6 @@ def execute_proposal_only(
         invocation=invocation,
         emit=emit,
         cancellation=cancellation,
-        cancellation_authority=cancellation_authority,
         kernel=kernel,
         lease_authority=lease_authority,
         lease_binding=lease_binding,
