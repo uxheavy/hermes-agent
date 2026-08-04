@@ -3,17 +3,19 @@
 from __future__ import annotations
 
 import copy
-import importlib
+import fcntl
 import json
+import os
 import selectors
 import subprocess
 import sys
+import tempfile
+import threading
 import unittest
 from dataclasses import replace
 from datetime import datetime, timezone
 from io import StringIO
 from pathlib import Path
-from types import ModuleType
 
 from plane_runtime import (
     MAX_ACCEPTANCE_CRITERIA,
@@ -27,11 +29,15 @@ from plane_runtime import (
     AssignmentSnapshot,
     BindingError,
     BoundsError,
+    CanonicalLeaseBinding,
+    CheckpointAttestation,
     ContractDigests,
     ContractError,
     EventCollector,
     FakeKernel,
     FakeKernelPlan,
+    FixtureCanonicalLeaseAuthority,
+    FixtureCheckpointAuthority,
     InvocationEnvelope,
     InvocationTrigger,
     LeaseError,
@@ -50,15 +56,16 @@ from plane_runtime import (
     RuntimeModelRoute,
     RunSnapshot,
     SequenceError,
-    SupervisorReconciler,
+    TerminalProposal,
+    TerminalReconciliationReceipt,
     ToolPresentation,
     TranscriptObserved,
-    TrustedRuntimeSupervisor,
     UsageObserved,
     VersionedContextRef,
     classify_process_death,
     execute,
     parse_utc_timestamp,
+    reconcile_process_death,
 )
 from plane_runtime.adapter import KernelObservation, KernelRequest, KernelResult
 from plane_runtime.service import serve_once
@@ -137,9 +144,41 @@ def event(
 
 
 def run_execute(*, snapshot: RunSnapshot, invocation: InvocationEnvelope, **kwargs) -> RuntimeExit:
-    kwargs.setdefault("clock", lambda: TRUSTED_NOW)
+    binding = kwargs.pop(
+        "lease_binding",
+        CanonicalLeaseBinding(
+            run_id=snapshot.run_id,
+            invocation_id=invocation.invocation_id,
+            lease_id="lease:one",
+            holder_ref="host:one",
+            active=True,
+            expires_at=invocation.lease.expires_at,
+        ),
+    )
+    kwargs.setdefault(
+        "lease_authority",
+        FixtureCanonicalLeaseAuthority([binding], clock=lambda: TRUSTED_NOW),
+    )
+    if invocation.checkpoint_ref is not None:
+        attestation = kwargs.pop(
+            "checkpoint_attestation",
+            CheckpointAttestation(
+                checkpoint_ref=invocation.checkpoint_ref,
+                source_run_id=snapshot.run_id,
+                source_invocation_id="invocation:one",
+                snapshot_digest=snapshot.digest(),
+                actor_ref=snapshot.actor_ref,
+                profile_version=snapshot.profile_version,
+                continuation_event_ref=invocation.trigger.event_ref or "event:unknown",
+                continuation_trigger_kind=invocation.trigger.kind,
+                allowed_target_invocation_id=invocation.invocation_id,
+            ),
+        )
+        kwargs.setdefault("checkpoint_attestation", attestation)
+        kwargs.setdefault("checkpoint_authority", FixtureCheckpointAuthority([attestation]))
     kwargs.setdefault("host", RecordingHost())
-    return execute(run=snapshot, invocation=invocation, **kwargs)
+    kwargs.setdefault("terminal_port", SharedTerminalPort())
+    return execute(run=snapshot, invocation=invocation, lease_binding=binding, **kwargs)
 
 
 def invoke_service(request: dict[str, object]) -> list[dict[str, object]]:
@@ -167,6 +206,12 @@ class ArtifactKernel:
         return KernelResult("completed")
 
 
+class ExplodingKernel:
+    def dispatch(self, request: KernelRequest, emit, cancellation) -> KernelResult:
+        del request, emit, cancellation
+        raise RuntimeError("provider secret must stay internal")
+
+
 class BadInputReceiptHost(RecordingHost):
     def request_input(self, **kwargs) -> ProductReceipt:
         receipt = super().request_input(**kwargs)
@@ -177,6 +222,74 @@ class BadPublicationReceiptHost(RecordingHost):
     def publish_transcript(self, **kwargs) -> PublicationReceipt:
         receipt = super().publish_transcript(**kwargs)
         return replace(receipt, invocation_id="invocation:forged")
+
+
+class SharedTerminalPort:
+    """Thread/process-safe durable-like fake for terminal reconciliation tests."""
+
+    def __init__(self, store=None, lock=None, accepted=None, path: Path | None = None) -> None:
+        self.store = store if store is not None else {}
+        self.lock = lock if lock is not None else threading.RLock()
+        self.accepted = accepted if accepted is not None else []
+        self.path = path
+
+    def reconcile_terminal(self, proposal: TerminalProposal) -> TerminalReconciliationReceipt:
+        key = proposal.idempotency_key
+        if self.path is not None:
+            return self._reconcile_file(proposal)
+        with self.lock:
+            prior = self.store.get(key)
+            if prior is not None:
+                prior_proposal, prior_receipt = prior
+                if prior_proposal != proposal:
+                    raise SequenceError("terminal idempotency key was reused with different content")
+                return prior_receipt
+            receipt = self._new_receipt(proposal)
+            if not receipt.accepted:
+                return receipt
+            self.store[key] = (proposal, receipt)
+            self.accepted.append(key)
+            return receipt
+
+    def _new_receipt(self, proposal: TerminalProposal) -> TerminalReconciliationReceipt:
+        accepted = not (
+            (proposal.kind == "completed" and not proposal.evidence_event_ids)
+            or (proposal.kind == "waiting_for_input" and not proposal.evidence_receipt_refs)
+        )
+        return TerminalReconciliationReceipt(
+            receipt_ref=f"{'receipt' if accepted else 'rejected'}:{proposal.idempotency_key}",
+            audit_ref=f"audit:{proposal.idempotency_key}",
+            run_id=proposal.run_id,
+            invocation_id=proposal.invocation_id,
+            kind=proposal.kind,
+            idempotency_key=proposal.idempotency_key,
+            accepted=accepted,
+            legal_transition=accepted,
+        )
+
+    def _reconcile_file(self, proposal: TerminalProposal) -> TerminalReconciliationReceipt:
+        assert self.path is not None
+        with self.path.open("a+", encoding="utf-8") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            handle.seek(0)
+            content = handle.read().strip()
+            state = json.loads(content) if content else {}
+            key = proposal.idempotency_key
+            prior = state.get(key)
+            if prior is not None:
+                if prior["proposal"] != repr(proposal):
+                    raise SequenceError("terminal idempotency key was reused with different content")
+                return TerminalReconciliationReceipt(**prior["receipt"])
+            receipt = self._new_receipt(proposal)
+            if receipt.accepted:
+                state[key] = {"proposal": repr(proposal), "receipt": receipt.__dict__}
+                handle.seek(0)
+                handle.truncate()
+                json.dump(state, handle, sort_keys=True)
+                handle.flush()
+                os.fsync(handle.fileno())
+                self.accepted.append(key)
+            return receipt
 
 
 class RuntimeContractTests(unittest.TestCase):
@@ -406,7 +519,7 @@ class RuntimeContractTests(unittest.TestCase):
         self.assertEqual(exit_value.kind, "cancelled")
         self.assertEqual(exit_value.final_sequence, 1)
 
-    def test_timestamp_and_lease_validation_use_trusted_authority(self) -> None:
+    def test_canonical_lease_authority_binds_all_fields_atomically(self) -> None:
         self.assertEqual(parse_utc_timestamp("2026-08-04T00:00:00Z"), datetime(2026, 8, 4, tzinfo=timezone.utc))
         for timestamp in ("2026-08-04T00:00:00+00:00", "2026-08-04T00:00:00", "2026-08-04T01:00:00+01:00"):
             with self.subTest(timestamp=timestamp):
@@ -419,9 +532,29 @@ class RuntimeContractTests(unittest.TestCase):
             lease=RuntimeLease("lease:one", "host:one", "2026-08-04T00:00:00Z"),
         )
         with self.assertRaises(LeaseError):
-            execute(run=snapshot, invocation=expired, host=RecordingHost(), clock=lambda: TRUSTED_NOW)
+            run_execute(snapshot=snapshot, invocation=expired)
         with self.assertRaises(LeaseError):
-            execute(run=snapshot, invocation=make_invocation(snapshot), host=RecordingHost())
+            execute(
+                run=snapshot,
+                invocation=make_invocation(snapshot),
+                host=RecordingHost(),
+                terminal_port=SharedTerminalPort(),
+            )
+
+        invocation = make_invocation(snapshot)
+        binding = CanonicalLeaseBinding(
+            "run:one", invocation.invocation_id, "lease:one", "host:one", True, invocation.lease.expires_at
+        )
+        authority = FixtureCanonicalLeaseAuthority([binding], clock=lambda: TRUSTED_NOW)
+        with self.assertRaises(BindingError):
+            execute(
+                run=snapshot,
+                invocation=replace(invocation, lease=RuntimeLease("lease:forged", "host:one", invocation.lease.expires_at)),
+                host=RecordingHost(),
+                lease_authority=authority,
+                lease_binding=binding,
+                terminal_port=SharedTerminalPort(),
+            )
 
     def test_initial_checkpoint_is_rejected_and_continuation_requires_supervisor_attestation(self) -> None:
         snapshot = make_snapshot()
@@ -435,20 +568,83 @@ class RuntimeContractTests(unittest.TestCase):
             remaining=RuntimeBudget(3, 80, 80),
         )
         with self.assertRaises(ContractError):
-            execute(run=snapshot, invocation=continuation, host=RecordingHost(), clock=lambda: TRUSTED_NOW)
+            binding = CanonicalLeaseBinding(
+                "run:one", continuation.invocation_id, "lease:one", "host:one", True, continuation.lease.expires_at
+            )
+            execute(
+                run=snapshot,
+                invocation=continuation,
+                host=RecordingHost(),
+                lease_authority=FixtureCanonicalLeaseAuthority([binding], clock=lambda: TRUSTED_NOW),
+                lease_binding=binding,
+                terminal_port=SharedTerminalPort(),
+            )
         kernel = FakeKernel()
         run_execute(
             snapshot=snapshot,
             invocation=continuation,
             kernel=kernel,
-            supervisor=TrustedRuntimeSupervisor(clock=lambda: TRUSTED_NOW, checkpoint_refs={"checkpoint:one"}),
         )
         self.assertEqual(kernel.requests[0].checkpoint_ref, "checkpoint:one")
         with self.assertRaises(BindingError):
+            valid_attestation = CheckpointAttestation(
+                "checkpoint:one",
+                "run:one",
+                "invocation:one",
+                snapshot.digest(),
+                snapshot.actor_ref,
+                snapshot.profile_version,
+                "event:restart",
+                "recoverable_restart",
+                continuation.invocation_id,
+            )
             run_execute(
                 snapshot=snapshot,
                 invocation=replace(continuation, checkpoint_ref="checkpoint:forged"),
-                supervisor=TrustedRuntimeSupervisor(clock=lambda: TRUSTED_NOW, checkpoint_refs={"checkpoint:one"}),
+                checkpoint_authority=FixtureCheckpointAuthority([valid_attestation]),
+                checkpoint_attestation=valid_attestation,
+            )
+
+    def test_checkpoint_attestation_cannot_replay_across_runs_or_targets(self) -> None:
+        snapshot = make_snapshot()
+        continuation = make_invocation(
+            snapshot,
+            invocation_id="invocation:target-one",
+            trigger=InvocationTrigger("continuation", "event:answer"),
+            checkpoint_ref="checkpoint:one",
+        )
+        attestation = CheckpointAttestation(
+            checkpoint_ref="checkpoint:one",
+            source_run_id=snapshot.run_id,
+            source_invocation_id="invocation:source",
+            snapshot_digest=snapshot.digest(),
+            actor_ref=snapshot.actor_ref,
+            profile_version=snapshot.profile_version,
+            continuation_event_ref="event:answer",
+            continuation_trigger_kind="continuation",
+            allowed_target_invocation_id=continuation.invocation_id,
+        )
+        authority = FixtureCheckpointAuthority([attestation])
+        other_snapshot = replace(snapshot, run_id="run:two")
+        other_invocation = replace(
+            continuation,
+            run_id=other_snapshot.run_id,
+            run_snapshot_digest=other_snapshot.digest(),
+        )
+        with self.assertRaises(BindingError):
+            run_execute(
+                snapshot=other_snapshot,
+                invocation=other_invocation,
+                checkpoint_authority=authority,
+                checkpoint_attestation=attestation,
+            )
+        other_target = replace(continuation, invocation_id="invocation:target-two")
+        with self.assertRaises(BindingError):
+            run_execute(
+                snapshot=snapshot,
+                invocation=other_target,
+                checkpoint_authority=authority,
+                checkpoint_attestation=attestation,
             )
 
     def test_input_requests_are_authorized_receipt_correlated_and_terminally_consistent(self) -> None:
@@ -735,13 +931,25 @@ class RuntimeContractTests(unittest.TestCase):
             expected_causation_ref=invocation.causation_ref,
         )
         self.assertTrue(stream.accept(streamed_event))
-        reconciler = SupervisorReconciler()
-        first_terminal = reconciler.reconcile_process_death(final_sequence=stream.last_sequence)
-        second_terminal = reconciler.reconcile_process_death(final_sequence=stream.last_sequence)
-        self.assertEqual(first_terminal, second_terminal)
-        self.assertIs(first_terminal, reconciler.terminal)
-        self.assertEqual(first_terminal.failure.code, "process_died")  # type: ignore[union-attr]
-        self.assertEqual(reconciler.reconciliation_count, 1)
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "terminal-reconciliation.json"
+            port = SharedTerminalPort(path=store_path)
+            first_receipt = reconcile_process_death(
+                port=port,
+                run_id=snapshot.run_id,
+                invocation_id=invocation.invocation_id,
+                final_sequence=stream.last_sequence,
+            )
+            restarted_port = SharedTerminalPort(path=store_path)
+            second_receipt = reconcile_process_death(
+                port=restarted_port,
+                run_id=snapshot.run_id,
+                invocation_id=invocation.invocation_id,
+                final_sequence=stream.last_sequence,
+            )
+            self.assertEqual(first_receipt, second_receipt)
+            state = json.loads(store_path.read_text(encoding="utf-8"))
+            self.assertEqual(list(state), [first_receipt.idempotency_key])
 
     def test_supervisor_classifies_process_death_as_one_terminal_exit(self) -> None:
         exit_value = classify_process_death(final_sequence=2)
@@ -750,21 +958,103 @@ class RuntimeContractTests(unittest.TestCase):
         self.assertEqual(exit_value.failure.code, "process_died")  # type: ignore[union-attr]
         self.assertEqual(RuntimeExit.from_json(exit_value.to_json()), exit_value)
 
-    def test_runtime_import_graph_has_no_product_or_network_imports(self) -> None:
-        package = importlib.import_module("plane_runtime")
-        package_modules = [
-            module
-            for name, module in sys.modules.items()
-            if (name == "plane_runtime" or name.startswith("plane_runtime."))
-            and isinstance(module, ModuleType)
+    def test_terminal_reconciliation_is_required_and_exactly_once_under_concurrency(self) -> None:
+        snapshot = make_snapshot()
+        invocation = make_invocation(snapshot, invocation_id="invocation:terminal")
+        binding = CanonicalLeaseBinding(
+            snapshot.run_id,
+            invocation.invocation_id,
+            "lease:one",
+            "host:one",
+            True,
+            invocation.lease.expires_at,
+        )
+        authority = FixtureCanonicalLeaseAuthority([binding], clock=lambda: TRUSTED_NOW)
+        with self.assertRaises(ContractError):
+            execute(
+                run=snapshot,
+                invocation=invocation,
+                host=RecordingHost(),
+                lease_authority=authority,
+                lease_binding=binding,
+            )
+
+        store: dict[str, object] = {}
+        lock = threading.RLock()
+        accepted: list[str] = []
+        port = SharedTerminalPort(store, lock, accepted)
+        results: list[RuntimeExit] = []
+
+        def invoke() -> None:
+            results.append(run_execute(snapshot=snapshot, invocation=invocation, terminal_port=port))
+
+        threads = [threading.Thread(target=invoke) for _ in range(4)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5)
+        self.assertEqual(len(results), 4)
+        self.assertTrue(all(item == results[0] for item in results))
+        self.assertEqual(len(accepted), 1)
+
+    def test_process_boundary_sanitizes_unexpected_exception_and_keeps_detail_internal(self) -> None:
+        snapshot = make_snapshot()
+        invocation = make_invocation(snapshot, invocation_id="invocation:exploding")
+        binding = CanonicalLeaseBinding(
+            snapshot.run_id,
+            invocation.invocation_id,
+            "lease:one",
+            "host:one",
+            True,
+            invocation.lease.expires_at,
+        )
+        output = StringIO()
+        captured: list[Exception] = []
+        serve_once(
+            json.dumps({"run": snapshot.to_dict(), "invocation": invocation.to_dict()}),
+            output,
+            host=RecordingHost(),
+            lease_authority=FixtureCanonicalLeaseAuthority([binding], clock=lambda: TRUSTED_NOW),
+            lease_binding=binding,
+            terminal_port=SharedTerminalPort(),
+            kernel=ExplodingKernel(),
+            internal_failure_hook=captured.append,
+        )
+        wire = output.getvalue()
+        self.assertNotIn("provider secret", wire)
+        self.assertNotIn("Traceback", wire)
+        self.assertEqual(len(captured), 1)
+        self.assertIn("provider secret", str(captured[0]))
+        reconciliation = json.loads(wire)
+        self.assertEqual(reconciliation["type"], "reconciliation_request")
+        self.assertEqual(reconciliation["request"]["message"], "runtime execution failed; Plane reconciliation is required")
+
+    def test_runtime_import_graph_uses_fresh_complete_sys_modules_delta(self) -> None:
+        probe = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import importlib, json, sys; before=set(sys.modules); [importlib.import_module(name) for name in ('plane_runtime', 'plane_runtime.contract', 'plane_runtime.adapter', 'plane_runtime.service')]; print(json.dumps(sorted(set(sys.modules)-before)))",
+            ],
+            cwd=REPO_ROOT,
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+        delta = json.loads(probe.stdout)
+        forbidden_prefixes = (
+            "plane.", "plane_api", "plane_server", "plane_product", "buzz",
+            "run_agent", "model_tools", "hermes_state", "agent", "cron", "gateway",
+            "memory", "delegation", "requests", "httpx", "aiohttp", "urllib3",
+            "openai", "anthropic", "boto3", "botocore", "slack_sdk", "telegram",
+            "discord", "websocket", "websockets",
+        )
+        forbidden = [
+            name
+            for name in delta
+            if any(name == prefix.rstrip(".") or name.startswith(prefix) for prefix in forbidden_prefixes)
         ]
-        self.assertIn(package, package_modules)
-        forbidden = {"run_agent", "model_tools", "gateway", "hermes_state", "requests", "httpx"}
-        for module in package_modules:
-            for value in vars(module).values():
-                if isinstance(value, ModuleType):
-                    root = value.__name__.split(".", 1)[0]
-                    self.assertNotIn(root, forbidden, f"forbidden runtime import graph edge: {module.__name__} -> {value.__name__}")
+        self.assertEqual(forbidden, [], f"forbidden fresh import(s): {forbidden}; delta={delta}")
 
 
 if __name__ == "__main__":

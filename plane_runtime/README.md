@@ -7,7 +7,16 @@ deployed Plane Agent runtime service. The logical adapter interface is
 The adapter is the only place that may translate Plane's versioned
 `RunSnapshot` and `InvocationEnvelope` into Hermes kernel calls and translate
 bounded runtime observations back. Plane remains authoritative for product
-state, lifecycle, publication, receipts, credentials, and durable recovery.
+state, lifecycle, publication, receipts, credentials, terminal reconciliation,
+and durable recovery.
+
+Execution requires host-injected `CanonicalLeaseAuthority` and
+`CanonicalLeaseBinding` values. Continuations additionally require a complete
+host `CheckpointAttestation` and `CheckpointAuthority`; the envelope's lease
+and checkpoint references are never authorities. Every runtime exit is
+submitted through the injected `TerminalReconciliationPort`, which returns a
+receipt, audit reference, and legal-transition result. A supervisor classifying
+process death uses the same port through `reconcile_process_death()`.
 
 The v1 contract contains immutable `RunSnapshot` and `InvocationEnvelope`
 values, bounded `RuntimeEvent` observations/proposals, and one `RuntimeExit`.
@@ -35,8 +44,9 @@ This package intentionally has no Hermes core wiring, dependencies,
 configuration, Buzz integration, or chat UI. Generated code must receive no
 credentials or ambient Plane authority; invocation processes and containers
 are replaceable infrastructure, never run-owned state. A supervisor may use
-`classify_process_death()` when a replaceable process dies before returning an
-exit.
+`classify_process_death()` for local evidence and must submit the resulting
+process-death proposal through the reconciliation port when a replaceable
+process dies before returning an exit.
 
 Verify the package from the repository root:
 

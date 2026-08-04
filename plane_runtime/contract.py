@@ -1087,3 +1087,115 @@ class ProductReceipt:
         object.__setattr__(self, "run_id", _require_text(self.run_id, "receipt.runId"))
         object.__setattr__(self, "invocation_id", _require_text(self.invocation_id, "receipt.invocationId"))
         object.__setattr__(self, "idempotency_key", _require_text(self.idempotency_key, "receipt.idempotencyKey"))
+
+
+TERMINAL_KINDS = frozenset(
+    {"completed", "waiting_for_input", "failed", "blocked", "cancelled"}
+)
+
+
+@dataclass(frozen=True)
+class TerminalProposal:
+    """A terminal observation submitted to Plane for lifecycle reconciliation.
+
+    This is deliberately not a Plane state record.  It is the small value sent
+    across the injected ``TerminalReconciliationPort`` seam.  The port owns
+    legal-transition decisions and durable idempotency; Hermes only supplies
+    bounded evidence and preserves the deterministic idempotency key.
+    """
+
+    run_id: str
+    invocation_id: str
+    kind: str
+    final_sequence: int
+    evidence_event_ids: tuple[str, ...] = ()
+    evidence_receipt_refs: tuple[str, ...] = ()
+    failure: RuntimeFailure | None = None
+    source: str = "runtime"
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "run_id", _require_text(self.run_id, "terminal.runId"))
+        object.__setattr__(
+            self, "invocation_id", _require_text(self.invocation_id, "terminal.invocationId")
+        )
+        if self.kind not in TERMINAL_KINDS:
+            raise ContractError(f"unsupported terminal proposal kind: {self.kind!r}")
+        object.__setattr__(
+            self,
+            "final_sequence",
+            _require_int(self.final_sequence, "terminal.finalSequence", minimum=0),
+        )
+        event_ids = tuple(
+            _require_text(value, "terminal.evidenceEventIds[]") for value in self.evidence_event_ids
+        )
+        receipt_refs = tuple(
+            _require_text(value, "terminal.evidenceReceiptRefs[]")
+            for value in self.evidence_receipt_refs
+        )
+        if len(event_ids) > MAX_NEW_CONTEXT_EVENT_REFS:
+            raise BoundsError(
+                f"terminal.evidenceEventIds exceeds {MAX_NEW_CONTEXT_EVENT_REFS} items"
+            )
+        if len(receipt_refs) > MAX_NEW_CONTEXT_EVENT_REFS:
+            raise BoundsError(
+                f"terminal.evidenceReceiptRefs exceeds {MAX_NEW_CONTEXT_EVENT_REFS} items"
+            )
+        if len(set(event_ids)) != len(event_ids):
+            raise ContractError("terminal.evidenceEventIds must be unique")
+        if len(set(receipt_refs)) != len(receipt_refs):
+            raise ContractError("terminal.evidenceReceiptRefs must be unique")
+        object.__setattr__(self, "evidence_event_ids", event_ids)
+        object.__setattr__(self, "evidence_receipt_refs", receipt_refs)
+        if self.kind in {"failed", "blocked"} and self.failure is None:
+            raise ContractError(f"{self.kind} terminal proposal requires failure details")
+        if self.kind not in {"failed", "blocked"} and self.failure is not None:
+            raise ContractError(f"{self.kind} terminal proposal cannot carry failure details")
+        if self.source not in {"runtime", "supervisor"}:
+            raise ContractError(f"unsupported terminal proposal source: {self.source!r}")
+        if self.source == "supervisor" and (
+            self.kind != "failed"
+            or self.failure is None
+            or self.failure.code != "process_died"
+        ):
+            raise ContractError("supervisor terminal proposals must synthesize process death")
+        object.__setattr__(self, "source", self.source)
+
+    @property
+    def idempotency_key(self) -> str:
+        return (
+            f"terminal:{self.source}:{self.run_id}:{self.invocation_id}:"
+            f"{self.kind}:{self.final_sequence}"
+        )
+
+
+@dataclass(frozen=True)
+class TerminalReconciliationReceipt:
+    """The host/Plane result for one terminal proposal."""
+
+    receipt_ref: str
+    audit_ref: str
+    run_id: str
+    invocation_id: str
+    kind: str
+    idempotency_key: str
+    accepted: bool
+    legal_transition: bool
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "receipt_ref", _require_text(self.receipt_ref, "terminalReceipt.receiptRef"))
+        object.__setattr__(self, "audit_ref", _require_text(self.audit_ref, "terminalReceipt.auditRef"))
+        object.__setattr__(self, "run_id", _require_text(self.run_id, "terminalReceipt.runId"))
+        object.__setattr__(
+            self,
+            "invocation_id",
+            _require_text(self.invocation_id, "terminalReceipt.invocationId"),
+        )
+        if self.kind not in TERMINAL_KINDS:
+            raise ContractError(f"unsupported terminal receipt kind: {self.kind!r}")
+        object.__setattr__(
+            self,
+            "idempotency_key",
+            _require_text(self.idempotency_key, "terminalReceipt.idempotencyKey"),
+        )
+        if not isinstance(self.accepted, bool) or not isinstance(self.legal_transition, bool):
+            raise ContractError("terminal receipt decisions must be booleans")

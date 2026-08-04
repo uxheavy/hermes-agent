@@ -9,12 +9,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from threading import Event
-from typing import Callable, Mapping, Protocol
+from threading import Event, RLock
+from typing import Callable, Iterable, Mapping, Protocol
 
 from .contract import (
     ArtifactObserved,
     BindingError,
+    BoundsError,
     ContractError,
     ConversationPublicationObserved,
     InputRequestObserved,
@@ -28,8 +29,13 @@ from .contract import (
     RuntimeFailure,
     RunSnapshot,
     SequenceError,
+    TerminalProposal,
+    TerminalReconciliationReceipt,
+    TERMINAL_KINDS,
     TranscriptObserved,
     UsageObserved,
+    RuntimeLease,
+    MAX_REFERENCE_LENGTH,
     parse_utc_timestamp,
 )
 from .contract import InvocationEnvelope, PROTOCOL
@@ -85,18 +91,110 @@ class RuntimeHost(Protocol):
         ...
 
 
-class RuntimeSupervisor(Protocol):
-    """Trusted host seam for lease and checkpoint authority."""
+@dataclass(frozen=True)
+class CanonicalLeaseBinding:
+    """Host-owned lease state kept separate from the untrusted envelope."""
 
-    def validate_lease(self, *, run: RunSnapshot, invocation: InvocationEnvelope) -> None:
+    run_id: str
+    invocation_id: str
+    lease_id: str
+    holder_ref: str
+    active: bool
+    expires_at: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.run_id, str) or not self.run_id:
+            raise ContractError("lease binding runId must be a non-empty string")
+        if len(self.run_id) > MAX_REFERENCE_LENGTH:
+            raise BoundsError("lease binding runId exceeds the reference limit")
+        if not isinstance(self.invocation_id, str) or not self.invocation_id:
+            raise ContractError("lease binding invocationId must be a non-empty string")
+        if len(self.invocation_id) > MAX_REFERENCE_LENGTH:
+            raise BoundsError("lease binding invocationId exceeds the reference limit")
+        lease = RuntimeLease(self.lease_id, self.holder_ref, self.expires_at)
+        object.__setattr__(self, "lease_id", lease.lease_id)
+        object.__setattr__(self, "holder_ref", lease.holder_ref)
+        object.__setattr__(self, "expires_at", lease.expires_at)
+        if not isinstance(self.active, bool):
+            raise ContractError("lease binding active must be a boolean")
+
+    def matches(self, invocation: InvocationEnvelope) -> bool:
+        lease = invocation.lease
+        return (
+            self.run_id == invocation.run_id
+            and self.invocation_id == invocation.invocation_id
+            and self.lease_id == lease.lease_id
+            and self.holder_ref == lease.holder_ref
+            and self.expires_at == lease.expires_at
+        )
+
+
+class CanonicalLeaseAuthority(Protocol):
+    """Host authority that atomically validates the complete lease binding."""
+
+    def validate_lease(
+        self,
+        *,
+        run: RunSnapshot,
+        invocation: InvocationEnvelope,
+        binding: CanonicalLeaseBinding,
+    ) -> None:
         ...
 
-    def validate_checkpoint(self, *, run: RunSnapshot, invocation: InvocationEnvelope) -> None:
+
+@dataclass(frozen=True)
+class CheckpointAttestation:
+    """Host attestation for one safe, invocation-specific continuation."""
+
+    checkpoint_ref: str
+    source_run_id: str
+    source_invocation_id: str
+    snapshot_digest: str
+    actor_ref: str
+    profile_version: str
+    continuation_event_ref: str
+    continuation_trigger_kind: str
+    allowed_target_invocation_id: str
+
+    def __post_init__(self) -> None:
+        fields = (
+            "checkpoint_ref",
+            "source_run_id",
+            "source_invocation_id",
+            "snapshot_digest",
+            "actor_ref",
+            "profile_version",
+            "continuation_event_ref",
+            "continuation_trigger_kind",
+            "allowed_target_invocation_id",
+        )
+        for name in fields:
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value:
+                raise ContractError(f"checkpoint attestation {name} must be a non-empty string")
+            if len(value) > MAX_REFERENCE_LENGTH:
+                raise BoundsError(f"checkpoint attestation {name} exceeds the reference limit")
+
+
+class CheckpointAuthority(Protocol):
+    """Host authority for complete, immutable checkpoint attestations."""
+
+    def validate_checkpoint(
+        self,
+        *,
+        run: RunSnapshot,
+        invocation: InvocationEnvelope,
+        attestation: CheckpointAttestation,
+    ) -> None:
         ...
 
 
-class TrustedClock(Protocol):
-    def now(self) -> datetime:
+class TerminalReconciliationPort(Protocol):
+    """Plane application-service seam for terminal lifecycle proposals."""
+
+    def reconcile_terminal(
+        self, proposal: TerminalProposal
+    ) -> TerminalReconciliationReceipt:
         ...
 
 
@@ -150,7 +248,7 @@ class KernelResult:
     failure: RuntimeFailure | None = None
 
     def __post_init__(self) -> None:
-        if self.terminal_kind not in {"completed", "waiting_for_input", "failed", "blocked", "cancelled"}:
+        if self.terminal_kind not in TERMINAL_KINDS:
             raise ContractError(f"unsupported kernel exit kind: {self.terminal_kind!r}")
         if self.terminal_kind in {"failed", "blocked"} and self.failure is None:
             raise ContractError(f"{self.terminal_kind} kernel result requires failure details")
@@ -299,8 +397,8 @@ def _validate_inputs(run: RunSnapshot, invocation: InvocationEnvelope) -> None:
         raise ContractError("invocation remaining budget exceeds the run total budget")
 
 
-def _trusted_now(clock: TrustedClock | Callable[[], datetime]) -> datetime:
-    value = clock.now() if hasattr(clock, "now") else clock()
+def _authority_now(clock: Callable[[], datetime]) -> datetime:
+    value = clock()
     if not isinstance(value, datetime) or value.tzinfo is None:
         raise LeaseError("trusted clock must return a timezone-aware datetime")
     if value.utcoffset() != timedelta(0):
@@ -309,10 +407,91 @@ def _trusted_now(clock: TrustedClock | Callable[[], datetime]) -> datetime:
     return value
 
 
-def _validate_lease_with_clock(invocation: InvocationEnvelope, clock: TrustedClock | Callable[[], datetime]) -> None:
-    expires_at = parse_utc_timestamp(invocation.lease.expires_at, "lease.expiresAt")
-    if expires_at <= _trusted_now(clock):
-        raise LeaseError("invocation lease is expired")
+class FixtureCanonicalLeaseAuthority:
+    """Deterministic host authority used by tests and the demo service only."""
+
+    def __init__(
+        self,
+        bindings: Iterable[CanonicalLeaseBinding],
+        *,
+        clock: Callable[[], datetime],
+    ) -> None:
+        self._clock = clock
+        self._lock = RLock()
+        self._bindings: dict[tuple[str, str], CanonicalLeaseBinding] = {}
+        for binding in bindings:
+            key = (binding.run_id, binding.invocation_id)
+            if key in self._bindings:
+                raise ContractError("duplicate canonical lease binding")
+            self._bindings[key] = binding
+
+    def validate_lease(
+        self,
+        *,
+        run: RunSnapshot,
+        invocation: InvocationEnvelope,
+        binding: CanonicalLeaseBinding,
+    ) -> None:
+        """Check every lease field under one authority lock."""
+
+        with self._lock:
+            canonical = self._bindings.get((run.run_id, invocation.invocation_id))
+            if canonical is None:
+                raise LeaseError("no canonical lease binding exists for this invocation")
+            if canonical != binding:
+                raise BindingError("host lease binding does not match canonical authority state")
+            if not canonical.matches(invocation):
+                raise BindingError("invocation lease does not match canonical authority state")
+            if not canonical.active:
+                raise LeaseError("invocation lease is not active")
+            if parse_utc_timestamp(canonical.expires_at, "lease binding expiresAt") <= _authority_now(
+                self._clock
+            ):
+                raise LeaseError("invocation lease is expired")
+
+
+class FixtureCheckpointAuthority:
+    """Deterministic host authority for complete checkpoint attestations."""
+
+    def __init__(self, attestations: Iterable[CheckpointAttestation]) -> None:
+        self._lock = RLock()
+        self._attestations: dict[tuple[str, str, str], CheckpointAttestation] = {}
+        for attestation in attestations:
+            key = (
+                attestation.source_run_id,
+                attestation.checkpoint_ref,
+                attestation.allowed_target_invocation_id,
+            )
+            if key in self._attestations:
+                raise ContractError("duplicate checkpoint attestation")
+            self._attestations[key] = attestation
+
+    def validate_checkpoint(
+        self,
+        *,
+        run: RunSnapshot,
+        invocation: InvocationEnvelope,
+        attestation: CheckpointAttestation,
+    ) -> None:
+        with self._lock:
+            if invocation.checkpoint_ref is None:
+                raise BindingError("checkpoint attestation requires a checkpoint reference")
+            canonical = self._attestations.get(
+                (run.run_id, invocation.checkpoint_ref, invocation.invocation_id)
+            )
+            if canonical is None or canonical != attestation:
+                raise BindingError("checkpoint attestation is not canonical for this continuation")
+            if (
+                attestation.source_run_id != run.run_id
+                or attestation.snapshot_digest != run.digest()
+                or attestation.actor_ref != run.actor_ref
+                or attestation.profile_version != run.profile_version
+                or attestation.allowed_target_invocation_id != invocation.invocation_id
+                or attestation.checkpoint_ref != invocation.checkpoint_ref
+                or attestation.continuation_trigger_kind != invocation.trigger.kind
+                or attestation.continuation_event_ref != invocation.trigger.event_ref
+            ):
+                raise BindingError("checkpoint attestation is bound to different run continuation state")
 
 
 def _validate_publication_receipt(
@@ -354,6 +533,73 @@ def _validate_product_receipt(
         raise BindingError("product receipt is not bound to this invocation and resource")
 
 
+def _terminal_proposal(
+    *,
+    run: RunSnapshot,
+    invocation: InvocationEnvelope,
+    exit_value: RuntimeExit,
+    stream: EventStream,
+    source: str = "runtime",
+) -> TerminalProposal:
+    receipt_refs = tuple(
+        receipt_ref
+        for event in stream.events
+        for receipt_ref in (getattr(event.body, "receipt_ref", None),)
+        if receipt_ref is not None
+    )
+    return TerminalProposal(
+        run_id=run.run_id,
+        invocation_id=invocation.invocation_id,
+        kind=exit_value.kind,
+        final_sequence=exit_value.final_sequence,
+        evidence_event_ids=tuple(event.event_id for event in stream.events),
+        evidence_receipt_refs=receipt_refs,
+        failure=exit_value.failure,
+        source=source,
+    )
+
+
+def _reconcile_terminal(
+    port: TerminalReconciliationPort | None,
+    proposal: TerminalProposal,
+) -> TerminalReconciliationReceipt:
+    if port is None:
+        raise ContractError("execution requires an injected terminal reconciliation port")
+    receipt = port.reconcile_terminal(proposal)
+    if not isinstance(receipt, TerminalReconciliationReceipt):
+        raise ContractError("terminal reconciliation returned an invalid receipt")
+    if (
+        receipt.run_id != proposal.run_id
+        or receipt.invocation_id != proposal.invocation_id
+        or receipt.kind != proposal.kind
+        or receipt.idempotency_key != proposal.idempotency_key
+    ):
+        raise BindingError("terminal reconciliation receipt is not bound to this proposal")
+    if not receipt.accepted or not receipt.legal_transition:
+        raise BindingError("Plane rejected the terminal proposal or reported an illegal transition")
+    return receipt
+
+
+def _return_terminal(
+    *,
+    port: TerminalReconciliationPort | None,
+    run: RunSnapshot,
+    invocation: InvocationEnvelope,
+    stream: EventStream,
+    exit_value: RuntimeExit,
+) -> RuntimeExit:
+    _reconcile_terminal(
+        port,
+        _terminal_proposal(
+            run=run,
+            invocation=invocation,
+            exit_value=exit_value,
+            stream=stream,
+        ),
+    )
+    return exit_value
+
+
 def execute(
     *,
     run: RunSnapshot,
@@ -362,8 +608,11 @@ def execute(
     emit: EventSink | None = None,
     cancellation: CancellationSignal | None = None,
     kernel: KernelPort | None = None,
-    clock: TrustedClock | Callable[[], datetime] | None = None,
-    supervisor: RuntimeSupervisor | None = None,
+    lease_authority: CanonicalLeaseAuthority | None = None,
+    lease_binding: CanonicalLeaseBinding | None = None,
+    checkpoint_authority: CheckpointAuthority | None = None,
+    checkpoint_attestation: CheckpointAttestation | None = None,
+    terminal_port: TerminalReconciliationPort | None = None,
 ) -> RuntimeExit:
     """Execute exactly one invocation through the replaceable kernel port.
 
@@ -373,16 +622,23 @@ def execute(
     """
 
     _validate_inputs(run, invocation)
-    if supervisor is not None:
-        supervisor.validate_lease(run=run, invocation=invocation)
-        if invocation.checkpoint_ref is not None:
-            supervisor.validate_checkpoint(run=run, invocation=invocation)
-    elif clock is not None:
-        _validate_lease_with_clock(invocation, clock)
-        if invocation.checkpoint_ref is not None:
-            raise ContractError("checkpoint continuation requires a trusted supervisor")
-    else:
-        raise LeaseError("execution requires an injected trusted clock or supervisor")
+    if lease_authority is None or lease_binding is None:
+        raise LeaseError("execution requires an injected canonical lease authority and host binding")
+    lease_authority.validate_lease(run=run, invocation=invocation, binding=lease_binding)
+    if invocation.checkpoint_ref is not None:
+        if checkpoint_authority is None or checkpoint_attestation is None:
+            raise ContractError(
+                "checkpoint continuation requires an injected checkpoint authority and attestation"
+            )
+        checkpoint_authority.validate_checkpoint(
+            run=run,
+            invocation=invocation,
+            attestation=checkpoint_attestation,
+        )
+    elif checkpoint_authority is not None or checkpoint_attestation is not None:
+        raise ContractError("checkpoint authority data is not allowed for an initial invocation")
+    if terminal_port is None:
+        raise ContractError("execution requires an injected terminal reconciliation port")
     cancellation = cancellation or NeverCancelled()
     stream = EventStream(
         run_id=run.run_id,
@@ -391,7 +647,13 @@ def execute(
         expected_causation_ref=invocation.causation_ref,
     )
     if cancellation.is_cancelled():
-        return RuntimeExit(kind="cancelled", final_sequence=stream.last_sequence)
+        return _return_terminal(
+            port=terminal_port,
+            run=run,
+            invocation=invocation,
+            stream=stream,
+            exit_value=RuntimeExit(kind="cancelled", final_sequence=stream.last_sequence),
+        )
     kernel = kernel or FakeKernel()
     request = KernelRequest(
         run_id=run.run_id,
@@ -527,17 +789,35 @@ def execute(
     try:
         result = kernel.dispatch(request, on_observation, cancellation)
     except CancellationRequested:
-        return RuntimeExit(kind="cancelled", final_sequence=stream.last_sequence)
+        return _return_terminal(
+            port=terminal_port,
+            run=run,
+            invocation=invocation,
+            stream=stream,
+            exit_value=RuntimeExit(kind="cancelled", final_sequence=stream.last_sequence),
+        )
     if cancellation.is_cancelled():
-        return RuntimeExit(kind="cancelled", final_sequence=stream.last_sequence)
+        return _return_terminal(
+            port=terminal_port,
+            run=run,
+            invocation=invocation,
+            stream=stream,
+            exit_value=RuntimeExit(kind="cancelled", final_sequence=stream.last_sequence),
+        )
     if result.terminal_kind == "waiting_for_input" and not pending_input_requests:
         raise ContractError("waiting_for_input requires a visible authorized input request")
     if result.terminal_kind != "waiting_for_input" and pending_input_requests:
         raise ContractError("terminal exit cannot leave an unresolved input request")
-    return RuntimeExit(
-        kind=result.terminal_kind,
-        final_sequence=stream.last_sequence,
-        failure=result.failure,
+    return _return_terminal(
+        port=terminal_port,
+        run=run,
+        invocation=invocation,
+        stream=stream,
+        exit_value=RuntimeExit(
+            kind=result.terminal_kind,
+            final_sequence=stream.last_sequence,
+            failure=result.failure,
+        ),
     )
 
 
@@ -687,62 +967,6 @@ class RecordingHost:
         return receipt
 
 
-class TrustedRuntimeSupervisor:
-    """Small deterministic supervisor adapter used by the service and tests."""
-
-    def __init__(
-        self,
-        *,
-        clock: TrustedClock | Callable[[], datetime],
-        checkpoint_refs: set[str] | frozenset[str] = frozenset(),
-    ) -> None:
-        self.clock = clock
-        self.checkpoint_refs = frozenset(checkpoint_refs)
-
-    def validate_lease(self, *, run: RunSnapshot, invocation: InvocationEnvelope) -> None:
-        del run
-        _validate_lease_with_clock(invocation, self.clock)
-
-    def validate_checkpoint(self, *, run: RunSnapshot, invocation: InvocationEnvelope) -> None:
-        del run
-        checkpoint_ref = invocation.checkpoint_ref
-        if checkpoint_ref is None or checkpoint_ref not in self.checkpoint_refs:
-            raise BindingError("checkpoint is not trusted for this continuation")
-
-
-class SupervisorReconciler:
-    """Idempotently records the one supervisor-classified terminal result."""
-
-    def __init__(self) -> None:
-        self._terminal: RuntimeExit | None = None
-        self._reconciliation_count = 0
-
-    @property
-    def terminal(self) -> RuntimeExit | None:
-        return self._terminal
-
-    @property
-    def reconciliation_count(self) -> int:
-        return self._reconciliation_count
-
-    def reconcile(self, exit_value: RuntimeExit) -> RuntimeExit:
-        if self._terminal is None:
-            self._terminal = exit_value
-            self._reconciliation_count = 1
-            return exit_value
-        if self._terminal != exit_value:
-            raise SequenceError("terminal reconciliation was attempted with different content")
-        return self._terminal
-
-    def reconcile_process_death(
-        self,
-        *,
-        final_sequence: int,
-        reason: str = "runtime process exited before returning an exit",
-    ) -> RuntimeExit:
-        return self.reconcile(classify_process_death(final_sequence=final_sequence, reason=reason))
-
-
 def classify_process_death(
     *,
     final_sequence: int,
@@ -755,3 +979,25 @@ def classify_process_death(
         final_sequence=final_sequence,
         failure=RuntimeFailure(code="process_died", message=reason, retryable=True),
     )
+
+
+def reconcile_process_death(
+    *,
+    port: TerminalReconciliationPort,
+    run_id: str,
+    invocation_id: str,
+    final_sequence: int,
+    reason: str = "runtime process exited before returning an exit",
+) -> TerminalReconciliationReceipt:
+    """Submit trusted supervisor process-death evidence through the Plane port."""
+
+    exit_value = classify_process_death(final_sequence=final_sequence, reason=reason)
+    proposal = TerminalProposal(
+        run_id=run_id,
+        invocation_id=invocation_id,
+        kind=exit_value.kind,
+        final_sequence=exit_value.final_sequence,
+        failure=exit_value.failure,
+        source="supervisor",
+    )
+    return _reconcile_terminal(port, proposal)
