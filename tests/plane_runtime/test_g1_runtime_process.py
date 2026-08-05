@@ -39,6 +39,7 @@ from plane_runtime.invocation_supervisor import (
 )
 from plane_runtime.service import main as service_main
 from plane_runtime.subprocess_transport import RuntimeTransportError, SubprocessRuntimeTransport
+from plane_runtime.contract import RuntimeConfigurationError
 
 
 def _digest(prefix: str, value: object) -> str:
@@ -217,7 +218,8 @@ class G1RuntimeProcessTests(unittest.TestCase):
         invocation = make_invocation(snapshot)
         request = json.dumps({"run": snapshot, "invocation": invocation}) + "\n"
         with mock.patch("plane_runtime.g1_service.HermesKernelAdapter") as adapter:
-            def dispatch(_snapshot, _invocation, _cancellation, emit_body):
+            def dispatch(_snapshot, _invocation, _cancellation, emit_body, **kwargs):
+                self.assertEqual(kwargs["model_call_allowance"], 1)
                 emit_body(
                     {
                         "kind": "progress_observed",
@@ -230,7 +232,7 @@ class G1RuntimeProcessTests(unittest.TestCase):
             adapter.return_value.dispatch.side_effect = dispatch
             output = io.StringIO()
             with mock.patch("sys.stdin", io.StringIO(request)), mock.patch("sys.stdout", output):
-                self.assertEqual(service_main(["--once", "--g1-production"]), 0)
+                self.assertEqual(service_main(["--once", "--g1-production", "--model-call-allowance", "1"]), 0)
             adapter.assert_called_once()
             source = adapter.call_args.kwargs["credential_source"]
             self.assertIsInstance(source, UnixSocketCredentialSource)
@@ -521,33 +523,59 @@ class G1RuntimeProcessTests(unittest.TestCase):
 
     def test_credential_bootstrap_accepts_one_control_frame_only(self) -> None:
         canary = "bootstrap-canary"
-        control = json.dumps(
-            {
-                "protocol": "plane.agent-runtime/credential-control/v1",
-                "credentials": {"api_key": canary},
-            },
+        dispatch = json.dumps(
+            {"modelCallAllowance": 1, "protocol": "plane.agent-runtime/dispatch-control/v1"},
+            sort_keys=True,
             separators=(",", ":"),
         ).encode() + b"\n"
-        request = b'{"run":{},"invocation":{}}\n'
+        control = json.dumps(
+            {
+                "credentials": {"api_key": canary},
+                "protocol": "plane.agent-runtime/credential-control/v1",
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode() + b"\n"
+        request = b'{"invocation":{},"run":{}}\n'
 
         class BinaryStdin:
             def __init__(self, value: bytes) -> None:
                 self.buffer = io.BytesIO(value)
 
         with mock.patch.object(bootstrap, "_run", return_value=0) as run:
-            with mock.patch("sys.stdin", BinaryStdin(control + request)):
+            with mock.patch("sys.stdin", BinaryStdin(dispatch + control + request)):
                 self.assertEqual(bootstrap.main(["--once", "--g1-production"]), 0)
             run.assert_called_once()
             self.assertNotIn(canary, repr(run.call_args.args[0]))
 
             for extra in (
                 b"not-json\n" + request,
-                control + control + request,
-                control + request + control,
+                dispatch + control + control + request,
+                dispatch + control + request + control,
             ):
                 run.reset_mock()
                 diagnostics = io.StringIO()
                 with mock.patch("sys.stdin", BinaryStdin(extra)), mock.patch("sys.stdout", diagnostics), mock.patch(
+                    "sys.stderr", diagnostics
+                ):
+                    self.assertEqual(bootstrap.main(["--once", "--g1-production"]), 2)
+                run.assert_not_called()
+                self.assertNotIn(canary, diagnostics.getvalue())
+
+            malformed = (
+                b'{"modelCallAllowance":1,"protocol":"plane.agent-runtime/dispatch-control/v1","unknown":1}\n',
+                b'{"modelCallAllowance":true,"protocol":"plane.agent-runtime/dispatch-control/v1"}\n',
+                b'{"modelCallAllowance":1,"modelCallAllowance":2,"protocol":"plane.agent-runtime/dispatch-control/v1"}\n',
+                b'{"modelCallAllowance":1,"protocol":"plane.agent-runtime/dispatch-control/v2"}\n',
+                control.replace(b'"credentials":{"api_key":"bootstrap-canary"}', b'"credentials":[]'),
+                b'{"credentials":{"api_key":"bootstrap-canary"},"protocol":"plane.agent-runtime/credential-control/v1","unknown":1}\n',
+                b'{"credentials":{"api_key":"bootstrap-canary"},"protocol":"plane.agent-runtime/credential-control/v1","protocol":"plane.agent-runtime/credential-control/v1"}\n',
+                b'{"credentials":{"api_key":"' + (b"x" * (16 * 1024)) + b'"},"protocol":"plane.agent-runtime/credential-control/v1"}\n',
+            )
+            for bad in malformed:
+                run.reset_mock()
+                diagnostics = io.StringIO()
+                with mock.patch("sys.stdin", BinaryStdin(bad + control + request)), mock.patch("sys.stdout", diagnostics), mock.patch(
                     "sys.stderr", diagnostics
                 ):
                     self.assertEqual(bootstrap.main(["--once", "--g1-production"]), 2)
@@ -594,6 +622,118 @@ class G1RuntimeProcessTests(unittest.TestCase):
             self.assertNotIn(canary, str(raised.exception))
         finally:
             broker.close()
+
+    def test_production_supervisor_requires_explicit_durable_ledger(self) -> None:
+        image = "alpine@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce"
+
+        class Credentials:
+            def resolve(self, provider: str) -> dict[str, str]:
+                del provider
+                return {"api_key": "not-used"}
+
+        runner = ProductionG1RuntimeRunner(image=image, credential_source=Credentials())
+        try:
+            with self.assertRaises(RuntimeConfigurationError):
+                G1InvocationSupervisor(runner=runner)
+        finally:
+            runner.close()
+
+    def test_durable_ledger_reopen_separates_usage_and_never_replays_unknown(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "ledger.sqlite3")
+            ledger = G1RuntimeLedger(path, max_calls=4, max_model_calls=2)
+            total = {"inputTokens": 100, "outputTokens": 100, "durationMs": 1000}
+            claim = ledger.claim(
+                run_id="run:durable", invocation_id="invocation:first", request_fingerprint="f" * 64,
+                snapshot_digest="snapshot:" + "a" * 64, total_budget=total, remaining_budget=total,
+                retained_bytes_limit=1000,
+            )
+            self.assertTrue(claim.owns_dispatch)
+            self.assertEqual(claim.model_call_allowance, 2)
+            ledger.finalize(
+                run_id="run:durable", invocation_id="invocation:first", request_fingerprint="f" * 64,
+                frames=("{}",), host_duration_ms=30,
+                usage={"inputTokens": 10, "outputTokens": 60, "durationMs": 999}, usage_valid=True,
+                model_calls=1, retained_bytes=200,
+            )
+            reopened = G1RuntimeLedger(path, max_calls=4, max_model_calls=2)
+            summary = reopened.summary("run:durable")
+            self.assertEqual(summary["inputTokensUsed"], 10)
+            self.assertEqual(summary["outputTokensUsed"], 60)
+            self.assertEqual(summary["retainedBytesUsed"], 200)
+            self.assertEqual(summary["hostDurationUsedMs"], 30)
+            self.assertEqual(summary["modelCallsUsed"], 1)
+            second_budget = {"inputTokens": 90, "outputTokens": 40, "durationMs": 900}
+            second = reopened.claim(
+                run_id="run:durable", invocation_id="invocation:second", request_fingerprint="e" * 64,
+                snapshot_digest="snapshot:" + "a" * 64, total_budget=total, remaining_budget=second_budget,
+                retained_bytes_limit=1000,
+            )
+            self.assertTrue(second.owns_dispatch)
+            self.assertEqual(second.model_call_allowance, 1)
+            increased = reopened.claim(
+                run_id="run:durable", invocation_id="invocation:increase", request_fingerprint="i" * 64,
+                snapshot_digest="snapshot:" + "a" * 64, total_budget=total,
+                remaining_budget={"inputTokens": 90, "outputTokens": 41, "durationMs": 900}, retained_bytes_limit=1000,
+            )
+            self.assertEqual(increased.state, "budget_exhausted")
+            changed = reopened.claim(
+                run_id="run:durable", invocation_id="invocation:changed-snapshot", request_fingerprint="c" * 64,
+                snapshot_digest="snapshot:" + "b" * 64, total_budget=total, remaining_budget=second_budget,
+                retained_bytes_limit=1000,
+            )
+            self.assertEqual(changed.state, "conflict")
+            reopened.mark_outcome_unknown(
+                run_id="run:durable", invocation_id="invocation:second", request_fingerprint="e" * 64,
+            )
+            self.assertEqual(
+                reopened.claim(
+                    run_id="run:durable", invocation_id="invocation:second", request_fingerprint="e" * 64,
+                    snapshot_digest="snapshot:" + "a" * 64, total_budget=total, remaining_budget=second_budget,
+                    retained_bytes_limit=1000,
+                ).state,
+                "outcome_unknown",
+            )
+
+    @unittest.skipUnless(shutil.which("docker") or os.path.exists("/opt/homebrew/bin/docker"), "Docker CLI is unavailable")
+    def test_linux_container_broker_denies_protocol_counterexamples(self) -> None:
+        docker = shutil.which("docker") or "/opt/homebrew/bin/docker"
+        inspected = subprocess.run(
+            (docker, "image", "inspect", "--format", "{{index .RepoDigests 0}}", "plane-g1-local:hermes"),
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, check=False,
+        )
+        image = inspected.stdout.strip()
+        if inspected.returncode != 0 or "@sha256:" not in image:
+            self.skipTest("local digest-pinned Hermes image was not built")
+        script = "\n".join((
+            "import os,socket",
+            "from plane_runtime.g1_runtime_image import bootstrap as b",
+            "canary='docker-broker-canary'",
+            "broker=b._CredentialBroker({'api_key':canary},'test-provider'); broker.start(os.getpid())",
+            "def ask(raw):",
+            " c=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); c.connect(b._BROKER_PATH); c.sendall(raw); v=c.recv(8192); c.close(); return v",
+            "assert b'\\\"credentials\\\":{}' in ask(b'{\\\"provider\\\":\\\"test-provider\\\",\\\"protocol\\\":\\\"plane.agent-runtime/credentials/v1\\\",\\\"unknown\\\":1}\\n'), 'unknown'",
+            "assert b'\\\"credentials\\\":{}' in ask(b'{\\\"provider\\\":[\\\"test-provider\\\"],\\\"protocol\\\":\\\"plane.agent-runtime/credentials/v1\\\"}\\n'), 'type'",
+            "assert b'\\\"credentials\\\":{}' in ask(b'{\\\"provider\\\":\\\"test-provider\\\",\\\"protocol\\\":\\\"plane.agent-runtime/credentials/v2\\\"}\\n'), 'version'",
+            "assert b'\\\"credentials\\\":{}' in ask(b'{\\\"provider\\\":\\\"test-provider\\\",\\\"protocol\\\":\\\"plane.agent-runtime/credentials/v1\\\",\\\"provider\\\":\\\"other\\\"}\\n'), 'duplicate'",
+            "assert b'\\\"credentials\\\":{}' in ask((b'x'*4097)+b'\\n'), 'oversized'",
+            "import json; valid=json.dumps({'provider':'test-provider','protocol':'plane.agent-runtime/credentials/v1'},sort_keys=True,separators=(',',':')).encode()+b'\\n'",
+            "assert b'\\\"credentials\\\":{\\\"api_key\\\":\\\"docker-broker-canary\\\"}' in ask(valid)",
+            "assert b'\\\"credentials\\\":{}' in ask(valid)",
+            "broker.close(); print('BROKER_MATRIX_OK')",
+        ))
+        command = [
+            docker, "run", "--rm", "--pull=never", "--network", "none", "--read-only", "--interactive",
+            "--tmpfs", "/tmp:rw,noexec,nosuid,nodev,size=64m", "--user", "65532:65532", "--cap-drop", "ALL",
+            "--security-opt", "no-new-privileges", "--env", "LANG=C.UTF-8", "--env", "LC_ALL=C.UTF-8",
+            "--env", "HOME=/tmp/hermes", "--env", "PATH=/usr/local/bin:/usr/bin:/bin",
+            "--env", "PYTHONDONTWRITEBYTECODE=1", "--env", "PYTHONUNBUFFERED=1",
+            "--entrypoint", "python3", image, "-c", script,
+        ]
+        result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("BROKER_MATRIX_OK", result.stdout)
+        self.assertNotIn("docker-broker-canary", result.stdout + result.stderr)
 
     @unittest.skipUnless(shutil.which("docker") or os.path.exists("/opt/homebrew/bin/docker"), "Docker CLI is unavailable")
     def test_local_digest_pinned_hermes_image_executes_real_adapter_path(self) -> None:
@@ -678,7 +818,7 @@ class G1RuntimeProcessTests(unittest.TestCase):
                 self.attestations.append(attestation)
                 return attestation
 
-            def launch(self, command, *, input_bytes, environment, max_output_bytes):
+            def launch(self, command, *, input_bytes, environment, max_output_bytes, model_call_allowance):
                 with self._count_lock:
                     self.launch_count += 1
                     self.environments.append(dict(environment))
@@ -687,6 +827,7 @@ class G1RuntimeProcessTests(unittest.TestCase):
                     input_bytes=input_bytes,
                     environment=environment,
                     max_output_bytes=max_output_bytes,
+                    model_call_allowance=model_call_allowance,
                 )
 
         runner = CountingRunner()
@@ -772,6 +913,8 @@ class G1RuntimeProcessTests(unittest.TestCase):
         captured: dict[str, object] = {}
 
         class FakeAgent:
+            session_api_calls = 2
+
             def run_conversation(self, message: str, *, system_message: str) -> dict[str, str]:
                 captured["message"] = message
                 captured["system_message"] = system_message
@@ -791,7 +934,7 @@ class G1RuntimeProcessTests(unittest.TestCase):
             agent_factory=factory,
             credential_source=Credentials(),
             enabled_toolsets=("safe",),
-        ).dispatch(snapshot, invocation, lambda: False, bodies.append)
+        ).dispatch(snapshot, invocation, lambda: False, bodies.append, model_call_allowance=3)
 
         self.assertEqual(result.kind, "completed")
         self.assertNotIn("top-secret-value", result.output_text)
@@ -799,7 +942,9 @@ class G1RuntimeProcessTests(unittest.TestCase):
         self.assertEqual(captured["kwargs"]["enabled_toolsets"], ["safe"])  # type: ignore[index]
         self.assertEqual(captured["kwargs"]["api_key"], "top-secret-value")  # type: ignore[index]
         self.assertEqual(captured["kwargs"]["max_tokens"], 100)  # type: ignore[index]
-        self.assertEqual(captured["kwargs"]["max_iterations"], 90)  # type: ignore[index]
+        self.assertEqual(captured["kwargs"]["max_iterations"], 3)  # type: ignore[index]
+        self.assertEqual(captured["kwargs"]["iteration_budget"].max_total, 3)  # type: ignore[index]
+        self.assertEqual(result.model_calls, 2)
         self.assertNotIn("top-secret-value", json.dumps(bodies))
 
     def test_hermes_adapter_fails_closed_when_measured_usage_exceeds_budget(self) -> None:
@@ -830,12 +975,28 @@ class G1RuntimeProcessTests(unittest.TestCase):
         result = HermesKernelAdapter(
             agent_factory=lambda **kwargs: FakeAgent(),
             credential_source=Credentials(),
-        ).dispatch(snapshot, invocation, lambda: False, lambda body: None)
+        ).dispatch(snapshot, invocation, lambda: False, lambda body: None, model_call_allowance=2)
 
         self.assertEqual(result.failure_code, "budget_exhausted")
         self.assertIsNotNone(result.usage)
         self.assertEqual(result.usage["inputTokens"], 2)  # type: ignore[index]
         self.assertEqual(result.usage["outputTokens"], 2)  # type: ignore[index]
+
+    def test_zero_model_call_allowance_does_not_construct_hermes(self) -> None:
+        snapshot = G1RunSnapshot.from_dict(make_snapshot())
+        invocation = G1InvocationEnvelope.from_dict(make_invocation(snapshot.to_dict()))
+        constructed = False
+
+        def factory(**kwargs: object) -> object:
+            nonlocal constructed
+            constructed = True
+            return object()
+
+        result = HermesKernelAdapter(agent_factory=factory).dispatch(
+            snapshot, invocation, lambda: False, lambda body: None, model_call_allowance=0
+        )
+        self.assertEqual(result.failure_code, "budget_exhausted")
+        self.assertFalse(constructed)
 
     def test_cumulative_budget_cannot_increase_across_invocations(self) -> None:
         snapshot = make_snapshot()
@@ -881,7 +1042,7 @@ class G1RuntimeProcessTests(unittest.TestCase):
             return object()
 
         result = HermesKernelAdapter(agent_factory=factory).dispatch(
-            snapshot, invocation, lambda: False, lambda body: None
+            snapshot, invocation, lambda: False, lambda body: None, model_call_allowance=1
         )
         self.assertEqual(result.failure_code, "invalid_continuation")
         self.assertFalse(called)

@@ -710,6 +710,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--once", action="store_true", help="accept one JSON-lines invocation (the default)")
     parser.add_argument("--g1-test-only", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--g1-production", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--model-call-allowance", type=int, default=None, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     try:
         with _ServiceFrameReader(sys.stdin) as reader:
@@ -735,7 +736,13 @@ def main(argv: list[str] | None = None) -> int:
                 raise RuntimeConfigurationError("G1 execution requires an attested supervisor mode")
             from .g1_service import serve_once_g1
 
-            return serve_once_g1(request_line, sys.stdout, production=args.g1_production)
+            return serve_once_g1(
+                request_line,
+                sys.stdout,
+                production=args.g1_production,
+                diagnostics=sys.stderr if args.g1_production else None,
+                model_call_allowance=args.model_call_allowance,
+            )
         # Parsing proves the fixed command accepts arbitrary valid envelopes,
         # but it does not authorize execution.  A real KernelPort binding must
         # be installed by the future runtime service; fail closed otherwise.

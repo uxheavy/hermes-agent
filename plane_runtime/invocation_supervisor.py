@@ -1415,6 +1415,8 @@ class _SubprocessDockerProcess:
             reaped = self._terminate_and_reap()
             if capture is not None:
                 object.__setattr__(capture, "reaped", reaped)
+                if capture.returncode is None and reaped:
+                    object.__setattr__(capture, "returncode", self._process.returncode)
 
     def cleanup(self) -> bool:
         """Terminate and reap an attached process when collection never began."""
@@ -4265,6 +4267,7 @@ class G1ProcessCapture:
     lease_expired: bool = False
     output_exceeded: bool = False
     reaped: bool = True
+    model_calls: int | None = None
 
 
 class G1RuntimeProcess(Protocol):
@@ -4295,6 +4298,7 @@ class G1RuntimeRunner(Protocol):
         input_bytes: bytes,
         environment: Mapping[str, str],
         max_output_bytes: int,
+        model_call_allowance: int,
     ) -> G1RuntimeProcess:
         ...
 
@@ -4343,12 +4347,13 @@ class _G1LocalProcess:
         return G1ProcessCapture(
             capture.returncode,
             capture.stdout,
-            capture.stderr,
+            b"",
             timed_out=capture.timed_out,
             cancelled=capture.cancelled,
             lease_expired=capture.lease_expired,
             output_exceeded=capture.output_exceeded,
             reaped=capture.reaped,
+            model_calls=0,
         )
 
     def cleanup(self) -> bool:
@@ -4387,7 +4392,9 @@ class G1LocalTestRunner:
         input_bytes: bytes,
         environment: Mapping[str, str],
         max_output_bytes: int,
+        model_call_allowance: int,
     ) -> G1RuntimeProcess:
+        del model_call_allowance
         if tuple(command) != _G1_LOCAL_COMMAND or dict(environment) != build_invocation_env():
             raise RuntimeConfigurationError("G1 local runner controls are not fixed")
         try:
@@ -4429,13 +4436,31 @@ class G1LocalTestRunner:
         return CleanupReport(invocation_name, False, False, True, (), reaped)
 
 
+def _dispatch_control_bytes(model_call_allowance: int) -> bytearray:
+    if isinstance(model_call_allowance, bool) or not isinstance(model_call_allowance, int) or model_call_allowance < 0 or model_call_allowance > 4096:
+        raise RuntimeConfigurationError("G1 model-call allowance is invalid")
+    payload = json.dumps(
+        {
+            "modelCallAllowance": model_call_allowance,
+            "protocol": "plane.agent-runtime/dispatch-control/v1",
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8") + b"\n"
+    if len(payload) > 4096:
+        raise RuntimeConfigurationError("G1 dispatch control frame is too large")
+    return bytearray(payload)
+
+
 def _credential_control_bytes(credentials: Mapping[str, str]) -> bytearray:
     payload = json.dumps(
         {
-            "protocol": "plane.agent-runtime/credential-control/v1",
             "credentials": dict(credentials),
+            "protocol": "plane.agent-runtime/credential-control/v1",
         },
         ensure_ascii=False,
+        sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8") + b"\n"
     if len(payload) > 16 * 1024:
@@ -4443,13 +4468,66 @@ def _credential_control_bytes(credentials: Mapping[str, str]) -> bytearray:
     return bytearray(payload)
 
 
+def _parse_model_usage(stderr: bytes) -> int | None:
+    """Accept only the bootstrap's exact, non-secret internal usage frame."""
+    if not stderr or len(stderr) > 16 * 1024 or not stderr.endswith(b"\n"):
+        return None
+
+
+def _strict_wire_object(raw: bytes, expected: set[str], name: str) -> dict[str, object]:
+    if len(raw) > 4096 or raw != raw.strip():
+        raise ValueError(f"{name} is not canonical")
+
+    def pairs(items: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in items:
+            if key in result:
+                raise ValueError(f"{name} contains duplicate keys")
+            result[key] = value
+        return result
+
+    value = json.loads(raw.decode("utf-8"), object_pairs_hook=pairs)
+    if not isinstance(value, dict) or set(value) != expected:
+        raise ValueError(f"{name} has an invalid key set")
+    if json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8") != raw:
+        raise ValueError(f"{name} is not canonical")
+    return value
+    raw = stderr[:-1]
+    if raw != raw.strip():
+        return None
+
+    def pairs(items: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in items:
+            if key in result:
+                raise ValueError("duplicate usage key")
+            result[key] = value
+        return result
+
+    try:
+        value = json.loads(raw.decode("utf-8"), object_pairs_hook=pairs)
+        if not isinstance(value, dict) or set(value) != {"modelCalls", "protocol"}:
+            return None
+        if value.get("protocol") != "plane.agent-runtime/internal-usage/v1":
+            return None
+        calls = value.get("modelCalls")
+        if isinstance(calls, bool) or not isinstance(calls, int) or calls < 0:
+            return None
+        if json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8") != raw:
+            return None
+        return calls
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        return None
+
+
 class _G1ProductionProcess:
     """Production child view that consumes a private pre-request control frame."""
 
-    def __init__(self, process: _SubprocessDockerProcess, credentials: Mapping[str, str], max_output_bytes: int) -> None:
+    def __init__(self, process: _SubprocessDockerProcess, credentials: Mapping[str, str], max_output_bytes: int, model_call_allowance: int) -> None:
         self._process = process
         self._credentials = dict(credentials)
         self._max_output_bytes = max_output_bytes
+        self._model_call_allowance = model_call_allowance
 
     def collect(
         self,
@@ -4459,7 +4537,11 @@ class _G1ProductionProcess:
         is_cancelled: Callable[[], bool],
         lease_valid: Callable[[], bool],
     ) -> G1ProcessCapture:
-        control = _credential_control_bytes(self._credentials)
+        control = _dispatch_control_bytes(self._model_call_allowance)
+        credential_control = _credential_control_bytes(self._credentials)
+        control.extend(credential_control)
+        for index in range(len(credential_control)):
+            credential_control[index] = 0
         control.extend(input_bytes)
         try:
             capture = self._process.collect(
@@ -4477,12 +4559,13 @@ class _G1ProductionProcess:
         return G1ProcessCapture(
             capture.returncode,
             capture.stdout,
-            capture.stderr,
+            b"",
             timed_out=capture.timed_out,
             cancelled=capture.cancelled,
             lease_expired=capture.lease_expired,
             output_exceeded=capture.output_exceeded,
             reaped=capture.reaped,
+            model_calls=_parse_model_usage(capture.stderr),
         )
 
     def cleanup(self) -> bool:
@@ -4551,27 +4634,42 @@ class HostCredentialBroker:
             with channel:
                 channel.settimeout(2.0)
                 raw = bytearray()
-                while len(raw) <= 4096 and not raw.endswith(b"\n"):
-                    chunk = channel.recv(min(1024, 4097 - len(raw)))
-                    if not chunk:
-                        break
-                    raw.extend(chunk)
                 try:
-                    request = json.loads(bytes(raw).rstrip(b"\n"))
+                    while len(raw) <= 4096 and not raw.endswith(b"\n"):
+                        chunk = channel.recv(min(1024, 4097 - len(raw)))
+                        if not chunk:
+                            break
+                        raw.extend(chunk)
+                except (OSError, socket.timeout):
+                    raw.clear()
+                try:
+                    if len(raw) > 4096 or not raw.endswith(b"\n"):
+                        raise ValueError("invalid broker request framing")
+                    request = _strict_wire_object(bytes(raw[:-1]), {"provider", "protocol"}, "credential broker request")
                     if (
-                        not isinstance(request, dict)
-                        or request.get("protocol") != "plane.agent-runtime/credentials/v1"
+                        request.get("protocol") != "plane.agent-runtime/credentials/v1"
                         or not isinstance(request.get("provider"), str)
+                        or not request["provider"]
                         or (self._allowed_provider is not None and request["provider"] != self._allowed_provider)
                     ):
                         raise ValueError("invalid broker request")
                     credentials = dict(self._source.resolve(request["provider"]))
-                    if any(not isinstance(key, str) or not isinstance(value, str) for key, value in credentials.items()):
+                    if len(credentials) > 16 or any(
+                        not isinstance(key, str)
+                        or not isinstance(value, str)
+                        or not key
+                        or not value
+                        or _CONTROL.search(key)
+                        or _CONTROL.search(value)
+                        or len(key.encode("utf-8")) > 128
+                        or len(value.encode("utf-8")) > 16 * 1024
+                        for key, value in credentials.items()
+                    ):
                         raise ValueError("invalid broker credentials")
                     response = {"protocol": "plane.agent-runtime/credentials/v1", "credentials": credentials}
                 except Exception:
                     response = {"protocol": "plane.agent-runtime/credentials/v1", "credentials": {}}
-                channel.sendall(json.dumps(response, separators=(",", ":")).encode("utf-8") + b"\n")
+                channel.sendall(json.dumps(response, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8") + b"\n")
 
     def allow_provider(self, provider: str) -> None:
         if not isinstance(provider, str) or not provider:
@@ -4679,6 +4777,7 @@ class ProductionG1RuntimeRunner:
         input_bytes: bytes,
         environment: Mapping[str, str],
         max_output_bytes: int,
+        model_call_allowance: int,
     ) -> G1RuntimeProcess:
         if tuple(command) != self.command or dict(environment) != build_invocation_env():
             raise RuntimeConfigurationError("production G1 launch controls are not fixed")
@@ -4696,7 +4795,12 @@ class ProductionG1RuntimeRunner:
         if argv is None:
             raise RuntimeConfigurationError("production G1 launch lacks an attested request")
         process = self._docker.launch(argv, client_env=dict(_DOCKER_CLIENT_ENV), input_bytes=input_bytes)
-        return _G1ProductionProcess(process, credentials, min(max_output_bytes, self._policy.stdout_limit_bytes))
+        return _G1ProductionProcess(
+            process,
+            credentials,
+            min(max_output_bytes, self._policy.stdout_limit_bytes),
+            model_call_allowance,
+        )
 
     def cleanup(self, invocation_name: str) -> CleanupReport:
         self._argv_by_name.pop(invocation_name, None)
@@ -4742,6 +4846,7 @@ class G1InvocationSupervisor:
         clock: Callable[[], float] = time.monotonic,
         ledger_path: str | os.PathLike[str] | None = None,
         max_calls: int = 128,
+        max_model_calls: int = 128,
     ) -> None:
         if not isinstance(hard_timeout_seconds, (int, float)) or not math.isfinite(float(hard_timeout_seconds)) or hard_timeout_seconds <= 0:
             raise ContractError("G1 hard timeout must be positive and finite")
@@ -4751,10 +4856,12 @@ class G1InvocationSupervisor:
         self._retention_authority = _RETENTION_AUTHORITY_PRODUCTION_CONSTRUCTOR()
         self._retention_finalizer = weakref.finalize(self, self._retention_authority.close)
         self._ledger_temporary_directory = None
+        if ledger_path is None and not isinstance(self.runner, G1LocalTestRunner):
+            raise RuntimeConfigurationError("production G1 requires an explicit durable ledger path")
         if ledger_path is None:
             self._ledger_temporary_directory = tempfile.TemporaryDirectory(prefix="plane-g1-ledger-")
             ledger_path = os.path.join(self._ledger_temporary_directory.name, "ledger.sqlite3")
-        self._ledger = G1RuntimeLedger(ledger_path, max_calls=max_calls)
+        self._ledger = G1RuntimeLedger(ledger_path, max_calls=max_calls, max_model_calls=max_model_calls)
         self._command = tuple(getattr(self.runner, "command", _G1_LOCAL_COMMAND))
 
     def close(self) -> None:
@@ -4851,6 +4958,8 @@ class G1InvocationSupervisor:
         lease_valid: Callable[[], bool],
     ) -> tuple[str, ...]:
         key = (snapshot.run_id, invocation.invocation_id)
+        policy = snapshot.raw["runtimePolicy"]
+        max_output = min(512 * 1024, max(64 * 1024, int(policy["maxEventPayloadBytes"]) * 128))
         claim = self._ledger.claim(
             run_id=snapshot.run_id,
             invocation_id=invocation.invocation_id,
@@ -4858,6 +4967,7 @@ class G1InvocationSupervisor:
             snapshot_digest=snapshot.digest,
             total_budget=snapshot.total_budget,
             remaining_budget=invocation.remaining_budget,
+            retained_bytes_limit=max_output,
         )
         if claim.state == "conflict":
             raise G1ContractError("changed replay conflicts with the retained invocation")
@@ -4878,27 +4988,44 @@ class G1InvocationSupervisor:
 
         started_at = time.monotonic()
 
-        def finish(frames: tuple[str, ...]) -> tuple[str, ...]:
+        def finish(
+            frames: tuple[str, ...],
+            *,
+            usage: Mapping[str, int] | None = None,
+            usage_valid: bool = False,
+            model_calls: int | None = None,
+        ) -> tuple[str, ...]:
             duration_ms = max(0, int((time.monotonic() - started_at) * 1000))
-            return self._retain_g1(snapshot, invocation, fingerprint, frames, host_duration_ms=duration_ms)
+            retained_bytes = sum(len(frame.encode("utf-8")) + 1 for frame in frames)
+            return self._retain_g1(
+                snapshot,
+                invocation,
+                fingerprint,
+                frames,
+                host_duration_ms=duration_ms,
+                usage=usage,
+                usage_valid=usage_valid,
+                model_calls=model_calls,
+                retained_bytes=retained_bytes,
+            )
+
+        zero_usage = {"inputTokens": 0, "outputTokens": 0, "durationMs": 0}
 
         if self._cancelled(cancellation):
             frames = _g1_failure_frames(snapshot, invocation, kind="cancelled", code="cancelled", message="runtime cancellation was requested")
-            return finish(frames)
+            return finish(frames, usage=zero_usage, usage_valid=True, model_calls=0)
         if not self._lease_is_valid(lease_valid):
             frames = _g1_failure_frames(snapshot, invocation, kind="failed", code="lease_expired", message="invocation lease is no longer valid")
-            return finish(frames)
+            return finish(frames, usage=zero_usage, usage_valid=True, model_calls=0)
         lease_remaining = self._lease_remaining(invocation)
         remaining_duration = invocation.remaining_budget["durationMs"] / 1000.0
         if lease_remaining <= 0:
             frames = _g1_failure_frames(snapshot, invocation, kind="failed", code="lease_expired", message="invocation lease is no longer valid")
-            return finish(frames)
-        if remaining_duration <= 0 or invocation.remaining_budget["inputTokens"] <= 0 or invocation.remaining_budget["outputTokens"] <= 0:
+            return finish(frames, usage=zero_usage, usage_valid=True, model_calls=0)
+        if remaining_duration <= 0 or invocation.remaining_budget["inputTokens"] <= 0 or invocation.remaining_budget["outputTokens"] <= 0 or claim.model_call_allowance == 0:
             frames = _g1_failure_frames(snapshot, invocation, kind="failed", code="budget_exhausted", message="cumulative runtime budget is exhausted")
-            return finish(frames)
+            return finish(frames, usage=zero_usage, usage_valid=True, model_calls=0)
         request = canonical_json_bytes({"run": snapshot.to_dict(), "invocation": invocation.to_dict()}) + b"\n"
-        policy = snapshot.raw["runtimePolicy"]
-        max_output = min(512 * 1024, max(64 * 1024, int(policy["maxEventPayloadBytes"]) * 128))
         command = self._command
         attestation = self.runner.attest_invocation(command, request_fingerprint=fingerprint)
         expected_classification = "production" if command == _G1_PRODUCTION_COMMAND else "test"
@@ -4911,6 +5038,7 @@ class G1InvocationSupervisor:
                 input_bytes=request,
                 environment=build_invocation_env(),
                 max_output_bytes=max_output,
+                model_call_allowance=claim.model_call_allowance,
             )
         except Exception:
             try:
@@ -4955,12 +5083,29 @@ class G1InvocationSupervisor:
                     frames_raw,
                     snapshot.to_dict(),
                     invocation.to_dict(),
-                    max_stream_bytes=max_output,
+                    max_stream_bytes=min(max_output, claim.retained_bytes_allowance),
                 )
                 frames = tuple(json.dumps(frame, ensure_ascii=False, sort_keys=True, separators=(",", ":")) for frame in frames_raw)
+                usage_events = [
+                    frame.get("body", {}).get("usage")
+                    for frame in frames_raw
+                    if isinstance(frame.get("body"), dict) and frame["body"].get("kind") == "usage_observed"
+                ]
+                usage = usage_events[0] if len(usage_events) == 1 and isinstance(usage_events[0], dict) else None
+                if usage is None or set(usage) != {"inputTokens", "outputTokens", "durationMs"} or any(
+                    isinstance(usage[key], bool) or not isinstance(usage[key], int) or usage[key] < 0
+                    for key in ("inputTokens", "outputTokens", "durationMs")
+                ):
+                    usage = None
+                return finish(
+                    frames,
+                    usage=usage,
+                    usage_valid=usage is not None,
+                    model_calls=capture.model_calls,
+                )
             except Exception:
                 frames = _g1_failure_frames(snapshot, invocation, kind="failed", code="runtime_error", message="runtime output was malformed or exceeded its contract")
-        return finish(frames)
+        return finish(frames, model_calls=capture.model_calls)
 
     def _retain_g1(
         self,
@@ -4970,6 +5115,10 @@ class G1InvocationSupervisor:
         frames: tuple[str, ...],
         *,
         host_duration_ms: int,
+        usage: Mapping[str, int] | None,
+        usage_valid: bool,
+        model_calls: int | None,
+        retained_bytes: int,
     ) -> tuple[str, ...]:
         key = (snapshot.run_id, invocation.invocation_id)
         value = {
@@ -4984,8 +5133,11 @@ class G1InvocationSupervisor:
                 invocation_id=invocation.invocation_id,
                 request_fingerprint=fingerprint,
                 frames=frames,
-                requested_budget=invocation.remaining_budget,
                 host_duration_ms=host_duration_ms,
+                usage=usage,
+                usage_valid=usage_valid,
+                model_calls=model_calls,
+                retained_bytes=retained_bytes,
             )
         except G1LedgerError as exc:
             raise RuntimeConfigurationError("G1 result was not durably retained") from exc

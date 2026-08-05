@@ -19,6 +19,21 @@ from .g1_contract import (
 from .hermes_adapter import DeterministicKernelAdapter, HermesKernelAdapter, HermesKernelResult, UnixSocketCredentialSource
 
 
+_MODEL_USAGE_PROTOCOL = "plane.agent-runtime/internal-usage/v1"
+
+
+def _write_model_usage(diagnostics: TextIO | None, model_calls: int | None) -> None:
+    if diagnostics is None or isinstance(model_calls, bool) or not isinstance(model_calls, int) or model_calls < 0:
+        return
+    diagnostics.write(json.dumps(
+        {"modelCalls": model_calls, "protocol": _MODEL_USAGE_PROTOCOL},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ) + "\n")
+    diagnostics.flush()
+
+
 def _runtime_suffix(invocation_id: str) -> str:
     return hashlib.sha256(invocation_id.encode("utf-8")).hexdigest()[:16]
 
@@ -84,7 +99,14 @@ def _terminal_failure(
     )
 
 
-def serve_once_g1(request_line: str, output: TextIO, *, production: bool = False) -> int:
+def serve_once_g1(
+    request_line: str,
+    output: TextIO,
+    *,
+    production: bool = False,
+    diagnostics: TextIO | None = None,
+    model_call_allowance: int | None = None,
+) -> int:
     """Consume exactly one G1 request and write direct event/exit frames.
 
     The child owns no Plane state.  It validates the immutable inputs, invokes
@@ -114,13 +136,19 @@ def serve_once_g1(request_line: str, output: TextIO, *, production: bool = False
             result = _failure_result("lease_expired", "invocation lease is no longer valid")
         elif any(value == 0 for value in invocation.remaining_budget.values()):
             result = _failure_result("budget_exhausted", "cumulative invocation budget is exhausted")
+        elif production and (model_call_allowance is None or isinstance(model_call_allowance, bool) or not isinstance(model_call_allowance, int) or model_call_allowance < 0):
+            result = _failure_result("runtime_error", "trusted model-call allowance is required")
         elif snapshot.adapter_name == "deterministic-test-adapter" and not production:
             result = DeterministicKernelAdapter().dispatch(snapshot, invocation, lambda: False, emit_body)
         elif snapshot.adapter_name == "deterministic-test-adapter" and production:
             result = _failure_result("runtime_error", "deterministic adapter is test-only")
         else:
             result = HermesKernelAdapter(credential_source=UnixSocketCredentialSource()).dispatch(
-                snapshot, invocation, lambda: False, emit_body
+                snapshot,
+                invocation,
+                lambda: False,
+                emit_body,
+                model_call_allowance=model_call_allowance,
             )
     except Exception:
         result = _failure_result("runtime_error", "Hermes runtime execution failed", retryable=True)
@@ -161,6 +189,7 @@ def serve_once_g1(request_line: str, output: TextIO, *, production: bool = False
     for frame in all_frames:
         output.write(json.dumps(frame, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n")
     output.flush()
+    _write_model_usage(diagnostics, result.model_calls)
     return 0
 
 

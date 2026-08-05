@@ -18,6 +18,56 @@ from .g1_contract import (
 )
 
 
+_CREDENTIAL_PROTOCOL = "plane.agent-runtime/credentials/v1"
+_MAX_CREDENTIALS = 16
+_MAX_CREDENTIAL_KEY_BYTES = 128
+_MAX_CREDENTIAL_VALUE_BYTES = 16 * 1024
+
+
+def _strict_json_object(raw: bytes, expected: set[str], name: str) -> dict[str, Any]:
+    """Parse one canonical object and reject duplicate/unknown/trailing data."""
+    if raw != raw.strip() or len(raw) > _MAX_CREDENTIAL_VALUE_BYTES:
+        raise G1ContractError(f"{name} is not canonical")
+
+    def pairs(items: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in items:
+            if key in result:
+                raise G1ContractError(f"{name} contains duplicate keys")
+            result[key] = value
+        return result
+
+    try:
+        value = json.loads(raw.decode("utf-8"), object_pairs_hook=pairs)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise G1ContractError(f"{name} is malformed") from exc
+    if not isinstance(value, dict) or set(value) != expected:
+        raise G1ContractError(f"{name} has an invalid key set")
+    canonical = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    if canonical != raw:
+        raise G1ContractError(f"{name} is not canonical")
+    return value
+
+
+def _strict_credentials(value: object) -> dict[str, str]:
+    if not isinstance(value, dict) or len(value) > _MAX_CREDENTIALS:
+        raise G1ContractError("credential broker credentials are invalid")
+    credentials: dict[str, str] = {}
+    for key, item in value.items():
+        if (
+            not isinstance(key, str)
+            or not isinstance(item, str)
+            or not key
+            or not item
+            or len(key.encode("utf-8")) > _MAX_CREDENTIAL_KEY_BYTES
+            or len(item.encode("utf-8")) > _MAX_CREDENTIAL_VALUE_BYTES
+            or any(ord(char) < 0x20 or ord(char) == 0x7F for char in key + item)
+        ):
+            raise G1ContractError("credential broker credentials are invalid")
+        credentials[key] = item
+    return credentials
+
+
 class HermesCredentialSource(Protocol):
     """Trusted host source; credentials never come from a runtime envelope."""
 
@@ -55,7 +105,12 @@ class UnixSocketCredentialSource:
     timeout_seconds: float = 2.0
 
     def resolve(self, provider: str) -> Mapping[str, str]:
-        request = json.dumps({"protocol": "plane.agent-runtime/credentials/v1", "provider": provider}, separators=(",", ":")).encode("utf-8") + b"\n"
+        request = json.dumps(
+            {"protocol": _CREDENTIAL_PROTOCOL, "provider": provider},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8") + b"\n"
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as channel:
             channel.settimeout(self.timeout_seconds)
             channel.connect(self.path)
@@ -70,13 +125,10 @@ class UnixSocketCredentialSource:
                     break
         if not response.endswith(b"\n"):
             raise G1ContractError("credential broker response is incomplete")
-        value = json.loads(response[:-1])
-        if not isinstance(value, dict) or value.get("protocol") != "plane.agent-runtime/credentials/v1":
-            raise G1ContractError("credential broker response is invalid")
-        credentials = value.get("credentials")
-        if not isinstance(credentials, dict) or any(not isinstance(k, str) or not isinstance(v, str) for k, v in credentials.items()):
-            raise G1ContractError("credential broker credentials are invalid")
-        return credentials
+        value = _strict_json_object(response[:-1], {"credentials", "protocol"}, "credential broker response")
+        if value["protocol"] != _CREDENTIAL_PROTOCOL:
+            raise G1ContractError("credential broker response protocol is invalid")
+        return _strict_credentials(value["credentials"])
 
 
 class HermesAuthStoreCredentialSource:
@@ -104,6 +156,7 @@ class HermesKernelResult:
     failure_message: str | None = None
     retryable: bool = True
     usage: Mapping[str, int] | None = None
+    model_calls: int | None = None
 
 
 def redact_runtime_text(value: str, secrets: Sequence[str]) -> str:
@@ -166,6 +219,8 @@ class HermesKernelAdapter:
         invocation: G1InvocationEnvelope,
         cancellation: Callable[[], bool],
         emit_body: Callable[[Mapping[str, Any]], None],
+        *,
+        model_call_allowance: int | None = None,
     ) -> HermesKernelResult:
         if cancellation():
             return HermesKernelResult(
@@ -184,6 +239,21 @@ class HermesKernelAdapter:
                     failure_message="continuation checkpoint is not available to the trusted host",
                     retryable=False,
                 )
+        if model_call_allowance is None or isinstance(model_call_allowance, bool) or not isinstance(model_call_allowance, int) or model_call_allowance < 0:
+            return HermesKernelResult(
+                kind="failed",
+                failure_code="runtime_error",
+                failure_message="trusted model-call allowance is required",
+                retryable=False,
+            )
+        if model_call_allowance == 0:
+            return HermesKernelResult(
+                kind="failed",
+                failure_code="budget_exhausted",
+                failure_message="model-call allowance is exhausted",
+                retryable=False,
+                model_calls=0,
+            )
             try:
                 prefill_messages = self._checkpoint_source.load(str(checkpoint_ref))
             except Exception:
@@ -248,7 +318,7 @@ class HermesKernelAdapter:
             # This is the model-dispatch output ceiling.  IterationBudget is
             # only a loop safeguard; it is not the token-budget authority.
             "max_tokens": max(1, int(invocation.remaining_budget["outputTokens"])),
-            "max_iterations": min(90, max(1, int(invocation.remaining_budget["outputTokens"]))),
+            "max_iterations": model_call_allowance,
             "session_id": invocation.invocation_id,
             "enabled_toolsets": list(self._enabled_toolsets),
             "quiet_mode": True,
@@ -263,7 +333,7 @@ class HermesKernelAdapter:
             from agent.iteration_budget import IterationBudget
 
             agent_kwargs["iteration_budget"] = IterationBudget(
-                max(1, min(90, int(invocation.remaining_budget["outputTokens"])))
+                model_call_allowance
             )
         except Exception:
             return HermesKernelResult(
@@ -282,6 +352,7 @@ class HermesKernelAdapter:
             agent_kwargs["prefill_messages"] = [dict(message) for message in prefill_messages]
 
         started_at = time.monotonic()
+        agent: Any | None = None
         try:
             agent = self._agent_factory(**agent_kwargs)
             prompt = (
@@ -298,6 +369,7 @@ class HermesKernelAdapter:
                 failure_code="runtime_error",
                 failure_message=message or "Hermes invocation failed",
                 retryable=True,
+                model_calls=self._observed_model_calls(agent, None),
             )
 
         if cancellation():
@@ -309,11 +381,24 @@ class HermesKernelAdapter:
             )
         if not isinstance(result, Mapping):
             raise G1ContractError("Hermes adapter returned a non-object result")
+        usage_values = (
+            getattr(agent, "session_input_tokens", 0),
+            getattr(agent, "session_output_tokens", 0),
+        )
+        if any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in usage_values):
+            return HermesKernelResult(
+                kind="failed",
+                failure_code="runtime_error",
+                failure_message="Hermes usage accounting was invalid",
+                retryable=False,
+                model_calls=self._observed_model_calls(agent, result),
+            )
         usage = {
-            "inputTokens": max(0, int(getattr(agent, "session_input_tokens", 0) or 0)),
-            "outputTokens": max(0, int(getattr(agent, "session_output_tokens", 0) or 0)),
+            "inputTokens": int(usage_values[0]),
+            "outputTokens": int(usage_values[1]),
             "durationMs": max(0, int((time.monotonic() - started_at) * 1000)),
         }
+        model_calls = self._observed_model_calls(agent, result)
         if any(usage[name] > invocation.remaining_budget[name] for name in usage):
             return HermesKernelResult(
                 kind="failed",
@@ -321,6 +406,7 @@ class HermesKernelAdapter:
                 failure_message="Hermes usage exceeded the cumulative invocation budget",
                 retryable=False,
                 usage=usage,
+                model_calls=model_calls,
             )
         if result.get("interrupted") is True:
             return HermesKernelResult(
@@ -328,6 +414,7 @@ class HermesKernelAdapter:
                 failure_code="cancelled",
                 failure_message="Hermes invocation was interrupted",
                 retryable=False,
+                model_calls=model_calls,
             )
         if result.get("failed") is True:
             return HermesKernelResult(
@@ -339,6 +426,7 @@ class HermesKernelAdapter:
                 ),
                 retryable=True,
                 usage=usage,
+                model_calls=model_calls,
             )
         question = result.get("input_request") or result.get("waiting_for_input")
         if isinstance(question, str) and question:
@@ -346,6 +434,7 @@ class HermesKernelAdapter:
                 kind="waiting_for_input",
                 question=bound_runtime_text(redact_runtime_text(question, credential_values), event_limit),
                 usage=usage,
+                model_calls=model_calls,
             )
         output = result.get("final_response")
         if output is None:
@@ -368,7 +457,16 @@ class HermesKernelAdapter:
                 "publication": {"action": "observation_only"},
             }
         )
-        return HermesKernelResult(kind="completed", output_text=output_text, usage=usage)
+        return HermesKernelResult(kind="completed", output_text=output_text, usage=usage, model_calls=model_calls)
+
+    @staticmethod
+    def _observed_model_calls(agent: Any | None, result: Mapping[str, Any] | None) -> int | None:
+        """Read Hermes' narrow call counter; never infer calls from tokens."""
+        for source in (agent, result):
+            value = getattr(source, "session_api_calls", None) if source is agent else (source or {}).get("api_calls")
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                return value
+        return None
 
 
 class DeterministicKernelAdapter:
@@ -408,7 +506,7 @@ class DeterministicKernelAdapter:
                 "publication": {"action": "observation_only"},
             }
         )
-        return HermesKernelResult("completed", output_text=output)
+        return HermesKernelResult("completed", output_text=output, model_calls=0)
 
 
 __all__ = [
