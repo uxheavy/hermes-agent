@@ -113,8 +113,12 @@ performs canonical binding and keyed-integrity checks atomically, converges
 same replays, rejects conflicting replays, and returns fresh immutable
 non-production value views. Killing or replacing the authority fails closed.
 This state is ephemeral Hermes execution state, not Plane product or database
-authority. Callers should invoke `InvocationSupervisor.close()` explicitly;
-the bounded finalizer is only a cleanup fallback.
+authority. The parent authenticates the exact local authority source and
+executable with a nonce-bound challenge before accepting responses; every
+request has a bounded incremental frame deadline and sequence-correlated
+authenticated response. Callers should invoke `InvocationSupervisor.close()`
+explicitly; the structural finalizer owns the original process resources and
+reaps them if public handles are replaced or the supervisor is abandoned.
 Overflow is returned as supervisor action required without inserting past the
 cap. Cleanup proves deterministic container absence after stop/kill/remove-volume
 attempts.

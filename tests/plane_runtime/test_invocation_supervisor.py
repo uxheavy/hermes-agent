@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import hashlib
+import gc
 import io
 import json
 import math
+import os
 import subprocess
 import sys
 import threading
@@ -650,13 +652,15 @@ class SupervisorTests(unittest.TestCase):
             port=port,
         )
         authority = supervisor._retention_authority
+        original_process = authority._process
         object.__setattr__(supervisor, "_retention_authority", object())
         result = supervisor.run_once(self.snapshot, self.invocation)
-        authority.close()
+        supervisor.close()
         self.assertEqual(result.status, "supervisor_action_required")
         self.assertIn("retained_result_invalid", result.evidence)
         self.assertEqual(runner.launch_calls, 0)
         self.assertEqual(port.proposals, [])
+        self.assertEqual(original_process.returncode, 0)
 
     def test_parent_authority_handle_replacements_fail_closed_and_reap_original(self) -> None:
         before_port = FixtureTerminalReconciliationPort()
@@ -689,6 +693,58 @@ class SupervisorTests(unittest.TestCase):
         self.assertEqual(len(after_port.proposals), 1)
         self.assertIsNotNone(after_process.poll())
 
+    def test_all_reachable_authority_handles_replace_fail_closed_and_reap_original(self) -> None:
+        supervisor, runner = self.make_supervisor(b"")
+        authority = supervisor._retention_authority
+        original_process = authority._process
+        replacements = {
+            "_process": object(),
+            "_process_identity": object(),
+            "_stdin": object(),
+            "_stdin_identity": object(),
+            "_stdout": object(),
+            "_stdout_identity": object(),
+            "_stdin_fd": -1,
+            "_stdout_fd": -1,
+            "_stdin_type": object,
+            "_stdout_type": object,
+            "_lock": object(),
+            "_closed": False,
+        }
+        for name, value in replacements.items():
+            object.__setattr__(authority, name, value)
+        result = supervisor.run_once(self.snapshot, self.invocation)
+        supervisor.close()
+        self.assertEqual(result.status, "supervisor_action_required")
+        self.assertEqual(runner.launch_calls, 0)
+        self.assertIsNotNone(original_process.poll())
+
+        after, after_runner = self.make_supervisor(
+            proposal_output(self.snapshot, self.invocation),
+        )
+        self.assertEqual(after.run_once(self.snapshot, self.invocation).status, "completed")
+        after_authority = after._retention_authority
+        after_process = after_authority._process
+        for name, value in replacements.items():
+            object.__setattr__(after_authority, name, value)
+        after_result = after.run_once(self.snapshot, self.invocation)
+        after.close()
+        self.assertEqual(after_result.status, "supervisor_action_required")
+        self.assertEqual(after_runner.launch_calls, 1)
+        self.assertIsNotNone(after_process.poll())
+
+    def test_post_construction_transport_helper_replacement_is_ignored_by_endpoint(self) -> None:
+        authority = supervisor_module._RetentionAuthority()
+        try:
+            with patch.object(
+                supervisor_module,
+                "_retention_read_frame",
+                side_effect=AssertionError("replaceable reader was called"),
+            ):
+                self.assertEqual(authority.count_results(), 0)
+        finally:
+            authority.close()
+
     def test_authority_death_after_terminalization_fails_closed(self) -> None:
         port = FixtureTerminalReconciliationPort()
         supervisor, runner = self.make_supervisor(
@@ -709,9 +765,141 @@ class SupervisorTests(unittest.TestCase):
     def test_explicit_close_reaps_authority_and_is_idempotent(self) -> None:
         supervisor, _runner = self.make_supervisor(b"")
         authority_process = supervisor._retention_authority._process
+        started = time.monotonic()
         supervisor.close()
+        elapsed = time.monotonic() - started
         supervisor.close()
         self.assertIsNotNone(authority_process.poll())
+        self.assertEqual(authority_process.returncode, 0)
+        self.assertLess(elapsed, 1.0)
+
+    def test_deadline_reader_rejects_stall_oversize_eof_and_wrong_id(self) -> None:
+        def read_from_peer(payload: bytes, *, limit: int, delay: float = 0.0) -> None:
+            read_fd, write_fd = os.pipe()
+            os.set_blocking(read_fd, False)
+
+            def writer() -> None:
+                try:
+                    os.write(write_fd, payload)
+                    if delay:
+                        time.sleep(delay)
+                finally:
+                    os.close(write_fd)
+
+            thread = threading.Thread(target=writer)
+            thread.start()
+            try:
+                with self.assertRaises(Exception):
+                    supervisor_module._retention_read_frame(
+                        read_fd,
+                        time.monotonic() + 0.05,
+                        limit,
+                    )
+            finally:
+                os.close(read_fd)
+                thread.join(timeout=1)
+                self.assertFalse(thread.is_alive())
+
+        read_from_peer(b"{", limit=128, delay=0.2)
+        read_from_peer(b"x" * 129, limit=128)
+        read_from_peer(b"{", limit=128)
+
+        key = b"retention-test-key"
+        response_without_mac = {
+            "protocol": supervisor_module._RETENTION_PROTOCOL,
+            "status": "missing",
+            "record": "result",
+            "requestId": 1,
+            "runId": "run:one",
+            "invocationId": "invocation:one",
+        }
+        response = {
+            **response_without_mac,
+            "mac": supervisor_module._retention_message_mac(key, response_without_mac),
+        }
+        with self.assertRaises(supervisor_module.RuntimeConfigurationError):
+            supervisor_module._retention_decode_response(
+                json.dumps(response, sort_keys=True, separators=(",", ":")).encode() + b"\n",
+                request={
+                    "op": "read",
+                    "record": "result",
+                    "runId": "run:one",
+                    "invocationId": "invocation:one",
+                },
+                request_id=2,
+                session_key=key,
+            )
+
+    def test_spawn_seam_replacement_fails_closed_before_ordinary_process_launch(self) -> None:
+        launched = False
+
+        def substituted_popen(*args, **kwargs):
+            nonlocal launched
+            launched = True
+            return supervisor_module._RETENTION_POPEN(*args, **kwargs)
+
+        with patch.object(supervisor_module.subprocess, "Popen", substituted_popen):
+            with self.assertRaises(supervisor_module.RuntimeConfigurationError):
+                supervisor_module._RetentionAuthority()
+        self.assertFalse(launched)
+
+    def test_source_executable_and_command_replacements_fail_closed_before_launch(self) -> None:
+        replacements = (
+            (supervisor_module.sys, "executable", "/tmp/ordinary-python"),
+            (supervisor_module, "_RETENTION_MODULE_NAME", "ordinary_module"),
+            (supervisor_module, "_RETENTION_SOURCE_PATH", "/tmp/ordinary-source.py"),
+            (supervisor_module, "_RETENTION_SOURCE_DIGEST", "0" * 64),
+        )
+        for target, name, value in replacements:
+            with self.subTest(name=name), patch.object(target, name, value):
+                with self.assertRaises(supervisor_module.RuntimeConfigurationError):
+                    supervisor_module._RetentionAuthority()
+
+    def test_structural_authority_finalizer_reaps_after_handle_replacement(self) -> None:
+        authority = supervisor_module._RetentionAuthority()
+        process = authority._process
+        object.__setattr__(authority, "_process", object())
+        object.__setattr__(authority, "_stdin", object())
+        object.__setattr__(authority, "_stdout", object())
+        del authority
+        for _ in range(100):
+            gc.collect()
+            if process.poll() is not None:
+                break
+            time.sleep(0.01)
+        self.assertEqual(process.returncode, 0)
+
+    def test_concurrent_close_and_requests_reap_one_original_authority(self) -> None:
+        supervisor, _runner = self.make_supervisor(b"")
+        original_process = supervisor._retention_authority._process
+        barrier = threading.Barrier(20)
+        errors: list[Exception] = []
+        threads: list[threading.Thread] = []
+
+        def request() -> None:
+            try:
+                barrier.wait(timeout=2)
+                supervisor.run_once(self.snapshot, self.invocation)
+            except Exception as exc:
+                errors.append(exc)
+
+        def close() -> None:
+            try:
+                barrier.wait(timeout=2)
+                supervisor.close()
+            except Exception as exc:
+                errors.append(exc)
+
+        for index in range(10):
+            threads.extend((threading.Thread(target=request), threading.Thread(target=close)))
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5)
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual(errors, [])
+        supervisor.close()
+        self.assertIsNotNone(original_process.poll())
 
     def test_returned_result_mutation_cannot_change_retained_nonproduction_truth(self) -> None:
         port = FixtureTerminalReconciliationPort()
