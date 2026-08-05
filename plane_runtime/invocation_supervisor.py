@@ -21,6 +21,7 @@ import json
 import math
 import os
 import re
+import secrets
 import selectors
 import subprocess
 import sys
@@ -85,9 +86,6 @@ except OSError as exc:  # pragma: no cover - import cannot safely continue
     raise RuntimeConfigurationError("retention authority source is unavailable") from exc
 _RETENTION_EXECUTABLE = os.path.realpath(sys.executable)
 _RETENTION_POPEN = subprocess.Popen
-_RETENTION_AUTHENTICATION_LABEL = b"plane-agent-retention-authority/v1"
-_RETENTION_FINALIZERS: weakref.WeakKeyDictionary[object, weakref.finalize] = weakref.WeakKeyDictionary()
-_RETENTION_FINALIZER_LOCK = threading.RLock()
 
 
 # Docker policy is intentionally module-private.  InvocationPolicy contains
@@ -1787,21 +1785,37 @@ _RETENTION_REQUEST_LIMIT = 512 * 1024
 _RETENTION_RESPONSE_LIMIT = 512 * 1024
 _RETENTION_REQUEST_TIMEOUT_SECONDS = 5.0
 _RETENTION_CLOSE_TIMEOUT_SECONDS = 2.0
+_RETENTION_SECRET_LENGTH = 32
 _RETENTION_OPERATIONS = frozenset({"create", "read", "close"})
 _RETENTION_RECORDS = frozenset({"result", "death"})
 _RETENTION_READ_RECORDS = frozenset({"result", "death", "result_count", "death_count"})
 _RETENTION_STATUSES = frozenset({"created", "replayed", "conflict", "missing", "ok", "closed"})
-_RETENTION_AUTHENTICATION_LABEL = b"plane-agent-retention-session/v1"
+_RETENTION_AUTHENTICATION_LABEL = b"plane-agent-retention-session/v2"
 
 
 def _retention_session_key(
+    secret: bytes,
+    nonce: bytes,
     source_digest: str,
+    parent_pid: int,
+    authority_pid: int,
     _hmac_new=hmac.new,
     _hash=hashlib.sha256,
 ) -> bytes:
+    context = (
+        _RETENTION_AUTHENTICATION_LABEL
+        + b"\x00"
+        + _RETENTION_PROTOCOL.encode("ascii")
+        + b"\x00"
+        + nonce
+        + b"\x00"
+        + source_digest.encode("ascii")
+        + parent_pid.to_bytes(8, "big", signed=False)
+        + authority_pid.to_bytes(8, "big", signed=False)
+    )
     return _hmac_new(
-        _RETENTION_AUTHENTICATION_LABEL,
-        source_digest.encode("ascii"),
+        secret,
+        context,
         _hash,
     ).digest()
 
@@ -1856,7 +1870,13 @@ def _retention_authority_response(
 def _retention_authority_main() -> None:
     """Own canonical retention in a process the supervisor cannot inspect."""
 
-    secret = _retention_session_key(_RETENTION_SOURCE_DIGEST)
+    secret_buffer = bytearray()
+    while len(secret_buffer) < _RETENTION_SECRET_LENGTH:
+        chunk = sys.stdin.buffer.read(_RETENTION_SECRET_LENGTH - len(secret_buffer))
+        if not chunk:
+            return
+        secret_buffer.extend(chunk)
+    secret = bytes(secret_buffer)
     records: dict[tuple[str, str, str], tuple[bytes, bytes]] = {}
     authenticated = False
     session_key: bytes | None = None
@@ -1892,23 +1912,35 @@ def _retention_authority_main() -> None:
             if type(request_id) is not int or isinstance(request_id, bool) or request_id < 1:
                 raise ContractError("retention request id is invalid")
             if not authenticated:
-                if set(request) != {"protocol", "op", "requestId", "nonce", "sourceDigest"}:
+                if set(request) != {
+                    "protocol", "op", "requestId", "nonce", "sourceDigest", "parentPid", "authorityPid"
+                }:
                     raise ContractError("retention authentication request has unexpected fields")
                 nonce_hex = request.get("nonce")
                 source_digest = request.get("sourceDigest")
+                parent_pid = request.get("parentPid")
+                authority_pid = request.get("authorityPid")
                 if (
                     type(nonce_hex) is not str
                     or len(nonce_hex) != 64
                     or re.fullmatch(r"[0-9a-f]{64}", nonce_hex) is None
                     or source_digest != _RETENTION_SOURCE_DIGEST
+                    or type(parent_pid) is not int
+                    or isinstance(parent_pid, bool)
+                    or type(authority_pid) is not int
+                    or isinstance(authority_pid, bool)
+                    or parent_pid != os.getppid()
+                    or authority_pid != os.getpid()
                 ):
                     return
                 nonce = bytes.fromhex(nonce_hex)
-                session_key = hmac.new(
+                session_key = _retention_session_key(
                     secret,
-                    b"session:" + nonce,
-                    hashlib.sha256,
-                ).digest()
+                    nonce,
+                    source_digest,
+                    parent_pid,
+                    authority_pid,
+                )
                 emit(
                     {
                         **_retention_authority_response(
@@ -1916,9 +1948,11 @@ def _retention_authority_main() -> None:
                             record="auth",
                             request_id=request_id,
                         ),
-                        "proof": hmac.new(secret, nonce, hashlib.sha256).hexdigest(),
+                        "proof": hmac.new(session_key, b"proof:" + nonce, hashlib.sha256).hexdigest(),
                         "sourceDigest": _RETENTION_SOURCE_DIGEST,
                         "sourcePath": _RETENTION_SOURCE_PATH,
+                        "parentPid": parent_pid,
+                        "authorityPid": authority_pid,
                     },
                     session_key,
                 )
@@ -2197,10 +2231,15 @@ def _retention_decode_response(
     if operation == "authenticate":
         expected_fields = {
             "protocol", "status", "record", "requestId", "runId", "invocationId",
-            "proof", "sourceDigest", "sourcePath", "mac",
+            "proof", "sourceDigest", "sourcePath", "parentPid", "authorityPid", "mac",
         }
         if set(response) != expected_fields or response.get("status") != "ready" or response.get("record") != "auth":
             raise RuntimeConfigurationError("canonical retention authority authentication response is invalid")
+        if (
+            response.get("parentPid") != request.get("parentPid")
+            or response.get("authorityPid") != request.get("authorityPid")
+        ):
+            raise RuntimeConfigurationError("canonical retention authority identity is not request-bound")
     else:
         allowed_fields = {
             "protocol", "status", "record", "requestId", "runId", "invocationId", "mac", "value",
@@ -2274,10 +2313,15 @@ def _make_retention_endpoint(
     stdin_type: type,
     stdout_type: type,
     lock: threading.RLock,
+    secret: bytes,
+    source_digest: str,
+    source_path: str,
+    parent_pid: int,
+    authority_pid: int,
 ) -> Callable[[str, object | None], object]:
     """Capture original transport resources outside replaceable attributes."""
 
-    source_key = _retention_session_key(_RETENTION_SOURCE_DIGEST)
+    trusted_session_key = _retention_session_key
     trusted_popen_type = _RETENTION_POPEN
     trusted_write_frame = _retention_write_frame
     trusted_read_frame = _retention_read_frame
@@ -2285,6 +2329,9 @@ def _make_retention_endpoint(
     trusted_message_mac = _retention_message_mac
     trusted_canonical_json_bytes = canonical_json_bytes
     trusted_monotonic = time.monotonic
+    trusted_close_process = _close_retention_process
+    protocol = _RETENTION_PROTOCOL
+    close_timeout = _RETENTION_CLOSE_TIMEOUT_SECONDS
     process_poll = process.poll
     process_wait = process.wait
     process_terminate = process.terminate
@@ -2338,7 +2385,7 @@ def _make_retention_endpoint(
             stdin.close()
         except Exception:
             pass
-        _close_retention_process(process, stdin, stdout)
+        trusted_close_process(process, stdin, stdout)
         try:
             stdout.close()
         except Exception:
@@ -2387,14 +2434,14 @@ def _make_retention_endpoint(
                 if process_poll() is None and authenticated and session_key is not None:
                     closed = False
                     response = send(
-                        {"protocol": _RETENTION_PROTOCOL, "op": "close"},
-                        timeout=_RETENTION_CLOSE_TIMEOUT_SECONDS,
+                        {"protocol": protocol, "op": "close"},
+                        timeout=close_timeout,
                         check_handles=False,
                     )
                     if response.get("status") != "closed":
                         raise RuntimeConfigurationError("retention close was not acknowledged")
                     closed = True
-                    process_wait(timeout=_RETENTION_CLOSE_TIMEOUT_SECONDS)
+                    process_wait(timeout=close_timeout)
             except Exception:
                 closed = True
             finally:
@@ -2404,7 +2451,7 @@ def _make_retention_endpoint(
                     pass
                 try:
                     if process_poll() is None:
-                        process_wait(timeout=_RETENTION_CLOSE_TIMEOUT_SECONDS)
+                        process_wait(timeout=close_timeout)
                 except Exception:
                     pass
                 if process_poll() is None:
@@ -2413,14 +2460,14 @@ def _make_retention_endpoint(
                     except Exception:
                         pass
                     try:
-                        process_wait(timeout=_RETENTION_CLOSE_TIMEOUT_SECONDS)
+                        process_wait(timeout=close_timeout)
                     except Exception:
                         try:
                             process_kill()
                         except Exception:
                             pass
                         try:
-                            process_wait(timeout=_RETENTION_CLOSE_TIMEOUT_SECONDS)
+                            process_wait(timeout=close_timeout)
                         except Exception:
                             pass
                 try:
@@ -2450,24 +2497,27 @@ def _make_retention_endpoint(
                 nonce_hex = request.get("nonce")
                 if type(nonce_hex) is not str or re.fullmatch(r"[0-9a-f]{64}", nonce_hex) is None:
                     raise ContractError("retention authentication nonce is invalid")
-                response_key = hmac.new(
-                    source_key,
-                    b"session:" + bytes.fromhex(nonce_hex),
-                    hashlib.sha256,
-                ).digest()
+                nonce = bytes.fromhex(nonce_hex)
+                response_key = trusted_session_key(
+                    secret,
+                    nonce,
+                    source_digest,
+                    parent_pid,
+                    authority_pid,
+                )
                 request_key = session_key
                 session_key = response_key
                 try:
+                    request["parentPid"] = parent_pid
+                    request["authorityPid"] = authority_pid
                     response = send(request, timeout=_RETENTION_REQUEST_TIMEOUT_SECONDS, check_handles=True)
-                    expected_proof = hmac.new(
-                        source_key,
-                        bytes.fromhex(nonce_hex),
-                        hashlib.sha256,
-                    ).hexdigest()
+                    expected_proof = hmac.new(response_key, b"proof:" + nonce, hashlib.sha256).hexdigest()
                     if (
                         response.get("proof") != expected_proof
-                        or response.get("sourceDigest") != _RETENTION_SOURCE_DIGEST
-                        or response.get("sourcePath") != _RETENTION_SOURCE_PATH
+                        or response.get("sourceDigest") != source_digest
+                        or response.get("sourcePath") != source_path
+                        or response.get("parentPid") != parent_pid
+                        or response.get("authorityPid") != authority_pid
                     ):
                         raise RuntimeConfigurationError("canonical retention authority identity is invalid")
                 except Exception:
@@ -2482,64 +2532,32 @@ def _make_retention_endpoint(
     return endpoint
 
 
-def _retention_endpoint_for(authority: object) -> Callable[[str, object | None], object] | None:
-    with _RETENTION_FINALIZER_LOCK:
-        finalizer = _RETENTION_FINALIZERS.get(authority)
-    if finalizer is None:
-        return None
-    info = finalizer.peek()
-    if info is None:
-        return None
-    _obj, _func, args, _kwargs = info
-    if len(args) != 1 or not callable(args[0]):
-        return None
-    return args[0]
-
-
-def _close_retention_endpoint(endpoint: Callable[[str, object | None], object]) -> None:
-    try:
-        endpoint("close")
-    except Exception:
-        pass
-
-
-def _invoke_retention_finalizer(target: object) -> None:
-    with _RETENTION_FINALIZER_LOCK:
-        finalizer = _RETENTION_FINALIZERS.pop(target, None)
-    if finalizer is None:
-        return
-    info = finalizer.detach()
-    if info is None:
-        return
-    _obj, function, args, kwargs = info
-    try:
-        function(*args, **kwargs)
-    except Exception:
-        pass
-
-
-def _register_retention_finalizer(
-    target: object,
-    endpoint: Callable[[str, object | None], object],
+def _validate_retention_spawn_contract(
+    *,
+    trusted_popen: type,
+    trusted_executable: str,
+    trusted_module_name: str,
+    trusted_source_path: str,
+    trusted_source_digest: str,
 ) -> None:
-    finalizer = weakref.finalize(target, _close_retention_endpoint, endpoint)
-    with _RETENTION_FINALIZER_LOCK:
-        _RETENTION_FINALIZERS[target] = finalizer
-
-
-def _validate_retention_spawn_contract() -> None:
     try:
-        if __name__ != _RETENTION_MODULE_NAME:
+        if __name__ != trusted_module_name or _RETENTION_MODULE_NAME != trusted_module_name:
             raise RuntimeConfigurationError("retention authority module identity was replaced")
-        if os.path.realpath(__file__) != _RETENTION_SOURCE_PATH:
+        if (
+            os.path.realpath(__file__) != trusted_source_path
+            or _RETENTION_SOURCE_PATH != trusted_source_path
+        ):
             raise RuntimeConfigurationError("retention authority source path was replaced")
-        with open(_RETENTION_SOURCE_PATH, "rb") as source_file:
+        with open(trusted_source_path, "rb") as source_file:
             source_digest = hashlib.sha256(source_file.read()).hexdigest()
-        if source_digest != _RETENTION_SOURCE_DIGEST:
+        if source_digest != trusted_source_digest or _RETENTION_SOURCE_DIGEST != trusted_source_digest:
             raise RuntimeConfigurationError("retention authority source changed after import")
-        if os.path.realpath(sys.executable) != _RETENTION_EXECUTABLE:
+        if (
+            os.path.realpath(sys.executable) != trusted_executable
+            or _RETENTION_EXECUTABLE != trusted_executable
+        ):
             raise RuntimeConfigurationError("retention authority executable was replaced")
-        if subprocess.Popen is not _RETENTION_POPEN:
+        if subprocess.Popen is not trusted_popen or _RETENTION_POPEN is not trusted_popen:
             raise RuntimeConfigurationError("retention authority spawn helper was replaced")
     except (OSError, TypeError, AttributeError) as exc:
         raise RuntimeConfigurationError("retention authority spawn contract is unavailable") from exc
@@ -2564,85 +2582,164 @@ class _RetentionAuthority:
         "__weakref__",
     )
 
-    def __init__(self) -> None:
-        _validate_retention_spawn_contract()
+    def __new__(
+        cls,
+        _trusted_popen=subprocess.Popen,
+        _trusted_executable=os.path.realpath(sys.executable),
+        _trusted_module_name=__name__,
+        _trusted_source_path=os.path.realpath(__file__),
+        _trusted_source_digest=_RETENTION_SOURCE_DIGEST,
+        _trusted_validator=_validate_retention_spawn_contract,
+        _trusted_make_endpoint=_make_retention_endpoint,
+        _trusted_write_frame=_retention_write_frame,
+        _trusted_close_process=_close_retention_process,
+        _trusted_token_bytes=secrets.token_bytes,
+        _trusted_getpid=os.getpid,
+        _trusted_set_blocking=os.set_blocking,
+        _trusted_pipe=subprocess.PIPE,
+        _trusted_devnull=subprocess.DEVNULL,
+        _trusted_monotonic=time.monotonic,
+        _trusted_finalize=weakref.finalize,
+    ) -> _RetentionAuthority:
+        _trusted_validator(
+            trusted_popen=_trusted_popen,
+            trusted_executable=_trusted_executable,
+            trusted_module_name=_trusted_module_name,
+            trusted_source_path=_trusted_source_path,
+            trusted_source_digest=_trusted_source_digest,
+        )
         command = (
-            _RETENTION_EXECUTABLE,
+            _trusted_executable,
             "-m",
-            _RETENTION_MODULE_NAME,
+            _trusted_module_name,
             "--retention-authority",
         )
+        secret = _trusted_token_bytes(_RETENTION_SECRET_LENGTH)
+        if type(secret) is not bytes or len(secret) != _RETENTION_SECRET_LENGTH:
+            raise RuntimeConfigurationError("canonical retention authority secret is unavailable")
         try:
-            process = _RETENTION_POPEN(
+            process = _trusted_popen(
                 command,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
+                stdin=_trusted_pipe,
+                stdout=_trusted_pipe,
+                stderr=_trusted_devnull,
                 close_fds=True,
             )
         except (OSError, ValueError) as exc:
             raise RuntimeConfigurationError("canonical retention authority could not start") from exc
-        if type(process) is not _RETENTION_POPEN or process.stdin is None or process.stdout is None:
-            _close_retention_process(process)
+        if type(process) is not _trusted_popen or process.stdin is None or process.stdout is None:
+            _trusted_close_process(process)
             raise RuntimeConfigurationError("canonical retention authority has no trusted typed channel")
         try:
             stdin_fd = process.stdin.fileno()
             stdout_fd = process.stdout.fileno()
             stdin_type = type(process.stdin)
             stdout_type = type(process.stdout)
-            os.set_blocking(stdin_fd, False)
-            os.set_blocking(stdout_fd, False)
+            _trusted_set_blocking(stdin_fd, False)
+            _trusted_set_blocking(stdout_fd, False)
         except (OSError, ValueError) as exc:
-            _close_retention_process(process)
+            _trusted_close_process(process)
             raise RuntimeConfigurationError("canonical retention authority channel is unavailable") from exc
-        self._process = process
-        self._process_identity = process
-        self._stdin = process.stdin
-        self._stdin_identity = process.stdin
-        self._stdout = process.stdout
-        self._stdout_identity = process.stdout
-        self._stdin_fd = stdin_fd
-        self._stdout_fd = stdout_fd
-        self._stdin_type = stdin_type
-        self._stdout_type = stdout_type
-        self._lock = threading.RLock()
-        self._closed = False
-        endpoint = _make_retention_endpoint(
-            weakref.ref(self),
-            process,
-            process.stdin,
-            process.stdout,
-            stdin_fd,
-            stdout_fd,
-            stdin_type,
-            stdout_type,
-            self._lock,
-        )
-        _register_retention_finalizer(self, endpoint)
         try:
-            self._request(
+            _trusted_write_frame(
+                stdin_fd,
+                secret,
+                _trusted_monotonic() + _RETENTION_REQUEST_TIMEOUT_SECONDS,
+            )
+        except Exception as exc:
+            _trusted_close_process(process, process.stdin, process.stdout)
+            raise RuntimeConfigurationError("canonical retention authority bootstrap failed") from exc
+        authority_pid = process.pid
+        parent_pid = _trusted_getpid()
+        cleanup_cell: list[Callable[[str, object | None], object] | None] = [None]
+
+        def bound_request(self: _RetentionAuthority, request: dict[str, object]) -> dict[str, object]:
+            endpoint = cleanup_cell[0]
+            if endpoint is None:
+                raise RuntimeConfigurationError("canonical retention authority is unavailable")
+            return endpoint("request", request)  # type: ignore[return-value]
+
+        def bound_exclusive(self: _RetentionAuthority, callback: Callable[[], object]) -> object:
+            endpoint = cleanup_cell[0]
+            if endpoint is None:
+                raise RuntimeConfigurationError("canonical retention authority is unavailable")
+            return endpoint("exclusive", callback)
+
+        def bound_close(self: _RetentionAuthority) -> None:
+            endpoint = cleanup_cell[0]
+            if endpoint is not None:
+                try:
+                    endpoint("close")
+                except Exception:
+                    pass
+
+        bound_type = type(
+            "_BoundRetentionAuthority",
+            (cls,),
+            {
+                "__slots__": (),
+                "_request": bound_request,
+                "exclusive": bound_exclusive,
+                "close": bound_close,
+                "__del__": bound_close,
+            },
+        )
+        authority = object.__new__(bound_type)
+        authority._process = process
+        authority._process_identity = process
+        authority._stdin = process.stdin
+        authority._stdin_identity = process.stdin
+        authority._stdout = process.stdout
+        authority._stdout_identity = process.stdout
+        authority._stdin_fd = stdin_fd
+        authority._stdout_fd = stdout_fd
+        authority._stdin_type = stdin_type
+        authority._stdout_type = stdout_type
+        authority._lock = threading.RLock()
+        authority._closed = False
+        try:
+            endpoint = _trusted_make_endpoint(
+                weakref.ref(authority),
+                process,
+                process.stdin,
+                process.stdout,
+                stdin_fd,
+                stdout_fd,
+                stdin_type,
+                stdout_type,
+                authority._lock,
+                secret,
+                _trusted_source_digest,
+                _trusted_source_path,
+                parent_pid,
+                authority_pid,
+            )
+        except Exception as exc:
+            _trusted_close_process(process, process.stdin, process.stdout)
+            raise RuntimeConfigurationError("canonical retention authority endpoint is unavailable") from exc
+        cleanup_cell[0] = endpoint
+        _trusted_finalize(authority, endpoint, "close")
+        try:
+            endpoint(
+                "request",
                 {
                     "protocol": _RETENTION_PROTOCOL,
                     "op": "authenticate",
-                    "nonce": os.urandom(32).hex(),
-                    "sourceDigest": _RETENTION_SOURCE_DIGEST,
-                }
+                    "nonce": _trusted_token_bytes(_RETENTION_SECRET_LENGTH).hex(),
+                    "sourceDigest": _trusted_source_digest,
+                },
             )
         except Exception:
-            _invoke_retention_finalizer(self)
+            bound_close(authority)
             raise
 
-    def _request(self, request: dict[str, object]) -> dict[str, object]:
-        endpoint = _retention_endpoint_for(self)
-        if endpoint is None:
-            raise RuntimeConfigurationError("canonical retention authority is unavailable")
-        return endpoint("request", request)
+        return authority
+
+    def __init__(self) -> None:
+        pass
 
     def exclusive(self, callback: Callable[[], object]) -> object:
-        endpoint = _retention_endpoint_for(self)
-        if endpoint is None:
-            raise RuntimeConfigurationError("canonical retention authority is unavailable")
-        return endpoint("exclusive", callback)
+        raise RuntimeConfigurationError("canonical retention authority is unavailable")
 
     def create(self, record: str, key: tuple[str, str], value: dict[str, object]) -> dict[str, object]:
         run_id, invocation_id = _retention_record_key(record, *key)[1:]
@@ -2688,7 +2785,7 @@ class _RetentionAuthority:
         return value
 
     def close(self) -> None:
-        _invoke_retention_finalizer(self)
+        raise RuntimeConfigurationError("canonical retention authority is unavailable")
 
 
 _EXACT_RETENTION_AUTHORITY = _RetentionAuthority
@@ -2730,20 +2827,16 @@ class InvocationSupervisor:
         self._clock = clock
         authority = _RetentionAuthority()
         self._retention_authority = authority
-        endpoint = _retention_endpoint_for(authority)
-        if endpoint is None:
-            authority.close()
-            raise RuntimeConfigurationError("canonical retention authority cleanup is unavailable")
-        # The finalizer captures the original endpoint and its original process
-        # resources.  It is lifecycle cleanup, never authority discovery or
-        # storage, and remains reachable even if this object's attributes are
-        # replaced.
-        _register_retention_finalizer(self, endpoint)
+        # Capture the authority's bound cleanup capability directly.  This is
+        # deliberately independent of the public authority handle and every
+        # module-level registry/helper, including during GC finalization.
+        self._retention_finalizer = weakref.finalize(self, authority.close)
 
     def close(self) -> None:
         """Close the invocation-scoped retention authority process."""
 
-        _invoke_retention_finalizer(self)
+        finalizer = object.__getattribute__(self, "_retention_finalizer")
+        finalizer()
 
     def __del__(self) -> None:
         try:
@@ -2751,12 +2844,12 @@ class InvocationSupervisor:
         except Exception:
             pass
 
-    def _authority(self) -> _RetentionAuthority:
+    def _authority(self, _authority_type=_EXACT_RETENTION_AUTHORITY) -> _RetentionAuthority:
         try:
             authority = object.__getattribute__(self, "_retention_authority")
         except AttributeError as exc:
             raise RuntimeConfigurationError("canonical retention authority is unavailable") from exc
-        if type(authority) is not _RetentionAuthority:
+        if not isinstance(authority, _authority_type):
             raise RuntimeConfigurationError("canonical retention authority was replaced")
         return authority
 

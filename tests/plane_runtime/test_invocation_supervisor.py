@@ -13,6 +13,7 @@ import sys
 import threading
 import time
 import unittest
+import weakref
 from datetime import datetime, timezone
 from unittest.mock import patch
 
@@ -842,6 +843,111 @@ class SupervisorTests(unittest.TestCase):
             with self.assertRaises(supervisor_module.RuntimeConfigurationError):
                 supervisor_module._RetentionAuthority()
         self.assertFalse(launched)
+
+    def test_coordinated_spawn_replacement_cannot_authenticate_ordinary_peer(self) -> None:
+        original_popen = supervisor_module._RETENTION_POPEN
+        source_digest = supervisor_module._RETENTION_SOURCE_DIGEST
+        source_path = supervisor_module._RETENTION_SOURCE_PATH
+        peer = r'''
+import hashlib
+import hmac
+import json
+import sys
+
+source_digest, source_path = sys.argv[1:]
+source_key = hmac.new(
+    b"plane-agent-retention-session/v1",
+    source_digest.encode("ascii"),
+    hashlib.sha256,
+).digest()
+
+def mac(key, message):
+    return hmac.new(key, json.dumps(message, sort_keys=True, separators=(",", ":")).encode(), hashlib.sha256).hexdigest()
+
+auth_request = json.loads(sys.stdin.buffer.readline())
+session_key = hmac.new(source_key, b"session:" + bytes.fromhex(auth_request["nonce"]), hashlib.sha256).digest()
+auth_response = {
+    "protocol": auth_request["protocol"],
+    "status": "ready",
+    "record": "auth",
+    "requestId": auth_request["requestId"],
+    "runId": "",
+    "invocationId": "",
+    "proof": hmac.new(source_key, bytes.fromhex(auth_request["nonce"]), hashlib.sha256).hexdigest(),
+    "sourceDigest": source_digest,
+    "sourcePath": source_path,
+}
+auth_response["mac"] = mac(session_key, auth_response)
+sys.stdout.write(json.dumps(auth_response, sort_keys=True, separators=(",", ":")) + "\n")
+sys.stdout.flush()
+count_request = json.loads(sys.stdin.buffer.readline())
+count_response = {
+    "protocol": count_request["protocol"],
+    "status": "ok",
+    "record": "result_count",
+    "requestId": count_request["requestId"],
+    "runId": "",
+    "invocationId": "",
+    "value": 424242,
+}
+count_response["mac"] = mac(session_key, count_response)
+sys.stdout.write(json.dumps(count_response, sort_keys=True, separators=(",", ":")) + "\n")
+sys.stdout.flush()
+'''
+        launched: list[subprocess.Popen[bytes]] = []
+
+        class CoordinatedPopen(original_popen):
+            def __init__(self, _command, **kwargs):
+                launched.append(self)
+                original_popen.__init__(
+                    self,
+                    (sys.executable, "-c", peer, source_digest, source_path),
+                    **kwargs,
+                )
+
+        try:
+            with patch.object(supervisor_module.subprocess, "Popen", CoordinatedPopen), patch.object(
+                supervisor_module, "_RETENTION_POPEN", CoordinatedPopen
+            ):
+                with self.assertRaises(supervisor_module.RuntimeConfigurationError):
+                    supervisor_module._RetentionAuthority()
+            self.assertEqual(launched, [])
+        finally:
+            for process in launched:
+                if process.poll() is None:
+                    process.kill()
+                process.wait(timeout=2)
+
+    def test_post_construction_registry_and_helper_replacement_cannot_block_close(self) -> None:
+        authority = supervisor_module._RetentionAuthority()
+        process = authority._process
+        try:
+            supervisor_module._RETENTION_FINALIZERS = weakref.WeakKeyDictionary()
+            with patch.object(
+                supervisor_module,
+                "_close_retention_process",
+                side_effect=AssertionError("replaceable cleanup helper was called"),
+                create=True,
+            ):
+                authority.close()
+            self.assertEqual(process.returncode, 0)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=2)
+            supervisor_module.__dict__.pop("_RETENTION_FINALIZERS", None)
+
+    def test_authority_construction_failure_reaps_bootstrapped_child(self) -> None:
+        captured: list[subprocess.Popen[bytes]] = []
+
+        def fail_after_launch(*args, **kwargs):
+            captured.append(args[1])
+            raise RuntimeError("endpoint construction failed")
+
+        with self.assertRaises(supervisor_module.RuntimeConfigurationError):
+            supervisor_module._RetentionAuthority(_trusted_make_endpoint=fail_after_launch)
+        self.assertEqual(len(captured), 1)
+        self.assertIsNotNone(captured[0].poll())
 
     def test_source_executable_and_command_replacements_fail_closed_before_launch(self) -> None:
         replacements = (
