@@ -15,6 +15,7 @@ import threading
 import time
 import unittest
 import weakref
+from dataclasses import fields
 from datetime import datetime, timezone
 from unittest.mock import patch
 
@@ -1031,6 +1032,16 @@ sys.stdout.flush()
 
     def test_complete_import_bound_authority_path_ignores_replaced_names_and_reaps_once(self) -> None:
         original_authority_type = supervisor_module._RetentionAuthority
+        dependency_bundle = supervisor_module._RETENTION_DEPENDENCIES
+        dependency_fields = tuple(field.name for field in fields(type(dependency_bundle)))
+        original_dependency_values = {
+            name: getattr(dependency_bundle, name) for name in dependency_fields
+        }
+        endpoint_factory = original_dependency_values["endpoint_factory"]
+        self.assertIsNotNone(endpoint_factory)
+        endpoint_closure = tuple(cell.cell_contents for cell in (endpoint_factory.__closure__ or ()))
+        self.assertFalse(any(value is dependency_bundle for value in endpoint_closure))
+        self.assertFalse(any(isinstance(value, type(dependency_bundle)) for value in endpoint_closure))
         sentinel_calls: list[str] = []
 
         def sentinel(name: str):
@@ -1095,15 +1106,33 @@ sys.stdout.flush()
             **{name: object() for name in registry_names + constant_names},
         }
 
-        with patch.multiple(supervisor_module, **replacements):
-            supervisor, _runner = self.make_supervisor(b"")
-            authority = supervisor._retention_authority
-            authority_process = authority._process
-            self.assertIsInstance(authority, original_authority_type)
-            self.assertEqual(authority.count_results(), 0)
-            supervisor.close()
-            supervisor.close()
-            self.assertEqual(authority_process.returncode, 0)
+        def mutate_every_dependency_field() -> None:
+            for name, value in original_dependency_values.items():
+                replacement = sentinel(f"bundle.{name}") if callable(value) else object()
+                object.__setattr__(dependency_bundle, name, replacement)
+
+        try:
+            with patch.multiple(supervisor_module, **replacements):
+                # Every published bundle field is adversarially replaced before
+                # production construction, while every replaceable module name
+                # is also rebound by the surrounding patch.
+                mutate_every_dependency_field()
+                supervisor, _runner = self.make_supervisor(b"")
+                authority = supervisor._retention_authority
+                authority_process = authority._process
+                self.assertIsInstance(authority, original_authority_type)
+
+                # Repeat the aggregate mutation after construction.  Existing
+                # authenticated transport and cleanup must remain independent
+                # of the published bundle and all patched module names.
+                mutate_every_dependency_field()
+                self.assertEqual(authority.count_results(), 0)
+                supervisor.close()
+                supervisor.close()
+                self.assertEqual(authority_process.returncode, 0)
+        finally:
+            for name, value in original_dependency_values.items():
+                object.__setattr__(dependency_bundle, name, value)
 
         self.assertEqual(sentinel_calls, [])
 

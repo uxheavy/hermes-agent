@@ -2388,31 +2388,31 @@ def _make_retention_endpoint(
     parent_pid: int,
     authority_pid: int,
     *,
-    dependencies: _RetentionDependencyBundle,
+    trusted_session_key: Callable[..., bytes],
+    trusted_popen_type: type,
+    trusted_write_frame: Callable[..., None],
+    trusted_read_frame: Callable[..., bytes],
+    trusted_decode_response: Callable[..., dict[str, object]],
+    trusted_message_mac: Callable[..., str],
+    trusted_canonical_json_bytes: Callable[..., bytes],
+    trusted_monotonic: Callable[[], float],
+    trusted_close_process: Callable[..., None],
+    trusted_hmac_new: Callable[..., object],
+    trusted_sha256: Callable[..., object],
+    trusted_fullmatch: Callable[..., object],
+    trusted_bytes_fromhex: Callable[[str], bytes],
+    trusted_type: Callable[[object], type],
+    trusted_getattribute: Callable[[object, str], object],
+    trusted_runtime_error: type[Exception],
+    trusted_contract_error: type[Exception],
+    trusted_attribute_error: type[Exception],
+    protocol: str,
+    response_limit: int,
+    request_timeout: float,
+    close_timeout: float,
 ) -> Callable[[str, object | None], object]:
     """Capture original transport resources outside replaceable attributes."""
 
-    trusted_session_key = dependencies.session_key
-    trusted_popen_type = dependencies.popen
-    trusted_write_frame = dependencies.write_frame
-    trusted_read_frame = dependencies.read_frame
-    trusted_decode_response = dependencies.decode_response
-    trusted_message_mac = dependencies.message_mac
-    trusted_canonical_json_bytes = dependencies.canonical_json
-    trusted_monotonic = dependencies.monotonic
-    trusted_close_process = dependencies.close_process
-    trusted_hmac_new = dependencies.hmac_new
-    trusted_sha256 = dependencies.sha256
-    trusted_fullmatch = dependencies.fullmatch
-    trusted_bytes_fromhex = dependencies.bytes_fromhex
-    trusted_type = dependencies.type_fn
-    trusted_getattribute = dependencies.getattribute
-    trusted_runtime_error = dependencies.runtime_configuration_error
-    trusted_contract_error = dependencies.contract_error
-    protocol = dependencies.protocol
-    response_limit = dependencies.response_limit
-    request_timeout = dependencies.request_timeout
-    close_timeout = dependencies.close_timeout
     process_poll = process.poll
     process_wait = process.wait
     process_terminate = process.terminate
@@ -2460,7 +2460,7 @@ def _make_retention_endpoint(
                 or stdout.fileno() != stdout_fd
             ):
                 raise trusted_runtime_error("canonical retention authority channel was replaced")
-        except dependencies.attribute_error as exc:
+        except trusted_attribute_error as exc:
             raise trusted_runtime_error("canonical retention authority handle is unavailable") from exc
 
     def invalidate() -> None:
@@ -2897,7 +2897,32 @@ def _make_retention_dependency_bundle() -> _RetentionDependencyBundle:
     bundle: _RetentionDependencyBundle
 
     def make_endpoint(*args: object, **kwargs: object) -> Callable[[str, object | None], object]:
-        return trusted_make_endpoint(*args, dependencies=bundle, **kwargs)
+        return trusted_make_endpoint(
+            *args,
+            trusted_session_key=session_key,
+            trusted_popen_type=trusted_popen,
+            trusted_write_frame=write_frame,
+            trusted_read_frame=read_frame,
+            trusted_decode_response=decode_response,
+            trusted_message_mac=message_mac,
+            trusted_canonical_json_bytes=trusted_canonical_json,
+            trusted_monotonic=trusted_monotonic,
+            trusted_close_process=close_process,
+            trusted_hmac_new=trusted_hmac_new,
+            trusted_sha256=trusted_sha256,
+            trusted_fullmatch=trusted_fullmatch,
+            trusted_bytes_fromhex=trusted_bytes_fromhex,
+            trusted_type=trusted_type,
+            trusted_getattribute=trusted_getattribute,
+            trusted_runtime_error=trusted_runtime_error,
+            trusted_contract_error=trusted_contract_error,
+            trusted_attribute_error=trusted_attribute_error,
+            protocol=protocol,
+            response_limit=response_limit,
+            request_timeout=request_timeout,
+            close_timeout=close_timeout,
+            **kwargs,
+        )
 
     bundle = _RetentionDependencyBundle(
         module=trusted_module,
