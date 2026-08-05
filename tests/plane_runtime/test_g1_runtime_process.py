@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import io
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import os
+from pathlib import Path
 import shutil
 import socket
 import stat
@@ -12,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from unittest import mock
@@ -25,9 +28,10 @@ from plane_runtime.g1_contract import (
     build_exit,
     validate_g1_frames,
 )
+from plane_runtime.g1_bootstrap_contract import G1BootstrapFrames
 from plane_runtime.g1_ledger import G1RuntimeLedger
 from plane_runtime.g1_runtime_image import bootstrap
-from plane_runtime.hermes_adapter import HermesKernelAdapter, HermesKernelResult, UnixSocketCredentialSource
+from plane_runtime.hermes_adapter import HermesKernelAdapter, HermesKernelResult, InlineCredentialSource, UnixSocketCredentialSource
 from plane_runtime.invocation_supervisor import (
     G1InvocationSupervisor,
     G1LocalTestRunner,
@@ -208,7 +212,7 @@ class G1RuntimeProcessTests(unittest.TestCase):
         ):
             self.assertEqual(service_main(["--once"]), 2)
 
-    def test_production_g1_service_routes_to_hermes_and_host_broker(self) -> None:
+    def test_production_g1_service_accepts_only_bootstrap_child_handoff(self) -> None:
         snapshot = make_snapshot()
         snapshot["runtimePolicy"] = dict(snapshot["runtimePolicy"])  # type: ignore[arg-type]
         snapshot["runtimePolicy"]["adapter"] = "hermes"  # type: ignore[index]
@@ -216,10 +220,27 @@ class G1RuntimeProcessTests(unittest.TestCase):
             "snapshot", {key: value for key, value in snapshot.items() if key != "contentDigest"}
         )
         invocation = make_invocation(snapshot)
-        request = json.dumps({"run": snapshot, "invocation": invocation}) + "\n"
+        request = json.dumps({"run": snapshot, "invocation": invocation}, sort_keys=True, separators=(",", ":")) + "\n"
+        dispatch_frame = json.dumps(
+            {"modelCallAllowance": 1, "protocol": "plane.agent-runtime/dispatch-control/v1"},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode() + b"\n"
+        control = json.dumps(
+            {"credentials": {"api_key": "private-canary"}, "protocol": "plane.agent-runtime/credential-control/v1"},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode() + b"\n"
+
+        class BinaryStdin:
+            def __init__(self, value: bytes) -> None:
+                self.buffer = io.BytesIO(value)
+
         with mock.patch("plane_runtime.g1_service.HermesKernelAdapter") as adapter:
-            def dispatch(_snapshot, _invocation, _cancellation, emit_body, **kwargs):
+            def dispatch_result(_snapshot, _invocation, _cancellation, emit_body, **kwargs):
                 self.assertEqual(kwargs["model_call_allowance"], 1)
+                source = adapter.call_args.kwargs["credential_source"]
+                self.assertEqual(source.resolve("test-provider")["api_key"], "private-canary")
                 emit_body(
                     {
                         "kind": "progress_observed",
@@ -229,15 +250,18 @@ class G1RuntimeProcessTests(unittest.TestCase):
                 )
                 return HermesKernelResult(kind="completed")
 
-            adapter.return_value.dispatch.side_effect = dispatch
+            adapter.return_value.dispatch.side_effect = dispatch_result
             output = io.StringIO()
-            with mock.patch("sys.stdin", io.StringIO(request)), mock.patch("sys.stdout", output):
-                self.assertEqual(service_main(["--once", "--g1-production", "--model-call-allowance", "1"]), 0)
+            with mock.patch("sys.stdin", BinaryStdin(dispatch_frame + control + request.encode())), mock.patch("sys.stdout", output):
+                self.assertEqual(service_main(["--once", "--g1-production", "--g1-bootstrap-child", "--model-call-allowance", "1"]), 0)
             adapter.assert_called_once()
             source = adapter.call_args.kwargs["credential_source"]
-            self.assertIsInstance(source, UnixSocketCredentialSource)
+            self.assertIsInstance(source, InlineCredentialSource)
+            self.assertEqual(source.credentials, {})
         frames = [json.loads(line) for line in output.getvalue().splitlines()]
         self.assertEqual(validate_g1_frames(frames, snapshot, invocation)[-1]["kind"], "completed")
+        with mock.patch("sys.stdin", io.StringIO(request)), mock.patch("sys.stdout", io.StringIO()):
+            self.assertEqual(service_main(["--once", "--g1-production"]), 2)
 
     def test_exact_g1_snapshot_and_envelope_are_immutable_and_bound(self) -> None:
         snapshot = G1RunSnapshot.from_dict(make_snapshot())
@@ -262,6 +286,225 @@ class G1RuntimeProcessTests(unittest.TestCase):
 
         replay = transport.dispatch(json.dumps(snapshot), json.dumps(invocation), lease_valid=lambda: True)
         self.assertEqual(frames, replay)
+
+    def test_real_production_bootstrap_drives_hermes_and_unix_host_rpc(self) -> None:
+        """Exercise the production three-frame path without a paid model."""
+
+        model_requests: list[dict[str, object]] = []
+        stream_count = [0]
+
+        class ModelHandler(BaseHTTPRequestHandler):
+            def do_POST(self) -> None:
+                size = int(self.headers.get("content-length", "0"))
+                request = json.loads(self.rfile.read(size))
+                model_requests.append(request)
+                if request.get("stream") is True:
+                    stream_count[0] += 1
+                    if stream_count[0] == 2:
+                        function_name = "tool_describe"
+                        arguments = {"name": "plane_operation"}
+                        finish_reason = "tool_calls"
+                    elif stream_count[0] == 3:
+                        function_name = "tool_call"
+                        arguments = {
+                            "name": "plane_operation",
+                            "arguments": {
+                                "action": "read",
+                                "operationRef": "operation:work-item-get@1",
+                                "input": {"workItemRef": "work-item:test"},
+                            },
+                        }
+                        finish_reason = "tool_calls"
+                    elif stream_count[0] >= 4:
+                        function_name = None
+                        arguments = None
+                        finish_reason = "stop"
+                    else:
+                        function_name = "tool_search"
+                        arguments = {"query": "Plane read", "limit": 5}
+                        finish_reason = "tool_calls"
+                    if function_name is None:
+                        chunk = {
+                            "id": "chatcmpl-local-final",
+                            "object": "chat.completion.chunk",
+                            "created": 1,
+                            "model": "deterministic-local",
+                            "choices": [{
+                                "index": 0,
+                                "delta": {"role": "assistant", "content": "local final evidence"},
+                                "finish_reason": "stop",
+                            }],
+                        }
+                    else:
+                        chunk = {
+                            "id": "chatcmpl-local-tool",
+                            "object": "chat.completion.chunk",
+                            "created": 1,
+                            "model": "deterministic-local",
+                            "choices": [{
+                                "index": 0,
+                                "delta": {
+                                    "role": "assistant",
+                                    "tool_calls": [{
+                                        "index": 0,
+                                        "id": "call-read",
+                                        "type": "function",
+                                        "function": {
+                                            "name": function_name,
+                                            "arguments": json.dumps(arguments, sort_keys=True, separators=(",", ":")),
+                                        },
+                                    }],
+                                },
+                                "finish_reason": finish_reason,
+                            }],
+                        }
+                    raw = ("data: " + json.dumps(chunk) + "\n\ndata: [DONE]\n\n").encode()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/event-stream")
+                else:
+                    raw = json.dumps({
+                        "id": "chatcmpl-local-probe",
+                        "object": "chat.completion",
+                        "created": 1,
+                        "model": "deterministic-local",
+                        "choices": [{
+                            "index": 0,
+                            "message": {"role": "assistant", "content": "local probe", "tool_calls": None},
+                            "finish_reason": "stop",
+                        }],
+                        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                    }).encode()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+            def log_message(self, *_args: object) -> None:
+                return
+
+        model_server = ThreadingHTTPServer(("127.0.0.1", 0), ModelHandler)
+        model_thread = threading.Thread(target=model_server.serve_forever, daemon=True)
+        model_thread.start()
+        host_requests: list[dict[str, object]] = []
+        with tempfile.TemporaryDirectory() as directory:
+            host_path = os.path.join(directory, "host.sock")
+            host_server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            host_server.bind(host_path)
+            host_server.listen(4)
+            host_stop = threading.Event()
+
+            def serve_host() -> None:
+                host_server.settimeout(0.2)
+                while not host_stop.is_set():
+                    try:
+                        channel, _ = host_server.accept()
+                    except socket.timeout:
+                        continue
+                    with channel:
+                        raw = bytearray()
+                        while not raw.endswith(b"\n"):
+                            chunk = channel.recv(4096)
+                            if not chunk:
+                                return
+                            raw.extend(chunk)
+                        request = json.loads(bytes(raw[:-1]))
+                        host_requests.append(request)
+                        response = {
+                            "correlationId": request["correlationId"],
+                            "idempotencyKey": request["idempotencyKey"],
+                            "output": {"read": True},
+                            "protocol": "plane.agent-runtime/v1",
+                            "replayed": False,
+                            "requestRef": request["requestRef"],
+                            "status": "ok",
+                        }
+                        channel.sendall(json.dumps(response, sort_keys=True, separators=(",", ":")).encode() + b"\n")
+
+            host_thread = threading.Thread(target=serve_host, daemon=True)
+            host_thread.start()
+            try:
+                snapshot = make_snapshot()
+                snapshot["runtimePolicy"] = dict(snapshot["runtimePolicy"])  # type: ignore[arg-type]
+                snapshot["runtimePolicy"]["adapter"] = "hermes"  # type: ignore[index]
+                snapshot["runtimePolicy"]["model"] = {  # type: ignore[index]
+                    "provider": "openai",
+                    "model": "deterministic-local",
+                }
+                snapshot["contentDigest"] = _digest(
+                    "snapshot", {key: value for key, value in snapshot.items() if key != "contentDigest"}
+                )
+                invocation = make_invocation(snapshot)
+                request = json.dumps(
+                    {"invocation": invocation, "run": snapshot},
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode()
+                frames = G1BootstrapFrames(
+                    6,
+                    {
+                        "api_key": "local-bootstrap-secret",
+                        "base_url": f"http://127.0.0.1:{model_server.server_port}/v1",
+                        "api_mode": "chat_completions",
+                    },
+                    request,
+                )
+                payload = bytes(frames.child_bytes())
+                frames.clear()
+                environment = {
+                    "HOME": directory,
+                    "HERMES_HOME": directory,
+                    "LANG": "C.UTF-8",
+                    "LC_ALL": "C.UTF-8",
+                    "PATH": os.path.dirname(sys.executable) + ":/usr/bin:/bin",
+                    "PYTHONPATH": str(Path(__file__).resolve().parents[2]),
+                    "PYTHONUNBUFFERED": "1",
+                }
+                completed = subprocess.run(
+                    [
+                        sys.executable,
+                        "-m",
+                        "plane_runtime.g1_runtime_image.bootstrap",
+                        "--once",
+                        "--g1-production",
+                        "--plane-host-socket",
+                        host_path,
+                    ],
+                    input=payload,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    env=environment,
+                    cwd=environment["PYTHONPATH"],
+                    timeout=20,
+                    check=False,
+                )
+            finally:
+                host_stop.set()
+                host_server.close()
+                host_thread.join(timeout=1.0)
+        model_server.shutdown()
+        model_server.server_close()
+        model_thread.join(timeout=1.0)
+
+        self.assertEqual(completed.returncode, 0, completed.stderr.decode(errors="replace"))
+        try:
+            output_frames = [json.loads(line) for line in completed.stdout.splitlines()]
+        except json.JSONDecodeError as exc:
+            self.fail(completed.stdout.decode(errors="replace") + completed.stderr.decode(errors="replace") + str(exc))
+        parsed = validate_g1_frames(output_frames, snapshot, invocation)
+        self.assertEqual(parsed[-1]["kind"], "completed")
+        self.assertEqual(
+            [request["action"] for request in host_requests],
+            ["read"],
+            completed.stdout.decode(errors="replace")
+            + completed.stderr.decode(errors="replace")
+            + json.dumps(model_requests, default=str),
+        )
+        self.assertNotIn(b"local-bootstrap-secret", completed.stdout + completed.stderr)
+        self.assertNotIn(host_path.encode(), completed.stdout + completed.stderr)
+        self.assertNotIn("local-bootstrap-secret", json.dumps(model_requests, default=str))
+        self.assertNotIn(host_path, json.dumps(model_requests, default=str))
+        self.assertFalse(any(frame.get("body", {}).get("kind") == "conversation_publication_observed" for frame in parsed))
 
     def test_malformed_binding_and_changed_replay_fail_before_spawn(self) -> None:
         snapshot = make_snapshot()
@@ -609,31 +852,7 @@ class G1RuntimeProcessTests(unittest.TestCase):
                     0,
                 )
         run.assert_called_once()
-        self.assertEqual(run.call_args.args[3], socket_path)
-
-    @unittest.skipUnless(hasattr(socket, "SO_PEERCRED"), "peer PID credentials are Linux-only")
-    def test_credential_broker_rejects_non_service_pid(self) -> None:
-        canary = "peer-canary"
-        broker = bootstrap._CredentialBroker({"api_key": canary}, "test-provider")
-        broker.start(os.getpid())
-        try:
-            self.assertEqual(stat.S_IMODE(os.stat(bootstrap._BROKER_DIRECTORY).st_mode), 0o700)
-            self.assertEqual(stat.S_IMODE(os.stat(bootstrap._BROKER_PATH).st_mode), 0o600)
-            authorized = UnixSocketCredentialSource(path=bootstrap._BROKER_PATH).resolve("test-provider")
-            self.assertEqual(authorized["api_key"], canary)
-            self.assertEqual(UnixSocketCredentialSource(path=bootstrap._BROKER_PATH).resolve("test-provider"), {})
-            probe = (
-                "import socket; "
-                f"s=socket.socket(socket.AF_UNIX); s.connect({bootstrap._BROKER_PATH!r}); "
-                "s.sendall(b'{\"protocol\":\"plane.agent-runtime/credentials/v1\",\"provider\":\"test-provider\"}\\n'); "
-                "print(s.recv(4096).decode())"
-            )
-            child = subprocess.run((sys.executable, "-c", probe), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
-            self.assertEqual(child.returncode, 0)
-            self.assertNotIn(canary, child.stdout + child.stderr)
-            self.assertIn('"credentials":{}', child.stdout)
-        finally:
-            broker.close()
+        self.assertEqual(run.call_args.args[1], socket_path)
 
     def test_credential_source_exception_is_redacted_from_runtime_path(self) -> None:
         canary = "exception-canary"
@@ -723,46 +942,6 @@ class G1RuntimeProcessTests(unittest.TestCase):
                 ).state,
                 "outcome_unknown",
             )
-
-    @unittest.skipUnless(shutil.which("docker") or os.path.exists("/opt/homebrew/bin/docker"), "Docker CLI is unavailable")
-    def test_linux_container_broker_denies_protocol_counterexamples(self) -> None:
-        docker = shutil.which("docker") or "/opt/homebrew/bin/docker"
-        inspected = subprocess.run(
-            (docker, "image", "inspect", "--format", "{{index .RepoDigests 0}}", "plane-g1-local:hermes"),
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, check=False,
-        )
-        image = inspected.stdout.strip()
-        if inspected.returncode != 0 or "@sha256:" not in image:
-            self.skipTest("local digest-pinned Hermes image was not built")
-        script = "\n".join((
-            "import os,socket",
-            "from plane_runtime.g1_runtime_image import bootstrap as b",
-            "canary='docker-broker-canary'",
-            "broker=b._CredentialBroker({'api_key':canary},'test-provider'); broker.start(os.getpid())",
-            "def ask(raw):",
-            " c=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); c.connect(b._BROKER_PATH); c.sendall(raw); v=c.recv(8192); c.close(); return v",
-            "assert b'\\\"credentials\\\":{}' in ask(b'{\\\"provider\\\":\\\"test-provider\\\",\\\"protocol\\\":\\\"plane.agent-runtime/credentials/v1\\\",\\\"unknown\\\":1}\\n'), 'unknown'",
-            "assert b'\\\"credentials\\\":{}' in ask(b'{\\\"provider\\\":[\\\"test-provider\\\"],\\\"protocol\\\":\\\"plane.agent-runtime/credentials/v1\\\"}\\n'), 'type'",
-            "assert b'\\\"credentials\\\":{}' in ask(b'{\\\"provider\\\":\\\"test-provider\\\",\\\"protocol\\\":\\\"plane.agent-runtime/credentials/v2\\\"}\\n'), 'version'",
-            "assert b'\\\"credentials\\\":{}' in ask(b'{\\\"provider\\\":\\\"test-provider\\\",\\\"protocol\\\":\\\"plane.agent-runtime/credentials/v1\\\",\\\"provider\\\":\\\"other\\\"}\\n'), 'duplicate'",
-            "assert b'\\\"credentials\\\":{}' in ask((b'x'*4097)+b'\\n'), 'oversized'",
-            "import json; valid=json.dumps({'provider':'test-provider','protocol':'plane.agent-runtime/credentials/v1'},sort_keys=True,separators=(',',':')).encode()+b'\\n'",
-            "assert b'\\\"credentials\\\":{\\\"api_key\\\":\\\"docker-broker-canary\\\"}' in ask(valid)",
-            "assert b'\\\"credentials\\\":{}' in ask(valid)",
-            "broker.close(); print('BROKER_MATRIX_OK')",
-        ))
-        command = [
-            docker, "run", "--rm", "--pull=never", "--network", "none", "--read-only", "--interactive",
-            "--tmpfs", "/tmp:rw,noexec,nosuid,nodev,size=64m", "--user", "65532:65532", "--cap-drop", "ALL",
-            "--security-opt", "no-new-privileges", "--env", "LANG=C.UTF-8", "--env", "LC_ALL=C.UTF-8",
-            "--env", "HOME=/tmp/hermes", "--env", "PATH=/usr/local/bin:/usr/bin:/bin",
-            "--env", "PYTHONDONTWRITEBYTECODE=1", "--env", "PYTHONUNBUFFERED=1",
-            "--entrypoint", "python3", image, "-c", script,
-        ]
-        result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("BROKER_MATRIX_OK", result.stdout)
-        self.assertNotIn("docker-broker-canary", result.stdout + result.stderr)
 
     @unittest.skipUnless(shutil.which("docker") or os.path.exists("/opt/homebrew/bin/docker"), "Docker CLI is unavailable")
     def test_local_digest_pinned_hermes_image_executes_real_adapter_path(self) -> None:
@@ -975,6 +1154,61 @@ class G1RuntimeProcessTests(unittest.TestCase):
         self.assertEqual(captured["kwargs"]["iteration_budget"].max_total, 3)  # type: ignore[index]
         self.assertEqual(result.model_calls, 2)
         self.assertNotIn("top-secret-value", json.dumps(bodies))
+
+    def test_hermes_adapter_interrupts_running_agent_from_trusted_cancellation(self) -> None:
+        snapshot_raw = make_snapshot()
+        snapshot_raw["runtimePolicy"] = dict(snapshot_raw["runtimePolicy"])  # type: ignore[arg-type]
+        snapshot_raw["runtimePolicy"]["adapter"] = "hermes"  # type: ignore[index]
+        snapshot_raw["contentDigest"] = _digest(
+            "snapshot", {key: value for key, value in snapshot_raw.items() if key != "contentDigest"}
+        )
+        snapshot = G1RunSnapshot.from_dict(snapshot_raw)
+        invocation = G1InvocationEnvelope.from_dict(make_invocation(snapshot.to_dict()))
+        started = threading.Event()
+        interrupted = threading.Event()
+        cancellation = threading.Event()
+
+        class BlockingAgent:
+            session_api_calls = 1
+
+            def run_conversation(self, message: str, *, system_message: str) -> dict[str, object]:
+                del message, system_message
+                started.set()
+                interrupted.wait(2.0)
+                return {"interrupted": interrupted.is_set()}
+
+            def interrupt(self, message: str) -> None:
+                self.message = message
+                interrupted.set()
+
+        class Credentials:
+            def resolve(self, provider: str) -> dict[str, str]:
+                del provider
+                return {"api_key": "trusted-host-secret"}
+
+        adapter = HermesKernelAdapter(
+            agent_factory=lambda **kwargs: BlockingAgent(),
+            credential_source=Credentials(),
+        )
+
+        def cancel_after_start() -> bool:
+            if started.is_set():
+                cancellation.set()
+            return cancellation.is_set()
+
+        began = time.monotonic()
+        result = adapter.dispatch(
+            snapshot,
+            invocation,
+            cancel_after_start,
+            lambda body: None,
+            model_call_allowance=2,
+        )
+        elapsed = time.monotonic() - began
+        self.assertEqual(result.kind, "cancelled")
+        self.assertEqual(result.failure_code, "cancelled")
+        self.assertTrue(interrupted.is_set())
+        self.assertLess(elapsed, 1.0)
 
     def test_hermes_adapter_fails_closed_when_measured_usage_exceeds_budget(self) -> None:
         snapshot_raw = make_snapshot()

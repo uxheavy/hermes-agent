@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
-import re
+import contextlib
+import io
 import json
+import re
 import socket
+import threading
 import time
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Protocol, Sequence
@@ -97,17 +100,32 @@ class EnvironmentCredentialSource:
         return {}
 
 
+@dataclass
+class InlineCredentialSource:
+    """Private bootstrap handoff; never an environment or model data source."""
+
+    credentials: Mapping[str, str]
+    expected_provider: str
+
+    def resolve(self, provider: str) -> Mapping[str, str]:
+        if provider != self.expected_provider:
+            return {}
+        return dict(self.credentials)
+
+
 @dataclass(frozen=True)
 class UnixSocketCredentialSource:
-    """Read one provider credential from the host-only broker socket.
+    """Read one provider credential from an explicitly supplied test socket.
 
-    The socket path is fixed and non-secret.  The credential value is returned
-    only to this adapter and is never part of the G1 request or child
-    environment.  A missing, malformed, or over-sized broker response fails
-    closed.
+    Production G1 does not construct this compatibility seam; its credential
+    source is the private bootstrap pipe. A missing, malformed, or over-sized
+    broker response fails closed.
     """
 
-    path: str = "/tmp/plane-agent-credential-broker/broker.sock"
+    # Explicit path is required because the production bootstrap no longer
+    # has a fixed credential socket authority.  This remains a local test or
+    # compatibility seam only.
+    path: str
     timeout_seconds: float = 2.0
 
     def resolve(self, provider: str) -> Mapping[str, str]:
@@ -163,6 +181,59 @@ class HermesKernelResult:
     retryable: bool = True
     usage: Mapping[str, int] | None = None
     model_calls: int | None = None
+
+
+class NeverCancelled:
+    """Explicit no-cancellation seam for callers that own no control signal."""
+
+    def __call__(self) -> bool:
+        return False
+
+
+class _CancellationMonitor:
+    """Poll trusted cancellation and interrupt a running AIAgent promptly."""
+
+    def __init__(self, probe: Callable[[], bool], agent: Any) -> None:
+        self._probe = probe
+        self._agent = agent
+        self._stop = threading.Event()
+        self._requested = threading.Event()
+        self._failed = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="plane-runtime-cancellation", daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            try:
+                value = self._probe()
+            except Exception:
+                self._failed.set()
+                return
+            if not isinstance(value, bool):
+                self._failed.set()
+                return
+            if value:
+                self._requested.set()
+                try:
+                    self._agent.interrupt("runtime cancellation requested")
+                except Exception:
+                    self._failed.set()
+                return
+            self._stop.wait(0.05)
+
+    def close(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=0.5)
+
+    @property
+    def requested(self) -> bool:
+        return self._requested.is_set()
+
+    @property
+    def failed(self) -> bool:
+        return self._failed.is_set() or self._thread.is_alive()
 
 
 def redact_runtime_text(value: str, secrets: Sequence[str]) -> str:
@@ -233,7 +304,23 @@ class HermesKernelAdapter:
         *,
         model_call_allowance: int | None = None,
     ) -> HermesKernelResult:
-        if cancellation():
+        try:
+            initially_cancelled = cancellation()
+        except Exception:
+            return HermesKernelResult(
+                kind="failed",
+                failure_code="runtime_error",
+                failure_message="trusted cancellation probe failed",
+                retryable=False,
+            )
+        if not isinstance(initially_cancelled, bool):
+            return HermesKernelResult(
+                kind="failed",
+                failure_code="runtime_error",
+                failure_message="trusted cancellation probe returned an invalid value",
+                retryable=False,
+            )
+        if initially_cancelled:
             return HermesKernelResult(
                 kind="cancelled",
                 failure_code="cancelled",
@@ -314,7 +401,11 @@ class HermesKernelAdapter:
 
         def on_step(*args: Any, **kwargs: Any) -> None:
             del args, kwargs
-            if not cancellation():
+            try:
+                cancelled = cancellation()
+            except Exception:
+                return
+            if cancelled is False:
                 emit_body(
                     {
                         "kind": "progress_observed",
@@ -365,6 +456,7 @@ class HermesKernelAdapter:
 
         started_at = time.monotonic()
         agent: Any | None = None
+        cancellation_monitor: _CancellationMonitor | None = None
         host_binding = (
             PlaneHostBinding(
                 port=self._host_port,
@@ -379,6 +471,8 @@ class HermesKernelAdapter:
         )
         try:
             agent = self._agent_factory(**agent_kwargs)
+            cancellation_monitor = _CancellationMonitor(cancellation, agent)
+            cancellation_monitor.start()
             prompt = (
                 f"{snapshot.behavioral_prompt}\n\n"
                 f"Assignment objective: {snapshot.objective}\n"
@@ -386,11 +480,31 @@ class HermesKernelAdapter:
                 + ", ".join(str(item["contextRef"]) for item in snapshot.raw["context"])
             )
             if host_binding is None:
-                result = agent.run_conversation(snapshot.objective, system_message=prompt)
+                with contextlib.redirect_stdout(io.StringIO()):
+                    result = agent.run_conversation(snapshot.objective, system_message=prompt)
             else:
                 with bind_plane_host(host_binding):
-                    result = agent.run_conversation(snapshot.objective, system_message=prompt)
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        result = agent.run_conversation(snapshot.objective, system_message=prompt)
         except Exception as exc:
+            if cancellation_monitor is not None:
+                cancellation_monitor.close()
+            if cancellation_monitor is not None and cancellation_monitor.requested:
+                return HermesKernelResult(
+                    kind="cancelled",
+                    failure_code="cancelled",
+                    failure_message="runtime cancellation was requested",
+                    retryable=False,
+                    model_calls=self._observed_model_calls(agent, None),
+                )
+            if cancellation_monitor is not None and cancellation_monitor.failed:
+                return HermesKernelResult(
+                    kind="failed",
+                    failure_code="runtime_error",
+                    failure_message="trusted cancellation could not interrupt Hermes",
+                    retryable=False,
+                    model_calls=self._observed_model_calls(agent, None),
+                )
             message = bound_runtime_text(redact_runtime_text(str(exc), credential_values), event_limit)
             return HermesKernelResult(
                 kind="failed",
@@ -400,7 +514,17 @@ class HermesKernelAdapter:
                 model_calls=self._observed_model_calls(agent, None),
             )
 
-        if cancellation():
+        if cancellation_monitor is not None:
+            cancellation_monitor.close()
+        if cancellation_monitor is not None and cancellation_monitor.failed:
+            return HermesKernelResult(
+                kind="failed",
+                failure_code="runtime_error",
+                failure_message="trusted cancellation probe failed",
+                retryable=False,
+                model_calls=self._observed_model_calls(agent, result),
+            )
+        if cancellation_monitor is not None and cancellation_monitor.requested:
             return HermesKernelResult(
                 kind="cancelled",
                 failure_code="cancelled",
@@ -548,12 +672,14 @@ class DeterministicKernelAdapter:
 __all__ = [
     "DeterministicKernelAdapter",
     "EnvironmentCredentialSource",
+    "InlineCredentialSource",
     "HermesAuthStoreCredentialSource",
     "UnixSocketCredentialSource",
     "HermesCheckpointSource",
     "HermesCredentialSource",
     "HermesKernelAdapter",
     "HermesKernelResult",
+    "NeverCancelled",
     "bound_runtime_text",
     "redact_runtime_text",
 ]

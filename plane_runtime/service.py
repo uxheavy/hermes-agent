@@ -12,7 +12,9 @@ import errno
 import json
 import os
 import selectors
+import signal
 import sys
+import threading
 import time
 from typing import BinaryIO, Callable, Protocol, TextIO
 
@@ -50,6 +52,8 @@ from .contract import (
     _check_raw_wire_size,
 )
 from .host_port import UnixSocketPlaneHostPort
+from .g1_bootstrap_contract import read_g1_bootstrap_frames
+from .g1_contract import G1RunSnapshot
 
 
 GENERIC_RUNTIME_FAILURE = "runtime execution failed; Plane reconciliation is required"
@@ -66,6 +70,30 @@ MAX_SERVICE_REQUEST_BYTES = (
 SERVICE_FRAME_TIMEOUT_SECONDS = 1.0
 SERVICE_FRAME_READ_CHUNK_BYTES = 16 * 1024
 SERVICE_FRAME_TERMINATOR_ALLOWANCE = 2
+
+
+class _BootstrapCancellation:
+    """Trusted parent signal state for one production child invocation."""
+
+    def __init__(self) -> None:
+        self._event = threading.Event()
+        self._previous: Any = None
+        self._installed = False
+
+    def _handler(self, _signum: int, _frame: Any) -> None:
+        self._event.set()
+
+    def __enter__(self) -> Callable[[], bool]:
+        if not hasattr(signal, "SIGUSR1"):
+            raise RuntimeConfigurationError("trusted cancellation signal is unavailable")
+        self._previous = signal.getsignal(signal.SIGUSR1)
+        signal.signal(signal.SIGUSR1, self._handler)
+        self._installed = True
+        return self._event.is_set
+
+    def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
+        if self._installed:
+            signal.signal(signal.SIGUSR1, self._previous)
 
 
 class _ServiceFrameReader:
@@ -711,9 +739,49 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--once", action="store_true", help="accept one JSON-lines invocation (the default)")
     parser.add_argument("--g1-test-only", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--g1-production", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--g1-bootstrap-child", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--model-call-allowance", type=int, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--plane-host-socket", default=None, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
+    # Production is authoritative only through the trusted bootstrap.  The
+    # marker is private parent-to-child wiring, not a second public entrypoint.
+    if args.g1_production != args.g1_bootstrap_child:
+        return 2
+    if args.g1_bootstrap_child:
+        frames = None
+        host_port = None
+        try:
+            from .g1_service import serve_once_g1
+            from .hermes_adapter import InlineCredentialSource
+
+            with _BootstrapCancellation() as cancellation:
+                frames = read_g1_bootstrap_frames(sys.stdin)
+                request_line = frames.request.decode("utf-8")
+                request = json.loads(request_line)
+                snapshot = G1RunSnapshot.from_dict(request["run"])
+                host_port = (
+                    UnixSocketPlaneHostPort(args.plane_host_socket)
+                    if args.plane_host_socket is not None
+                    else None
+                )
+                source = InlineCredentialSource(frames.credentials, snapshot.model_provider)
+                return serve_once_g1(
+                    request_line,
+                    sys.stdout,
+                    production=True,
+                    diagnostics=sys.stderr,
+                    model_call_allowance=frames.model_call_allowance,
+                    host_port=host_port,
+                    credential_source=source,
+                    cancellation=cancellation,
+                )
+        except Exception:
+            return 2
+        finally:
+            if host_port is not None:
+                host_port.close()
+            if frames is not None:
+                frames.clear()
     try:
         with _ServiceFrameReader(sys.stdin) as reader:
             request_line = reader.read_frame()

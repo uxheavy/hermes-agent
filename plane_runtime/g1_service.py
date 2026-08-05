@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from datetime import datetime, timezone
-from typing import Any, Mapping, TextIO
+from typing import Any, Callable, Mapping, TextIO
 
 from .g1_contract import (
     G1ContractError,
@@ -20,7 +20,8 @@ from .hermes_adapter import (
     DeterministicKernelAdapter,
     HermesKernelAdapter,
     HermesKernelResult,
-    UnixSocketCredentialSource,
+    HermesCredentialSource,
+    NeverCancelled,
 )
 from .host_port import PlaneHostPort
 
@@ -113,6 +114,8 @@ def serve_once_g1(
     diagnostics: TextIO | None = None,
     model_call_allowance: int | None = None,
     host_port: PlaneHostPort | None = None,
+    credential_source: HermesCredentialSource | None = None,
+    cancellation: Callable[[], bool] | None = None,
 ) -> int:
     """Consume exactly one G1 request and write direct event/exit frames.
 
@@ -145,18 +148,23 @@ def serve_once_g1(
             result = _failure_result("budget_exhausted", "cumulative invocation budget is exhausted")
         elif production and (model_call_allowance is None or isinstance(model_call_allowance, bool) or not isinstance(model_call_allowance, int) or model_call_allowance < 0):
             result = _failure_result("runtime_error", "trusted model-call allowance is required")
+        elif production and credential_source is None:
+            result = _failure_result(
+                "runtime_error",
+                "trusted bootstrap credential handoff is required",
+            )
         elif snapshot.adapter_name == "deterministic-test-adapter" and not production:
-            result = DeterministicKernelAdapter().dispatch(snapshot, invocation, lambda: False, emit_body)
+            result = DeterministicKernelAdapter().dispatch(snapshot, invocation, NeverCancelled(), emit_body)
         elif snapshot.adapter_name == "deterministic-test-adapter" and production:
             result = _failure_result("runtime_error", "deterministic adapter is test-only")
         else:
             result = HermesKernelAdapter(
-                credential_source=UnixSocketCredentialSource(),
+                credential_source=credential_source,
                 host_port=host_port,
             ).dispatch(
                 snapshot,
                 invocation,
-                lambda: False,
+                cancellation or NeverCancelled(),
                 emit_body,
                 model_call_allowance=model_call_allowance,
             )

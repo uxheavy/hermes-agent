@@ -109,6 +109,7 @@ def _result(request: dict, *, status: str = "ok", output: object = None, **extra
 class HostPortTests(unittest.TestCase):
     def test_production_one_shot_service_binds_socket_host_before_real_hermes_turn(self) -> None:
         from plane_runtime.hermes_adapter import HermesKernelAdapter
+        from plane_runtime.g1_bootstrap_contract import G1BootstrapFrames
         from plane_runtime.service import main as service_main
         from run_agent import AIAgent
         from tests.plane_runtime.test_g1_runtime_process import (
@@ -200,6 +201,18 @@ class HostPortTests(unittest.TestCase):
             agent._create_request_openai_client = lambda **_kwargs: client  # type: ignore[method-assign]
             return agent
 
+        class BinaryStdin:
+            def __init__(self, value: bytes) -> None:
+                self.buffer = io.BytesIO(value)
+
+        bootstrap_frames = G1BootstrapFrames(
+            4,
+            {"api_key": "model-only-secret", "base_url": "http://127.0.0.1"},
+            request_line[:-1].encode(),
+        )
+        bootstrap_input = bytes(bootstrap_frames.child_bytes())
+        bootstrap_frames.clear()
+
         bodies: list[dict] = []
         with _LocalHostServer(
             lambda request: (
@@ -221,10 +234,7 @@ class HostPortTests(unittest.TestCase):
                 HermesKernelAdapter,
                 "_default_agent_factory",
                 staticmethod(agent_factory),
-            ), mock.patch(
-                "plane_runtime.g1_service.UnixSocketCredentialSource",
-                return_value=Credentials(),
-            ), mock.patch("sys.stdin", io.StringIO(request_line)), mock.patch(
+            ), mock.patch("sys.stdin", BinaryStdin(bootstrap_input)), mock.patch(
                 "sys.stdout", output
             ), mock.patch("sys.stderr", diagnostics), mock.patch.dict(
                 os.environ, {"HERMES_HOME": _TEST_HERMES_HOME.name}
@@ -233,6 +243,7 @@ class HostPortTests(unittest.TestCase):
                     [
                         "--once",
                         "--g1-production",
+                        "--g1-bootstrap-child",
                         "--model-call-allowance",
                         "4",
                         "--plane-host-socket",

@@ -68,7 +68,9 @@ proposal-only child entrypoint accepts only an invocation-scoped cancellation
 signal; the signal is an observation and is never treated as authority. The
 trusted `serve_once` convenience path may additionally receive an independent
 canonical cancellation authority and is the only service path that can emit a
-host-authorized cancellation receipt.
+host-authorized cancellation receipt. Production G1 has one authority:
+`plane_runtime.g1_runtime_image.bootstrap`; `service --g1-production` is
+rejected unless invoked with the bootstrap's private child marker.
 Unexpected internal exceptions are retained only by the protected failure hook
 and become a bounded generic failed proposal; if that proposal is not
 accepted, the service returns status 1 so a trusted supervisor can reconcile
@@ -95,18 +97,16 @@ once through its injected `TerminalReconciliationPort`. Product status is
 derived only from the accepted host receipt. G1 has no product-completion
 claim: it returns runtime evidence frames only. `ProductionG1RuntimeRunner`
 is the separate G1 production seam and uses the same fixed Docker supervisor
-policy, with a host-owned credential source delivered through one separate
-fixed bootstrap control frame. The trusted container bootstrap stores that
-frame only in tmpfs mode-0600 broker state and authorizes only the spawned
-Hermes service PID; `G1LocalTestRunner` is explicitly test-only.
+policy, with a host-owned credential source delivered through the bootstrap's
+private three-frame handoff. `G1LocalTestRunner` is explicitly test-only.
 
 The fixed child command uses `docker create`, `start`, and `attach` with
 module-private network, namespace, privilege, mount, environment, logging,
 storage, and cleanup controls. `SubprocessDockerRunner` performs bounded
 daemon, image, and post-launch inspections and rejects ambiguity, but those
 checks are bounded Docker enforcement evidence. The G1 production runner adds
-the fixed `--g1-production` bootstrap command and internal peer-authorized
-broker; the child reaches `HermesKernelAdapter` only through that path.
+the fixed `--g1-production` bootstrap command; the child reaches
+`HermesKernelAdapter` only through the marked bootstrap child path.
 Caller-owned runners remain
 explicit test seams and cannot produce a product completion claim. The attach
 client is terminated,
@@ -145,11 +145,35 @@ and durable product state.
 
 The production one-shot service binds the concrete `UnixSocketPlaneHostPort`
 when the trusted supervisor supplies `--plane-host-socket <absolute-path>`.
-The bootstrap forwards this dedicated argument to the child service; it is not
-read from the runtime request, environment, model prompt, tool result,
+The single production entrypoint is:
+
+```bash
+python3 -m plane_runtime.g1_runtime_image.bootstrap --once --g1-production \
+  [--plane-host-socket <absolute-path>]
+```
+
+Its stdin is exactly three canonical JSON-lines frames followed by EOF, in
+this order: dispatch control (`dispatch-control/v1`, bounded model-call
+allowance), credential control (`credential-control/v1`, bounded host-only
+credential map), and the ordinary `{"invocation","run"}` G1 request. The
+bootstrap validates the order and bounds before spawning the child, then
+forwards the same private frames to `service --once --g1-production
+--g1-bootstrap-child`. The child clears the in-memory credential map after
+the invocation. The dispatch and credential frames never appear in stdout,
+stderr, the model prompt, tool input/results, transcript evidence, or the
+request fingerprint.
+
+The bootstrap forwards this dedicated host-socket argument to the child; it is
+not read from the runtime request, environment, model prompt, tool result,
 transcript, event, or generated code. The client opens a fresh local `AF_UNIX`
 stream for each callback and closes it after the one canonical JSON-lines
 response, so the endpoint and connection are invocation-scoped.
+
+The trusted parent requests in-process cancellation by sending `SIGUSR1` to
+the bootstrap process. The bootstrap forwards it to the child, whose bounded
+adapter watcher calls `AIAgent.interrupt()` within its 50 ms polling cadence.
+Hermes emits a typed `cancelled` runtime exit; process termination remains the
+supervisor fallback and no cancellation receipt is authored by Hermes.
 
 The host callback wire contract is exactly `plane.agent-runtime/v1`:
 
@@ -181,13 +205,13 @@ unproven unless a local daemon and already-present digest-pinned image pass
 the inspection path; this slice does not pull images or contact a registry.
 The production G1 seam is wired to Hermes, but successful model execution
 also requires an existing digest-pinned image containing this service and its
-Hermes dependencies. The host broker keeps provider credentials out of the
-snapshot, envelope, child environment, command arguments, logs, events, and
-artifacts. The trusted `serve_once` function remains a host/test convenience;
-fixture/demo authorities are not command-line runtime entrypoints. The
-bootstrap frame is not part of the request fingerprint, ledger, retained
-frames, or event stream; malformed, duplicate, and post-request control
-frames fail before the Hermes service starts.
+Hermes dependencies. The private bootstrap handoff keeps provider credentials
+out of the snapshot, envelope, child environment, command arguments, logs,
+events, and artifacts. The trusted `serve_once` function remains a host/test
+convenience; fixture/demo authorities are not command-line runtime entrypoints.
+The bootstrap frames are not part of the request fingerprint, ledger, retained
+frames, or event stream; malformed, duplicate, oversized, and post-request
+control frames fail before the Hermes service starts.
 
 For a local no-install G1 execution probe, build
 `plane_runtime/Dockerfile.g1` with the already-cached digest-pinned
@@ -195,8 +219,8 @@ For a local no-install G1 execution probe, build
 base image's ambient environment while retaining its Python/Hermes files;
 the resulting local image digest must be passed unchanged as the production
 `InvocationPolicy.image` value and attested before launch. The image's
-dotenv shim is deliberately a no-op: the only credential path is the fixed
-host bootstrap control frame and the mode-0600 in-container broker.
+dotenv shim is deliberately a no-op: the only credential path is the private
+bootstrap control frame.
 
 Verify the package from the repository root:
 
