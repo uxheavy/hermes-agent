@@ -983,6 +983,52 @@ sys.stdout.flush()
                 supervisor_module._RetentionAuthority(object())
         self.assertEqual(launched, [])
 
+    def test_supervisor_uses_import_time_authority_constructor_not_replaced_globals(self) -> None:
+        original_authority = supervisor_module._RetentionAuthority
+        original_test_factory = supervisor_module._make_retention_authority_for_test
+        replacement_calls: list[str] = []
+        supplied_endpoint_calls: list[object] = []
+        replaced_test_factory_calls: list[object] = []
+
+        def supplied_endpoint(*args, **kwargs):
+            supplied_endpoint_calls.append((args, kwargs))
+            raise AssertionError("supplied test endpoint was invoked")
+
+        class ReplacementAuthority(original_authority):
+            def __new__(cls):
+                replacement_calls.append("constructor")
+                return original_test_factory(make_endpoint=supplied_endpoint)
+
+        def replaced_test_factory(*args, **kwargs):
+            replaced_test_factory_calls.append((args, kwargs))
+            raise AssertionError("replaced test factory was invoked")
+
+        original_constructor = supervisor_module._RETENTION_AUTHORITY_PRODUCTION_CONSTRUCTOR
+        try:
+            supervisor_module._RETENTION_AUTHORITY_PRODUCTION_CONSTRUCTOR = replaced_test_factory
+            with (
+                patch.object(supervisor_module, "_RetentionAuthority", ReplacementAuthority),
+                patch.object(supervisor_module, "_make_retention_authority_for_test", replaced_test_factory),
+                patch.object(supervisor_module, "_retention_authority_test_harness", replaced_test_factory),
+                patch.object(
+                    supervisor_module,
+                    "_make_production_retention_authority_constructor",
+                    replaced_test_factory,
+                ),
+            ):
+                supervisor, _runner = self.make_supervisor(b"")
+                authority_process = supervisor._retention_authority._process
+                self.assertIsInstance(supervisor._retention_authority, original_authority)
+                self.assertNotIsInstance(supervisor._retention_authority, ReplacementAuthority)
+                supervisor.close()
+                self.assertIsNotNone(authority_process.poll())
+        finally:
+            supervisor_module._RETENTION_AUTHORITY_PRODUCTION_CONSTRUCTOR = original_constructor
+
+        self.assertEqual(replacement_calls, [])
+        self.assertEqual(supplied_endpoint_calls, [])
+        self.assertEqual(replaced_test_factory_calls, [])
+
     def test_authority_construction_failure_reaps_bootstrapped_child(self) -> None:
         captured: list[subprocess.Popen[bytes]] = []
 

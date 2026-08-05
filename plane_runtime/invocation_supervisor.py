@@ -2807,16 +2807,65 @@ class _RetentionAuthority:
 _EXACT_RETENTION_AUTHORITY = _RetentionAuthority
 
 
+def _make_retention_authority_test_harness(
+    authority_type: type,
+    test_constructor: Callable[[type, Callable[..., object]], _RetentionAuthority],
+) -> Callable[..., _RetentionAuthority]:
+    """Keep the injectable endpoint factory behind a test-only closure."""
+
+    trusted_authority_type = authority_type
+    trusted_test_constructor = test_constructor
+
+    def make_for_test(*, make_endpoint: Callable[..., object]) -> _RetentionAuthority:
+        return trusted_test_constructor(trusted_authority_type, make_endpoint)
+
+    return make_for_test
+
+
+_retention_authority_test_harness = _make_retention_authority_test_harness(
+    _RetentionAuthority,
+    _retention_authority_test_constructor,
+)
+
+
 def _make_retention_authority_for_test(*, make_endpoint):
     """Test-only construction seam; production calls cannot select it."""
 
-    return _retention_authority_test_constructor(_RetentionAuthority, make_endpoint)
+    return _retention_authority_test_harness(make_endpoint=make_endpoint)
 
 
-class InvocationSupervisor:
-    """Run, bound, reconcile, and dispose of exactly one invocation."""
+def _make_production_retention_authority_constructor(
+    authority_type: type,
+    authority_new: Callable[[type], _RetentionAuthority],
+) -> Callable[[], _RetentionAuthority]:
+    """Capture the production authority type and constructor in one closure."""
 
-    def __init__(
+    trusted_authority_type = authority_type
+    trusted_authority_new = authority_new
+
+    def construct() -> _RetentionAuthority:
+        return trusted_authority_new(trusted_authority_type)
+
+    return construct
+
+
+_RETENTION_AUTHORITY_PRODUCTION_CONSTRUCTOR = _make_production_retention_authority_constructor(
+    _RetentionAuthority,
+    _retention_authority_new,
+)
+
+
+def _make_invocation_supervisor_initializer(
+    production_authority_constructor: Callable[[], _RetentionAuthority],
+) -> Callable[..., None]:
+    """Bind supervisor construction to the import-time production constructor."""
+
+    trusted_authority_constructor = production_authority_constructor
+    trusted_validate_policy = _validate_policy
+    trusted_finalize = weakref.finalize
+    trusted_clock = time.monotonic
+
+    def initialize(
         self,
         *,
         policy: InvocationPolicy,
@@ -2825,9 +2874,9 @@ class InvocationSupervisor:
         lease_authority: CanonicalLeaseAuthority,
         lease_binding: CanonicalLeaseBinding,
         cancellation_authority: CancellationAuthority | None = None,
-        clock: Callable[[], float] = time.monotonic,
+        clock: Callable[[], float] = trusted_clock,
     ) -> None:
-        _validate_policy(policy)
+        trusted_validate_policy(policy)
         if terminal_port is None:
             raise RuntimeConfigurationError("invocation supervisor requires terminal reconciliation")
         if lease_authority is None or lease_binding is None:
@@ -2847,12 +2896,24 @@ class InvocationSupervisor:
             lease_binding.expires_at,
         )
         self._clock = clock
-        authority = _RetentionAuthority()
+        authority = trusted_authority_constructor()
         self._retention_authority = authority
         # Capture the authority's bound cleanup capability directly.  This is
         # deliberately independent of the public authority handle and every
         # module-level registry/helper, including during GC finalization.
-        self._retention_finalizer = weakref.finalize(self, authority.close)
+        self._retention_finalizer = trusted_finalize(self, authority.close)
+
+    initialize.__name__ = "__init__"
+    initialize.__qualname__ = "InvocationSupervisor.__init__"
+    return initialize
+
+
+class InvocationSupervisor:
+    """Run, bound, reconcile, and dispose of exactly one invocation."""
+
+    __init__ = _make_invocation_supervisor_initializer(
+        _RETENTION_AUTHORITY_PRODUCTION_CONSTRUCTOR,
+    )
 
     def close(self) -> None:
         """Close the invocation-scoped retention authority process."""
