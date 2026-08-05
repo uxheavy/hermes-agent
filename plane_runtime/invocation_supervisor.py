@@ -16,17 +16,18 @@ attestation is rejected rather than treated as proof.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import math
 import os
 import re
 import selectors
-import secrets
-import sqlite3
 import subprocess
+import sys
+import threading
 import time
+import weakref
 from dataclasses import dataclass
-from types import MappingProxyType
 from typing import Callable, Mapping, Protocol, Sequence
 
 from .adapter import (
@@ -1763,90 +1764,379 @@ class SubprocessDockerRunner:
             raise RuntimeConfigurationError("Docker cleanup command failed")
 
 
-_RETENTION_SCHEMA = (
-    "CREATE TABLE supervisor_results ("
-    "run_id TEXT NOT NULL, invocation_id TEXT NOT NULL, payload BLOB NOT NULL,"
-    "payload_digest BLOB NOT NULL,"
-    "PRIMARY KEY (run_id, invocation_id))",
-    "CREATE TABLE supervisor_death_receipts ("
-    "run_id TEXT NOT NULL, invocation_id TEXT NOT NULL, payload BLOB, payload_digest BLOB,"
-    "has_receipt INTEGER NOT NULL, PRIMARY KEY (run_id, invocation_id))",
-)
+_RETENTION_PROTOCOL = "plane.agent-runtime/retention/v1"
+_RETENTION_REQUEST_LIMIT = 512 * 1024
+_RETENTION_RESPONSE_LIMIT = 512 * 1024
+_RETENTION_REQUEST_TIMEOUT_SECONDS = 5.0
+_RETENTION_CLOSE_TIMEOUT_SECONDS = 2.0
+_RETENTION_OPERATIONS = frozenset({"create", "read", "close"})
+_RETENTION_RECORDS = frozenset({"result", "death"})
+_RETENTION_READ_RECORDS = frozenset({"result", "death", "result_count", "death_count"})
+_RETENTION_STATUSES = frozenset({"created", "replayed", "conflict", "missing", "ok", "closed"})
 
 
-def _new_retention_anchor() -> tuple[str, sqlite3.Connection]:
-    """Create an opaque per-supervisor serialized store.
-
-    SQLite owns transaction ordering in its C implementation.  No Python
-    module-global dictionary, weak-reference ledger, live result object, or
-    mutable lock is authoritative.  The URI is an in-memory SQLite name; the
-    anchor connection only keeps that private database alive.
-    """
-
-    uri = f"file:hermes-retention-{secrets.token_hex(32)}?mode=memory&cache=shared"
-    anchor = sqlite3.connect(uri, uri=True, check_same_thread=False, isolation_level=None)
-    for statement in _RETENTION_SCHEMA:
-        anchor.execute(statement)
-    return uri, anchor
-
-
-def _retention_connection(owner: object) -> sqlite3.Connection:
-    try:
-        uri = object.__getattribute__(owner, "_retention_uri")
-        anchor = object.__getattribute__(owner, "_retention_anchor")
-    except AttributeError as exc:
-        raise RuntimeConfigurationError("invocation retention store is unavailable") from exc
+def _retention_record_key(record: str, run_id: str, invocation_id: str) -> tuple[str, str, str]:
+    if record not in _RETENTION_RECORDS:
+        raise ContractError("retention record kind is invalid")
     if (
-        type(uri) is not str
-        or not uri.startswith("file:hermes-retention-")
-        or type(anchor) is not sqlite3.Connection
+        type(run_id) is not str
+        or not run_id
+        or len(run_id) > MAX_REFERENCE_LENGTH
+        or type(invocation_id) is not str
+        or not invocation_id
+        or len(invocation_id) > MAX_REFERENCE_LENGTH
     ):
-        raise RuntimeConfigurationError("invocation retention store was replaced")
-    try:
-        connection = sqlite3.connect(uri, uri=True, check_same_thread=False, isolation_level=None, timeout=5.0)
-        connection.execute("PRAGMA busy_timeout = 5000")
-    except Exception as exc:
-        raise RuntimeConfigurationError("invocation retention store is invalid") from exc
-    return connection
+        raise ContractError("retention record binding is invalid")
+    return record, run_id, invocation_id
 
 
-def _retention_transaction(owner: object) -> sqlite3.Connection:
-    """Acquire SQLite's serialized write transaction with bounded retry."""
+def _retention_authority_response(
+    *,
+    status: str,
+    record: str,
+    run_id: str = "",
+    invocation_id: str = "",
+    value: object | None = None,
+) -> bytes:
+    response: dict[str, object] = {
+        "protocol": _RETENTION_PROTOCOL,
+        "status": status,
+        "record": record,
+        "runId": run_id,
+        "invocationId": invocation_id,
+    }
+    if value is not None:
+        response["value"] = value
+    return canonical_json_bytes(response) + b"\n"
 
-    deadline = time.monotonic() + 5.0
+
+def _retention_authority_main() -> None:
+    """Own canonical retention in a process the supervisor cannot inspect."""
+
+    import secrets
+
+    secret = secrets.token_bytes(32)
+    records: dict[tuple[str, str, str], tuple[bytes, bytes]] = {}
+
+    def integrity(payload: bytes) -> bytes:
+        return hmac.new(secret, payload, hashlib.sha256).digest()
+
+    def emit(response: bytes) -> None:
+        if len(response) > _RETENTION_RESPONSE_LIMIT:
+            raise RuntimeConfigurationError("retention authority response exceeded its bound")
+        sys.stdout.buffer.write(response)
+        sys.stdout.buffer.flush()
+
     while True:
-        connection = _retention_connection(owner)
+        raw_line = sys.stdin.buffer.readline(_RETENTION_REQUEST_LIMIT + 1)
+        if not raw_line:
+            return
+        if not raw_line or len(raw_line) > _RETENTION_REQUEST_LIMIT or not raw_line.endswith(b"\n"):
+            return
         try:
-            connection.execute("BEGIN IMMEDIATE")
-            return connection
-        except sqlite3.OperationalError as exc:
-            connection.close()
-            if "locked" not in str(exc).lower() or time.monotonic() >= deadline:
-                raise
-            time.sleep(0.005)
+            request = json.loads(raw_line[:-1])
+            if type(request) is not dict or request.get("protocol") != _RETENTION_PROTOCOL:
+                raise ContractError("retention request protocol is invalid")
+            operation = request.get("op")
+            record = request.get("record")
+            run_id = request.get("runId", "")
+            invocation_id = request.get("invocationId", "")
+            if operation not in _RETENTION_OPERATIONS or type(record) is not str:
+                raise ContractError("retention request operation is invalid")
+            if operation == "close":
+                if set(request) != {"protocol", "op"}:
+                    raise ContractError("retention close request has unexpected fields")
+                emit(_retention_authority_response(status="closed", record="close"))
+                return
+            if operation == "read":
+                if record in {"result_count", "death_count"}:
+                    if set(request) != {"protocol", "op", "record"}:
+                        raise ContractError("retention count request has unexpected fields")
+                    emit(_retention_authority_response(
+                        status="ok", record=record,
+                        value=sum(key[0] == record[:-6] for key in records),
+                    ))
+                    continue
+                key = _retention_record_key(record, run_id, invocation_id)
+                if set(request) != {"protocol", "op", "record", "runId", "invocationId"}:
+                    raise ContractError("retention read request has unexpected fields")
+                stored = records.get(key)
+                if stored is None:
+                    emit(_retention_authority_response(
+                        status="missing", record=record, run_id=run_id, invocation_id=invocation_id,
+                    ))
+                    continue
+                payload, expected_digest = stored
+                if not hmac.compare_digest(integrity(payload), expected_digest):
+                    return
+                emit(_retention_authority_response(
+                    status="ok", record=record, run_id=run_id, invocation_id=invocation_id,
+                    value=json.loads(payload),
+                ))
+                continue
+            key = _retention_record_key(record, run_id, invocation_id)
+            if set(request) != {"protocol", "op", "record", "runId", "invocationId", "value"}:
+                raise ContractError("retention create request has unexpected fields")
+            value = request["value"]
+            if type(value) is not dict:
+                raise ContractError("retention create value is invalid")
+            payload = canonical_json_bytes(value)
+            if record == "result":
+                canonical = _validated_canonical_payload(payload)
+                if canonical["run_id"] != run_id or canonical["invocation_id"] != invocation_id:
+                    raise BindingError("retention result is bound to a different invocation")
+            else:
+                receipt = _parse_canonical_contract_payload(
+                    payload,
+                    expected_type=_EXACT_TERMINAL_RECEIPT,
+                    label="retention death receipt",
+                )
+                if receipt.run_id != run_id or receipt.invocation_id != invocation_id:
+                    raise BindingError("retention death receipt is bound to a different invocation")
+            existing = records.get(key)
+            if existing is not None:
+                existing_payload, expected_digest = existing
+                if not hmac.compare_digest(integrity(existing_payload), expected_digest):
+                    return
+                if existing_payload != payload:
+                    emit(_retention_authority_response(
+                        status="conflict", record=record, run_id=run_id, invocation_id=invocation_id,
+                    ))
+                else:
+                    emit(_retention_authority_response(
+                        status="replayed", record=record, run_id=run_id, invocation_id=invocation_id,
+                        value=json.loads(existing_payload),
+                    ))
+                continue
+            if record == "result" and sum(key[0] == "result" for key in records) >= _MAX_RETAINED_INVOCATIONS:
+                emit(_retention_authority_response(
+                    status="conflict", record=record, run_id=run_id, invocation_id=invocation_id,
+                ))
+                continue
+            records[key] = (payload, integrity(payload))
+            emit(_retention_authority_response(
+                status="created", record=record, run_id=run_id, invocation_id=invocation_id,
+                value=json.loads(payload),
+            ))
+        except Exception:
+            try:
+                response_record = record if record in _RETENTION_RECORDS else "result"
+                response_run_id = run_id if type(run_id) is str else ""
+                response_invocation_id = invocation_id if type(invocation_id) is str else ""
+                emit(_retention_authority_response(
+                    status="conflict",
+                    record=response_record,
+                    run_id=response_run_id,
+                    invocation_id=response_invocation_id,
+                ))
+            except Exception:
+                return
 
 
-def _retention_snapshot(owner: object) -> dict[tuple[str, str], bytes]:
-    connection = _retention_connection(owner)
+class _RetentionAuthority:
+    """Typed parent client for the isolated canonical-retention process."""
+
+    __slots__ = (
+        "_process",
+        "_process_identity",
+        "_stdin",
+        "_stdin_identity",
+        "_stdout",
+        "_stdout_identity",
+        "_stdin_fd",
+        "_stdout_fd",
+        "_stdin_type",
+        "_stdout_type",
+        "_lock",
+        "_closed",
+    )
+
+    def __init__(self) -> None:
+        try:
+            process = subprocess.Popen(
+                (sys.executable, "-m", __name__, "--retention-authority"),
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                close_fds=True,
+            )
+        except (OSError, ValueError) as exc:
+            raise RuntimeConfigurationError("canonical retention authority could not start") from exc
+        if process.stdin is None or process.stdout is None:
+            process.kill()
+            process.wait(timeout=_RETENTION_CLOSE_TIMEOUT_SECONDS)
+            raise RuntimeConfigurationError("canonical retention authority has no typed channel")
+        self._process = process
+        self._process_identity = process
+        self._stdin = process.stdin
+        self._stdin_identity = process.stdin
+        self._stdout = process.stdout
+        self._stdout_identity = process.stdout
+        self._stdin_fd = process.stdin.fileno()
+        self._stdout_fd = process.stdout.fileno()
+        self._stdin_type = type(process.stdin)
+        self._stdout_type = type(process.stdout)
+        self._lock = threading.RLock()
+        self._closed = False
+
+    def _request(self, request: dict[str, object]) -> dict[str, object]:
+        with self._lock:
+            if (
+                self._closed
+                or self._process is not self._process_identity
+                or self._stdin is not self._stdin_identity
+                or self._stdout is not self._stdout_identity
+                or type(self._process) is not subprocess.Popen
+                or self._process.poll() is not None
+            ):
+                raise RuntimeConfigurationError("canonical retention authority is unavailable")
+            if (
+                self._process.stdin is not self._stdin
+                or self._process.stdout is not self._stdout
+                or type(self._stdin) is not self._stdin_type
+                or type(self._stdout) is not self._stdout_type
+                or self._stdin.fileno() != self._stdin_fd
+                or self._stdout.fileno() != self._stdout_fd
+            ):
+                raise RuntimeConfigurationError("canonical retention authority channel was replaced")
+            raw = canonical_json_bytes(request) + b"\n"
+            if len(raw) > _RETENTION_REQUEST_LIMIT:
+                raise BoundsError("canonical retention request exceeds its bound")
+            try:
+                self._stdin.write(raw)
+                self._stdin.flush()
+                selector = selectors.DefaultSelector()
+                try:
+                    selector.register(self._stdout, selectors.EVENT_READ)
+                    if not selector.select(timeout=_RETENTION_REQUEST_TIMEOUT_SECONDS):
+                        raise RuntimeConfigurationError("canonical retention authority timed out")
+                    response_line = self._stdout.readline(_RETENTION_RESPONSE_LIMIT + 1)
+                finally:
+                    selector.close()
+            except (OSError, ValueError, BrokenPipeError) as exc:
+                raise RuntimeConfigurationError("canonical retention authority channel failed") from exc
+            if not response_line or len(response_line) > _RETENTION_RESPONSE_LIMIT or not response_line.endswith(b"\n"):
+                raise RuntimeConfigurationError("canonical retention authority returned an invalid response")
+            try:
+                response = json.loads(response_line[:-1])
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise RuntimeConfigurationError("canonical retention authority returned malformed JSON") from exc
+            if (
+                type(response) is not dict
+                or response.get("protocol") != _RETENTION_PROTOCOL
+                or response.get("record") not in (*_RETENTION_RECORDS, "result_count", "death_count")
+                or response.get("status") not in _RETENTION_STATUSES
+            ):
+                raise RuntimeConfigurationError("canonical retention authority returned an invalid response")
+            if request.get("op") in {"create", "read"} and request.get("record") in _RETENTION_RECORDS and (
+                response.get("record") != request.get("record")
+                or response.get("runId") != request.get("runId")
+                or response.get("invocationId") != request.get("invocationId")
+            ):
+                raise RuntimeConfigurationError("canonical retention authority response is not request-bound")
+            return response
+
+    def exclusive(self, callback: Callable[[], object]) -> object:
+        with self._lock:
+            return callback()
+
+    def create(self, record: str, key: tuple[str, str], value: dict[str, object]) -> dict[str, object]:
+        run_id, invocation_id = _retention_record_key(record, *key)[1:]
+        return self._request({
+            "protocol": _RETENTION_PROTOCOL,
+            "op": "create",
+            "record": record,
+            "runId": run_id,
+            "invocationId": invocation_id,
+            "value": value,
+        })
+
+    def read(self, record: str, key: tuple[str, str]) -> dict[str, object]:
+        run_id, invocation_id = _retention_record_key(record, *key)[1:]
+        return self._request({
+            "protocol": _RETENTION_PROTOCOL,
+            "op": "read",
+            "record": record,
+            "runId": run_id,
+            "invocationId": invocation_id,
+        })
+
+    def count_results(self) -> int:
+        response = self._request({
+            "protocol": _RETENTION_PROTOCOL,
+            "op": "read",
+            "record": "result_count",
+        })
+        value = response.get("value")
+        if response.get("status") != "ok" or type(value) is not int:
+            raise RuntimeConfigurationError("canonical retention count is invalid")
+        return value
+
+    def count_death_receipts(self) -> int:
+        response = self._request({
+            "protocol": _RETENTION_PROTOCOL,
+            "op": "read",
+            "record": "death_count",
+        })
+        value = response.get("value")
+        if response.get("status") != "ok" or type(value) is not int:
+            raise RuntimeConfigurationError("canonical death-receipt count is invalid")
+        return value
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            process = self._process_identity
+            try:
+                if process.poll() is None:
+                    raw = canonical_json_bytes({"protocol": _RETENTION_PROTOCOL, "op": "close"}) + b"\n"
+                    try:
+                        self._stdin_identity.write(raw)
+                        self._stdin_identity.flush()
+                    except Exception:
+                        pass
+                    try:
+                        process.wait(timeout=_RETENTION_CLOSE_TIMEOUT_SECONDS)
+                    except subprocess.TimeoutExpired:
+                        pass
+            except Exception:
+                pass
+            finally:
+                if process.poll() is None:
+                    try:
+                        process.terminate()
+                    except Exception:
+                        pass
+                    try:
+                        process.wait(timeout=_RETENTION_CLOSE_TIMEOUT_SECONDS)
+                    except Exception:
+                        try:
+                            process.kill()
+                        except Exception:
+                            pass
+                        try:
+                            process.wait(timeout=_RETENTION_CLOSE_TIMEOUT_SECONDS)
+                        except Exception:
+                            pass
+                for stream in (self._stdin_identity, self._stdout_identity):
+                    try:
+                        stream.close()
+                    except Exception:
+                        pass
+
+
+_EXACT_RETENTION_AUTHORITY = _RetentionAuthority
+
+
+def _close_retention_authority(authority: _RetentionAuthority) -> None:
+    """Best-effort finalizer only; the child process remains the authority."""
+
     try:
-        rows = connection.execute(
-            "SELECT run_id, invocation_id, payload FROM supervisor_results"
-        ).fetchall()
-        return {(run_id, invocation_id): bytes(payload) for run_id, invocation_id, payload in rows}
-    finally:
-        connection.close()
-
-
-def _retention_count(connection: sqlite3.Connection) -> int:
-    row = connection.execute("SELECT COUNT(*) FROM supervisor_results").fetchone()
-    if row is None or type(row[0]) is not int:
-        raise RuntimeConfigurationError("invocation retention count is invalid")
-    return row[0]
-
-
-def _verify_integrity(payload: bytes, expected_digest: object) -> None:
-    if type(expected_digest) is not bytes or expected_digest != hashlib.sha256(payload).digest():
-        raise ContractError("retained canonical payload failed its integrity check")
+        authority.close()
+    except Exception:
+        pass
 
 
 class InvocationSupervisor:
@@ -1883,19 +2173,35 @@ class InvocationSupervisor:
             lease_binding.expires_at,
         )
         self._clock = clock
-        self._retention_uri, self._retention_anchor = _new_retention_anchor()
+        authority = _EXACT_RETENTION_AUTHORITY()
+        self._retention_authority = authority
+        # This is lifecycle cleanup, never authority discovery or storage.
+        weakref.finalize(self, _close_retention_authority, authority)
 
-    @property
-    def _results(self) -> Mapping[tuple[str, str], bytes]:
-        """Fresh diagnostic bytes; returned mappings are never authoritative."""
+    def close(self) -> None:
+        """Close the invocation-scoped retention authority process."""
 
-        return MappingProxyType(_retention_snapshot(self))
+        try:
+            authority = object.__getattribute__(self, "_retention_authority")
+        except AttributeError:
+            return
+        if type(authority) is _EXACT_RETENTION_AUTHORITY:
+            authority.close()
 
-    @_results.setter
-    def _results(self, replacement: object) -> None:
-        """Discard caller-supplied cache replacement attempts."""
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
 
-        del replacement
+    def _authority(self) -> _RetentionAuthority:
+        try:
+            authority = object.__getattribute__(self, "_retention_authority")
+        except AttributeError as exc:
+            raise RuntimeConfigurationError("canonical retention authority is unavailable") from exc
+        if type(authority) is not _EXACT_RETENTION_AUTHORITY:
+            raise RuntimeConfigurationError("canonical retention authority was replaced")
+        return authority
 
     def _attest(self, argv: Sequence[str]) -> EnforcementAttestation:
         runner = self.runner
@@ -1976,45 +2282,38 @@ class InvocationSupervisor:
 
     def _retain_result(
         self,
-        connection: sqlite3.Connection,
         key: tuple[str, str],
         result: object,
         name: str,
+        expected_argv_digest: str,
     ) -> object:
-        """Store only canonical bytes and reconstruct a fresh readback view."""
+        """Create one canonical record in the isolated authority."""
 
         try:
             canonical = _canonicalize_result(key, result)
-            public = _public_result_from_canonical(key, canonical)
+            value = json.loads(canonical)
+            if type(value) is not dict:
+                raise ContractError("retained result canonical value is invalid")
+            response = self._authority().create("result", key, value)
+            if response.get("status") not in {"created", "replayed"}:
+                raise ContractError("retained result create was rejected")
+            return self._cached_result(key, name, expected_argv_digest)
         except Exception:
             return self._invalid_retained_result(name)
-        payload_digest = hashlib.sha256(canonical).digest()
-        connection.execute(
-            "INSERT INTO supervisor_results "
-            "(run_id, invocation_id, payload, payload_digest) VALUES (?, ?, ?, ?)",
-            (*key, canonical, payload_digest),
-        )
-        return public
 
     def _cached_result(
         self,
-        connection: sqlite3.Connection,
         key: tuple[str, str],
         name: str,
         expected_argv_digest: str,
     ) -> object:
-        """Validate a retained record; malformed state remains fail-closed."""
+        """Read and validate a fresh record from the isolated authority."""
 
-        row = connection.execute(
-            "SELECT payload, payload_digest FROM supervisor_results "
-            "WHERE run_id = ? AND invocation_id = ?",
-            key,
-        ).fetchone()
-        if row is None:
-            raise KeyError(key)
         try:
-            payload = bytes(row[0])
-            _verify_integrity(payload, bytes(row[1]))
+            response = self._authority().read("result", key)
+            if response.get("status") != "ok" or type(response.get("value")) is not dict:
+                raise KeyError(key)
+            payload = canonical_json_bytes(response["value"])
             canonical = _validated_canonical_payload(payload)
             enforcement = canonical["enforcement"]
             if enforcement is not None and enforcement[1] != expected_argv_digest:
@@ -2126,68 +2425,39 @@ class InvocationSupervisor:
         _validate_binding(run, invocation)
         if reason not in _SAFE_DEATH_REASONS:
             reason = _SAFE_DEATH_REASON
-        key = (run.run_id, invocation.invocation_id)
-        connection = _retention_transaction(self)
         try:
-            self._reconcile_death_locked(
-                connection,
+            return self._authority().exclusive(lambda: self._reconcile_death_locked(
                 run,
                 invocation,
                 final_sequence=final_sequence,
                 reason=reason,
-            )
-            connection.commit()
-            row = connection.execute(
-                "SELECT has_receipt, payload, payload_digest FROM supervisor_death_receipts "
-                "WHERE run_id = ? AND invocation_id = ?",
-                key,
-            ).fetchone()
-            if row is None or row[0] == 0 or row[1] is None or row[2] is None:
-                return None
-            payload = bytes(row[1])
-            _verify_integrity(payload, bytes(row[2]))
-            raw = json.loads(payload)
-            if (
-                type(raw) is not dict
-                or canonical_json_bytes(raw) != payload
-                or raw.get("runId") != key[0]
-                or raw.get("invocationId") != key[1]
-            ):
-                raise ContractError("death receipt canonical payload is invalid")
-            return _record_view(raw)
+                public=True,
+            ))
         except Exception:
-            connection.rollback()
             return None
-        finally:
-            connection.close()
 
     def _reconcile_death_locked(
         self,
-        connection: sqlite3.Connection,
         run: RunSnapshot,
         invocation: InvocationEnvelope,
         *,
         final_sequence: int,
         reason: str,
-    ) -> TerminalReconciliationReceipt | None:
+        public: bool = False,
+    ) -> TerminalReconciliationReceipt | object | None:
         key = (run.run_id, invocation.invocation_id)
-        row = connection.execute(
-            "SELECT has_receipt, payload, payload_digest FROM supervisor_death_receipts "
-            "WHERE run_id = ? AND invocation_id = ?",
-            key,
-        ).fetchone()
-        if row is not None:
-            if row[0] == 0 or row[1] is None or row[2] is None:
-                return None
-            payload = bytes(row[1])
-            _verify_integrity(payload, bytes(row[2]))
-            return _parse_canonical_contract_payload(
+        existing = self._authority().read("death", key)
+        if existing.get("status") == "ok" and type(existing.get("value")) is dict:
+            payload = canonical_json_bytes(existing["value"])
+            receipt = _parse_canonical_contract_payload(
                 payload,
                 expected_type=_EXACT_TERMINAL_RECEIPT,
                 label="death receipt",
             )
-        count = connection.execute("SELECT COUNT(*) FROM supervisor_death_receipts").fetchone()
-        if count is None or count[0] >= _MAX_RETAINED_INVOCATIONS:
+            return _record_view(existing["value"]) if public else receipt
+        if existing.get("status") != "missing":
+            return None
+        if self._authority().count_death_receipts() >= _MAX_RETAINED_INVOCATIONS:
             return None
         try:
             receipt = reconcile_process_death(
@@ -2200,30 +2470,25 @@ class InvocationSupervisor:
         except Exception:
             receipt = None
         if receipt is None:
-            connection.execute(
-                "INSERT INTO supervisor_death_receipts "
-                "(run_id, invocation_id, payload, payload_digest, has_receipt) "
-                "VALUES (?, ?, NULL, NULL, 0)",
-                key,
-            )
             return None
         payload = _canonical_contract_payload(
             receipt,
             expected_type=_EXACT_TERMINAL_RECEIPT,
             label="death receipt",
         )
-        payload_digest = hashlib.sha256(payload).digest()
-        connection.execute(
-            "INSERT INTO supervisor_death_receipts "
-            "(run_id, invocation_id, payload, payload_digest, has_receipt) "
-            "VALUES (?, ?, ?, ?, 1)",
-            (*key, payload, payload_digest),
+        response = self._authority().create("death", key, json.loads(payload))
+        if response.get("status") not in {"created", "replayed"} or type(response.get("value")) is not dict:
+            return None
+        if public:
+            return _record_view(response["value"])
+        return _parse_canonical_contract_payload(
+            canonical_json_bytes(response["value"]),
+            expected_type=_EXACT_TERMINAL_RECEIPT,
+            label="death receipt",
         )
-        return receipt
 
     def _result_for_death(
         self,
-        connection: sqlite3.Connection,
         run: RunSnapshot,
         invocation: InvocationEnvelope,
         *,
@@ -2235,7 +2500,6 @@ class InvocationSupervisor:
         enforcement: EnforcementAttestation | None,
     ) -> tuple[object, ...]:
         receipt = self._reconcile_death_locked(
-            connection,
             run,
             invocation,
             final_sequence=final_sequence,
@@ -2329,200 +2593,205 @@ class InvocationSupervisor:
         *,
         cancellation: CancellationSignal | None = None,
     ) -> object:
+        """Run one invocation through the isolated retention authority."""
+
+        try:
+            name = invocation_container_name(run, invocation)
+            authority = self._authority()
+            return authority.exclusive(lambda: self._run_once_locked(
+                run,
+                invocation,
+                cancellation=cancellation,
+            ))
+        except Exception:
+            try:
+                return self._invalid_retained_result(invocation_container_name(run, invocation))
+            except Exception:
+                return self._invalid_retained_result("invalid")
+
+    def _run_once_locked(
+        self,
+        run: RunSnapshot,
+        invocation: InvocationEnvelope,
+        *,
+        cancellation: CancellationSignal | None = None,
+    ) -> object:
         """Launch, bound, reconcile, and dispose of one invocation."""
 
         _validate_binding(run, invocation)
         _validate_policy(self.policy)
         key = (run.run_id, invocation.invocation_id)
         name = invocation_container_name(run, invocation)
-        connection = _retention_transaction(self)
-        try:
-            def finish(result: object) -> object:
-                public = self._retain_result(connection, key, result, name)
-                connection.commit()
-                return public
+        def finish(result: object) -> object:
+            return self._retain_result(key, result, name, expected_argv_digest)
 
-            row = connection.execute(
-                "SELECT payload FROM supervisor_results WHERE run_id = ? AND invocation_id = ?",
-                key,
-            ).fetchone()
-            if row is not None:
-                expected_argv_digest = _argv_digest(build_invocation_argv(run, invocation, self.policy))
-                public = self._cached_result(connection, key, name, expected_argv_digest)
-                connection.commit()
-                return public
-            if _retention_count(connection) >= _MAX_RETAINED_INVOCATIONS:
-                connection.commit()
-                return _result_view(
-                    {
-                        "run_id": run.run_id,
-                        "invocation_id": invocation.invocation_id,
-                        "status": "supervisor_action_required",
-                        "container_name": name,
-                        "exit": None,
-                        "proposal": None,
-                        "receipt": None,
-                        "cleanup": None,
-                        "enforcement": None,
-                        "evidence": ["result_not_retained", "supervisor_action_required"],
-                    }
-                )
-            try:
-                self._validate_host_lease(run, invocation)
-            except (BindingError, ContractError, RuntimeConfigurationError):
-                return finish(
-                    _draft_result(
-                        "rejected", name, evidence=("lease_rejected", "supervisor_action_required")
-                    )
-                )
+        authority = self._authority()
+        cached = authority.read("result", key)
+        if cached.get("status") == "ok":
             expected_argv_digest = _argv_digest(build_invocation_argv(run, invocation, self.policy))
-            signal = cancellation or _NeverCancelled()
-            cancelled, signal_error = _safe_cancel_check(signal)
-            if cancelled:
-                return finish(
-                    self._result_for_host_cancellation(
-                        run,
-                        invocation,
-                        name=name,
-                        final_sequence=0,
-                        cleanup=None,
-                        enforcement=None,
-                        evidence=("cancellation_signal_unavailable",) if signal_error else ("cancellation_signal",),
-                    )
+            return self._cached_result(key, name, expected_argv_digest)
+        if cached.get("status") != "missing":
+            return self._invalid_retained_result(name)
+        if authority.count_results() >= _MAX_RETAINED_INVOCATIONS:
+            return _result_view(
+                {
+                    "run_id": run.run_id,
+                    "invocation_id": invocation.invocation_id,
+                    "status": "supervisor_action_required",
+                    "container_name": name,
+                    "exit": None,
+                    "proposal": None,
+                    "receipt": None,
+                    "cleanup": None,
+                    "enforcement": None,
+                    "evidence": ["result_not_retained", "supervisor_action_required"],
+                }
+            )
+        try:
+            self._validate_host_lease(run, invocation)
+        except (BindingError, ContractError, RuntimeConfigurationError):
+            expected_argv_digest = _argv_digest(build_invocation_argv(run, invocation, self.policy))
+            return finish(_draft_result("rejected", name, evidence=("lease_rejected", "supervisor_action_required")))
+        expected_argv_digest = _argv_digest(build_invocation_argv(run, invocation, self.policy))
+        signal = cancellation or _NeverCancelled()
+        cancelled, signal_error = _safe_cancel_check(signal)
+        if cancelled:
+            return finish(
+                self._result_for_host_cancellation(
+                    run,
+                    invocation,
+                    name=name,
+                    final_sequence=0,
+                    cleanup=None,
+                    enforcement=None,
+                    evidence=("cancellation_signal_unavailable",) if signal_error else ("cancellation_signal",),
                 )
-            try:
-                argv = build_invocation_argv(run, invocation, self.policy)
-                request = _request_bytes(run, invocation, self.policy)
-                enforcement = self._attest(argv)
-            except (ContractError, BoundsError, RuntimeConfigurationError, BindingError):
-                return finish(
-                    _draft_result("rejected", name, evidence=("policy_rejected", "enforcement_unproven"))
-                )
-            try:
-                process = self._active_runner().launch(
-                    argv,
-                    client_env=dict(_DOCKER_CLIENT_ENV),
-                    input_bytes=request,
-                )
-            except Exception:
-                cleanup = self._cleanup(name)
-                return finish(
-                    self._result_for_death(
-                        connection,
-                        run,
-                        invocation,
-                        name=name,
-                        cleanup=cleanup,
-                        final_sequence=0,
-                        reason="runtime launch failed before terminal evidence",
-                        evidence=("launch_failed",),
-                        enforcement=enforcement,
-                    )
-                )
-
-            deadline = self._clock() + float(self.policy.wall_time_seconds)
-            collection_failed = False
-            try:
-                capture = process.collect(
-                    input_bytes=request,
-                    deadline=deadline,
-                    stdout_limit_bytes=int(self.policy.stdout_limit_bytes),
-                    stderr_limit_bytes=int(self.policy.stderr_limit_bytes),
-                    is_cancelled=lambda: _safe_cancel_check(signal)[0],
-                )
-            except Exception:
-                capture = ProcessCapture(None, reaped=False)
-                collection_failed = True
+            )
+        try:
+            argv = build_invocation_argv(run, invocation, self.policy)
+            request = _request_bytes(run, invocation, self.policy)
+            enforcement = self._attest(argv)
+        except (ContractError, BoundsError, RuntimeConfigurationError, BindingError):
+            return finish(_draft_result("rejected", name, evidence=("policy_rejected", "enforcement_unproven")))
+        try:
+            process = self._active_runner().launch(
+                argv,
+                client_env=dict(_DOCKER_CLIENT_ENV),
+                input_bytes=request,
+            )
+        except Exception:
             cleanup = self._cleanup(name)
-            final_sequence = 0
-            post_cancelled, post_cancel_error = _safe_cancel_check(signal)
-            active_cancellation = not collection_failed and post_cancelled and not post_cancel_error
-            if active_cancellation and self.cancellation_authority is not None:
-                return finish(
-                    self._result_for_host_cancellation(
-                        run,
-                        invocation,
-                        name=name,
-                        final_sequence=0,
-                        cleanup=cleanup,
-                        enforcement=enforcement,
-                        evidence=("cancellation_signal",),
-                    )
-                )
-            if collection_failed:
-                reason = "runtime output was malformed or lacked terminal evidence"
-                evidence = ("collection_failed",)
-            elif active_cancellation:
-                reason = "runtime invocation was stopped by a cancellation signal"
-                evidence = ("cancellation_signal", "cancellation_authority_missing")
-            elif not capture.reaped:
-                reason = "runtime output was malformed or lacked terminal evidence"
-                evidence = ("attach_process_not_reaped", "supervisor_action_required")
-            elif (
-                capture.output_exceeded
-                or len(capture.stdout) > int(self.policy.stdout_limit_bytes)
-                or len(capture.stderr) > int(self.policy.stderr_limit_bytes)
-            ):
-                reason = "runtime output exceeded supervisor bounds"
-                evidence = ("output_limit_exceeded",)
-            elif capture.timed_out:
-                reason = "runtime invocation exceeded its wall-time bound"
-                evidence = ("timeout",)
-            elif capture.cancelled:
-                reason = "runtime invocation was stopped by a cancellation signal"
-                evidence = ("cancellation_signal",)
-            elif capture.returncode not in (0, None):
-                reason = _SAFE_DEATH_REASON
-                evidence = ("child_nonzero_exit",)
-            else:
-                try:
-                    parsed = _parse_child_output(capture.stdout, run=run, invocation=invocation, policy=self.policy)
-                except ChildCancellationProposalRejected:
-                    return finish(
-                        _draft_result(
-                            status="rejected",
-                            container_name=name,
-                            cleanup=cleanup,
-                            enforcement=enforcement,
-                            evidence=("child_cancellation_untrusted", "supervisor_action_required"),
-                        )
-                    )
-                except Exception:
-                    reason = "runtime output was malformed or lacked terminal evidence"
-                    evidence = ("invalid_child_output",)
-                else:
-                    final_sequence = parsed.final_sequence
-                    if capture.returncode is None:
-                        reason = "runtime process died before terminal evidence"
-                        evidence = ("child_process_died",)
-                    else:
-                        return finish(
-                            self._result_from_proposal(
-                                run,
-                                invocation,
-                                name=name,
-                                parsed=parsed,
-                                cleanup=cleanup,
-                                enforcement=enforcement,
-                            )
-                        )
             return finish(
                 self._result_for_death(
-                    connection,
                     run,
                     invocation,
                     name=name,
                     cleanup=cleanup,
-                    final_sequence=final_sequence,
-                    reason=reason,
-                    evidence=evidence,
+                    final_sequence=0,
+                    reason="runtime launch failed before terminal evidence",
+                    evidence=("launch_failed",),
                     enforcement=enforcement,
                 )
             )
-        finally:
-            if connection.in_transaction:
-                connection.rollback()
-            connection.close()
+
+        deadline = self._clock() + float(self.policy.wall_time_seconds)
+        collection_failed = False
+        try:
+            capture = process.collect(
+                input_bytes=request,
+                deadline=deadline,
+                stdout_limit_bytes=int(self.policy.stdout_limit_bytes),
+                stderr_limit_bytes=int(self.policy.stderr_limit_bytes),
+                is_cancelled=lambda: _safe_cancel_check(signal)[0],
+            )
+        except Exception:
+            capture = ProcessCapture(None, reaped=False)
+            collection_failed = True
+        cleanup = self._cleanup(name)
+        final_sequence = 0
+        post_cancelled, post_cancel_error = _safe_cancel_check(signal)
+        active_cancellation = not collection_failed and post_cancelled and not post_cancel_error
+        if active_cancellation and self.cancellation_authority is not None:
+            return finish(
+                self._result_for_host_cancellation(
+                    run,
+                    invocation,
+                    name=name,
+                    final_sequence=0,
+                    cleanup=cleanup,
+                    enforcement=enforcement,
+                    evidence=("cancellation_signal",),
+                )
+            )
+        if collection_failed:
+            reason = "runtime output was malformed or lacked terminal evidence"
+            evidence = ("collection_failed",)
+        elif active_cancellation:
+            reason = "runtime invocation was stopped by a cancellation signal"
+            evidence = ("cancellation_signal", "cancellation_authority_missing")
+        elif not capture.reaped:
+            reason = "runtime output was malformed or lacked terminal evidence"
+            evidence = ("attach_process_not_reaped", "supervisor_action_required")
+        elif (
+            capture.output_exceeded
+            or len(capture.stdout) > int(self.policy.stdout_limit_bytes)
+            or len(capture.stderr) > int(self.policy.stderr_limit_bytes)
+        ):
+            reason = "runtime output exceeded supervisor bounds"
+            evidence = ("output_limit_exceeded",)
+        elif capture.timed_out:
+            reason = "runtime invocation exceeded its wall-time bound"
+            evidence = ("timeout",)
+        elif capture.cancelled:
+            reason = "runtime invocation was stopped by a cancellation signal"
+            evidence = ("cancellation_signal",)
+        elif capture.returncode not in (0, None):
+            reason = _SAFE_DEATH_REASON
+            evidence = ("child_nonzero_exit",)
+        else:
+            try:
+                parsed = _parse_child_output(capture.stdout, run=run, invocation=invocation, policy=self.policy)
+            except ChildCancellationProposalRejected:
+                return finish(
+                    _draft_result(
+                        status="rejected",
+                        container_name=name,
+                        cleanup=cleanup,
+                        enforcement=enforcement,
+                        evidence=("child_cancellation_untrusted", "supervisor_action_required"),
+                    )
+                )
+            except Exception:
+                reason = "runtime output was malformed or lacked terminal evidence"
+                evidence = ("invalid_child_output",)
+            else:
+                final_sequence = parsed.final_sequence
+                if capture.returncode is None:
+                    reason = "runtime process died before terminal evidence"
+                    evidence = ("child_process_died",)
+                else:
+                    return finish(
+                        self._result_from_proposal(
+                            run,
+                            invocation,
+                            name=name,
+                            parsed=parsed,
+                            cleanup=cleanup,
+                            enforcement=enforcement,
+                        )
+                    )
+        return finish(
+            self._result_for_death(
+                run,
+                invocation,
+                name=name,
+                cleanup=cleanup,
+                final_sequence=final_sequence,
+                reason=reason,
+                evidence=evidence,
+                enforcement=enforcement,
+            )
+        )
 
 
 __all__ = [
@@ -2538,3 +2807,7 @@ __all__ = [
     "build_invocation_env",
     "invocation_container_name",
 ]
+
+
+if __name__ == "__main__" and sys.argv[1:] == ["--retention-authority"]:
+    _retention_authority_main()

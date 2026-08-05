@@ -619,7 +619,7 @@ class SupervisorTests(unittest.TestCase):
         self.assertTrue(second.completed)
         self.assertIsNot(type(first), type(second))
 
-    def test_results_diagnostic_mapping_and_valid_payload_mutation_are_non_authoritative(self) -> None:
+    def test_reachable_sqlite_row_and_digest_replacement_cannot_forge_readback(self) -> None:
         port = FixtureTerminalReconciliationPort()
         supervisor, _runner = self.make_supervisor(
             proposal_output(self.snapshot, self.invocation),
@@ -627,50 +627,91 @@ class SupervisorTests(unittest.TestCase):
         )
         first = supervisor.run_once(self.snapshot, self.invocation)
         key = (self.snapshot.run_id, self.invocation.invocation_id)
-        snapshot = supervisor._results
-        with self.assertRaises(TypeError):
-            snapshot[key] = b"forged"  # type: ignore[index]
-        self.assertEqual(snapshot[key], supervisor._results[key])
-
-        canonical = json.loads(snapshot[key])
-        canonical["evidence"].append("forged-but-well-shaped")
-        supervisor._retention_anchor.execute(
-            "UPDATE supervisor_results SET payload = ? WHERE run_id = ? AND invocation_id = ?",
-            (json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode(), *key),
-        )
+        authority = supervisor._retention_authority
+        self.assertFalse(hasattr(supervisor, "_retention_anchor"))
+        self.assertFalse(hasattr(supervisor, "_retention_uri"))
+        self.assertFalse(hasattr(supervisor, "_results"))
+        canonical = dict(authority.read("result", key)["value"])
+        canonical["evidence"] = [*canonical["evidence"], "forged-but-well-shaped"]
+        self.assertEqual(authority.create("result", key, canonical)["status"], "conflict")
+        canonical["payloadDigest"] = "0" * 64
+        self.assertEqual(authority.create("result", key, canonical)["status"], "conflict")
         second = supervisor.run_once(self.snapshot, self.invocation)
-        self.assertEqual(second.status, "supervisor_action_required")
-        self.assertIn("retained_result_invalid", second.evidence)
+        self.assertEqual(second, first)
+        self.assertEqual(second.evidence, ("host_reconciliation", "enforcement_attested"))
         self.assertFalse(second.production_completed)
         self.assertEqual(len(port.proposals), 1)
         self.assertTrue(first.completed)
 
-    def test_malformed_or_production_canonical_records_fail_closed_without_reconciliation(self) -> None:
-        for mutation in ("production", "malformed", "binding"):
-            with self.subTest(mutation=mutation):
-                port = FixtureTerminalReconciliationPort()
-                supervisor, _runner = self.make_supervisor(
-                    proposal_output(self.snapshot, self.invocation),
-                    port=port,
-                )
-                first = supervisor.run_once(self.snapshot, self.invocation)
-                key = (self.snapshot.run_id, self.invocation.invocation_id)
-                canonical = json.loads(supervisor._results[key])
-                if mutation == "production":
-                    canonical["enforcement"] = ["production", "0" * 64, first.container_name, ["forged"]]
-                elif mutation == "malformed":
-                    canonical["evidence"] = {}
-                else:
-                    canonical["enforcement"] = ["test", "0" * 64, "wrong-container", ["forged"]]
-                supervisor._retention_anchor.execute(
-                    "UPDATE supervisor_results SET payload = ? WHERE run_id = ? AND invocation_id = ?",
-                    (json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode(), *key),
-                )
-                second = supervisor.run_once(self.snapshot, self.invocation)
-                self.assertEqual(second.status, "supervisor_action_required")
-                self.assertFalse(second.production_completed)
-                self.assertIn("retained_result_invalid", second.evidence)
-                self.assertEqual(len(port.proposals), 1)
+    def test_parent_authority_replacement_before_terminalization_fails_closed(self) -> None:
+        port = FixtureTerminalReconciliationPort()
+        supervisor, runner = self.make_supervisor(
+            proposal_output(self.snapshot, self.invocation),
+            port=port,
+        )
+        authority = supervisor._retention_authority
+        object.__setattr__(supervisor, "_retention_authority", object())
+        result = supervisor.run_once(self.snapshot, self.invocation)
+        authority.close()
+        self.assertEqual(result.status, "supervisor_action_required")
+        self.assertIn("retained_result_invalid", result.evidence)
+        self.assertEqual(runner.launch_calls, 0)
+        self.assertEqual(port.proposals, [])
+
+    def test_parent_authority_handle_replacements_fail_closed_and_reap_original(self) -> None:
+        before_port = FixtureTerminalReconciliationPort()
+        before, before_runner = self.make_supervisor(
+            proposal_output(self.snapshot, self.invocation),
+            port=before_port,
+        )
+        before_authority = before._retention_authority
+        before_process = before_authority._process
+        object.__setattr__(before_authority, "_process", object())
+        before_result = before.run_once(self.snapshot, self.invocation)
+        before.close()
+        self.assertEqual(before_result.status, "supervisor_action_required")
+        self.assertEqual(before_runner.launch_calls, 0)
+        self.assertIsNotNone(before_process.poll())
+
+        after_port = FixtureTerminalReconciliationPort()
+        after, after_runner = self.make_supervisor(
+            proposal_output(self.snapshot, self.invocation),
+            port=after_port,
+        )
+        self.assertEqual(after.run_once(self.snapshot, self.invocation).status, "completed")
+        after_authority = after._retention_authority
+        after_process = after_authority._process
+        object.__setattr__(after_authority, "_stdout", object())
+        after_result = after.run_once(self.snapshot, self.invocation)
+        after.close()
+        self.assertEqual(after_result.status, "supervisor_action_required")
+        self.assertEqual(after_runner.launch_calls, 1)
+        self.assertEqual(len(after_port.proposals), 1)
+        self.assertIsNotNone(after_process.poll())
+
+    def test_authority_death_after_terminalization_fails_closed(self) -> None:
+        port = FixtureTerminalReconciliationPort()
+        supervisor, runner = self.make_supervisor(
+            proposal_output(self.snapshot, self.invocation),
+            port=port,
+        )
+        first = supervisor.run_once(self.snapshot, self.invocation)
+        authority_process = supervisor._retention_authority._process
+        authority_process.kill()
+        authority_process.wait(timeout=2)
+        second = supervisor.run_once(self.snapshot, self.invocation)
+        self.assertEqual(first.status, "completed")
+        self.assertEqual(second.status, "supervisor_action_required")
+        self.assertFalse(second.production_completed)
+        self.assertEqual(runner.launch_calls, 1)
+        self.assertEqual(len(port.proposals), 1)
+
+    def test_explicit_close_reaps_authority_and_is_idempotent(self) -> None:
+        supervisor, _runner = self.make_supervisor(b"")
+        authority_process = supervisor._retention_authority._process
+        supervisor.close()
+        supervisor.close()
+        self.assertIsNotNone(authority_process.poll())
 
     def test_returned_result_mutation_cannot_change_retained_nonproduction_truth(self) -> None:
         port = FixtureTerminalReconciliationPort()
@@ -702,18 +743,10 @@ class SupervisorTests(unittest.TestCase):
         result = supervisor.run_once(self.snapshot, self.invocation)
         self.assertEqual(result.status, "failed")
         key = (self.snapshot.run_id, self.invocation.invocation_id)
-        row = supervisor._retention_anchor.execute(
-            "SELECT payload FROM supervisor_death_receipts WHERE run_id = ? AND invocation_id = ?",
-            key,
-        ).fetchone()
-        self.assertIsNotNone(row)
-        receipt = json.loads(row[0])
+        receipt = dict(supervisor._retention_authority.read("death", key)["value"])
         receipt["receiptRef"] = "forged-receipt"
-        supervisor._retention_anchor.execute(
-            "UPDATE supervisor_death_receipts SET payload = ? WHERE run_id = ? AND invocation_id = ?",
-            (json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode(), *key),
-        )
-        self.assertIsNone(supervisor.reconcile_death(self.snapshot, self.invocation))
+        self.assertEqual(supervisor._retention_authority.create("death", key, receipt)["status"], "conflict")
+        self.assertIsNotNone(supervisor.reconcile_death(self.snapshot, self.invocation))
         self.assertEqual(len(port.proposals), 1)
 
     def test_child_cancellation_receipt_is_rejected_without_host_mutation(self) -> None:
@@ -831,16 +864,18 @@ class SupervisorTests(unittest.TestCase):
         for index in range(_MAX_RETAINED_INVOCATIONS):
             invocation = make_invocation(self.snapshot, f"invocation:hostile-{index}")
             retained.append(supervisor.run_once(self.snapshot, invocation))
-        self.assertEqual(len(supervisor._results), _MAX_RETAINED_INVOCATIONS)
+        self.assertEqual(supervisor._retention_authority.count_results(), _MAX_RETAINED_INVOCATIONS)
         overflow_invocation = make_invocation(self.snapshot, "invocation:hostile-overflow")
         overflow = supervisor.run_once(self.snapshot, overflow_invocation)
         self.assertEqual(overflow.status, "supervisor_action_required")
         self.assertIn("result_not_retained", overflow.evidence)
-        self.assertNotIn(
-            (self.snapshot.run_id, overflow_invocation.invocation_id),
-            supervisor._results,
+        self.assertEqual(
+            supervisor._retention_authority.read(
+                "result", (self.snapshot.run_id, overflow_invocation.invocation_id)
+            )["status"],
+            "missing",
         )
-        self.assertEqual(len(supervisor._results), _MAX_RETAINED_INVOCATIONS)
+        self.assertEqual(supervisor._retention_authority.count_results(), _MAX_RETAINED_INVOCATIONS)
         self.assertEqual(
             supervisor.run_once(self.snapshot, make_invocation(self.snapshot, "invocation:hostile-0")),
             retained[0],

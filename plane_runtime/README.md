@@ -106,11 +106,15 @@ produce a `production_completed` result; there is deliberately no mutable
 closed-runner production path to replace. The attach client is terminated,
 killed if necessary, and reaped on every collector exit before container
 cleanup. Results are retained under a fixed bound only as validated private
-canonical bytes in an invocation-local serialized store; caller-supplied or
-mutated result objects are never trusted. Each lookup validates the binding
-and integrity record, then returns a fresh immutable non-production value
-view. The store is ephemeral Hermes execution state, not Plane product or
-database authority.
+canonical values inside one invocation-scoped authority process. The parent
+can request only typed create/read/close operations; it receives no database,
+URI, connection, digest key, row replacement, or delete path. The authority
+performs canonical binding and keyed-integrity checks atomically, converges
+same replays, rejects conflicting replays, and returns fresh immutable
+non-production value views. Killing or replacing the authority fails closed.
+This state is ephemeral Hermes execution state, not Plane product or database
+authority. Callers should invoke `InvocationSupervisor.close()` explicitly;
+the bounded finalizer is only a cleanup fallback.
 Overflow is returned as supervisor action required without inserting past the
 cap. Cleanup proves deterministic container absence after stop/kill/remove-volume
 attempts.
