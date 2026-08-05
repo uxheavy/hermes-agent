@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import gc
 import io
+import inspect
 import json
 import math
 import os
@@ -937,6 +938,51 @@ sys.stdout.flush()
                 process.wait(timeout=2)
             supervisor_module.__dict__.pop("_RETENTION_FINALIZERS", None)
 
+    def test_authority_constructor_has_no_dependency_injection_surface(self) -> None:
+        self.assertEqual(tuple(inspect.signature(supervisor_module._RetentionAuthority).parameters), ())
+        self.assertEqual(
+            tuple(inspect.signature(supervisor_module._RetentionAuthority.__new__).parameters),
+            ("cls",),
+        )
+        former_dependency_names = (
+            "_trusted_popen",
+            "_trusted_executable",
+            "_trusted_module_name",
+            "_trusted_source_path",
+            "_trusted_source_digest",
+            "_trusted_validator",
+            "_trusted_make_endpoint",
+            "_trusted_write_frame",
+            "_trusted_close_process",
+            "_trusted_token_bytes",
+            "_trusted_getpid",
+            "_trusted_set_blocking",
+            "_trusted_pipe",
+            "_trusted_devnull",
+            "_trusted_monotonic",
+            "_trusted_finalize",
+        )
+        launched: list[object] = []
+
+        def fail_if_launched(*args, **kwargs):
+            launched.append((args, kwargs))
+            raise AssertionError("dependency-injection attempt launched a process")
+
+        with patch.object(supervisor_module.subprocess, "Popen", fail_if_launched):
+            for name in former_dependency_names:
+                supplied_calls: list[object] = []
+
+                def supplied(*args, **kwargs):
+                    supplied_calls.append((args, kwargs))
+                    raise AssertionError("caller-supplied dependency was invoked")
+
+                with self.subTest(name=name), self.assertRaises(TypeError):
+                    supervisor_module._RetentionAuthority(**{name: supplied})
+                self.assertEqual(supplied_calls, [])
+            with self.assertRaises(TypeError):
+                supervisor_module._RetentionAuthority(object())
+        self.assertEqual(launched, [])
+
     def test_authority_construction_failure_reaps_bootstrapped_child(self) -> None:
         captured: list[subprocess.Popen[bytes]] = []
 
@@ -945,7 +991,7 @@ sys.stdout.flush()
             raise RuntimeError("endpoint construction failed")
 
         with self.assertRaises(supervisor_module.RuntimeConfigurationError):
-            supervisor_module._RetentionAuthority(_trusted_make_endpoint=fail_after_launch)
+            supervisor_module._make_retention_authority_for_test(make_endpoint=fail_after_launch)
         self.assertEqual(len(captured), 1)
         self.assertIsNotNone(captured[0].poll())
 

@@ -2563,94 +2563,77 @@ def _validate_retention_spawn_contract(
         raise RuntimeConfigurationError("retention authority spawn contract is unavailable") from exc
 
 
-class _RetentionAuthority:
-    """Typed parent client for the isolated canonical-retention process."""
+def _make_retention_authority_constructor():
+    """Bind production authority dependencies outside the constructor surface."""
 
-    __slots__ = (
-        "_process",
-        "_process_identity",
-        "_stdin",
-        "_stdin_identity",
-        "_stdout",
-        "_stdout_identity",
-        "_stdin_fd",
-        "_stdout_fd",
-        "_stdin_type",
-        "_stdout_type",
-        "_lock",
-        "_closed",
-        "__weakref__",
-    )
+    trusted_popen = _RETENTION_POPEN
+    trusted_executable = _RETENTION_EXECUTABLE
+    trusted_module_name = _RETENTION_MODULE_NAME
+    trusted_source_path = _RETENTION_SOURCE_PATH
+    trusted_source_digest = _RETENTION_SOURCE_DIGEST
+    trusted_validator = _validate_retention_spawn_contract
+    trusted_make_endpoint = _make_retention_endpoint
+    trusted_write_frame = _retention_write_frame
+    trusted_close_process = _close_retention_process
+    trusted_token_bytes = secrets.token_bytes
+    trusted_getpid = os.getpid
+    trusted_set_blocking = os.set_blocking
+    trusted_pipe = subprocess.PIPE
+    trusted_devnull = subprocess.DEVNULL
+    trusted_monotonic = time.monotonic
+    trusted_finalize = weakref.finalize
 
-    def __new__(
-        cls,
-        _trusted_popen=subprocess.Popen,
-        _trusted_executable=os.path.realpath(sys.executable),
-        _trusted_module_name=__name__,
-        _trusted_source_path=os.path.realpath(__file__),
-        _trusted_source_digest=_RETENTION_SOURCE_DIGEST,
-        _trusted_validator=_validate_retention_spawn_contract,
-        _trusted_make_endpoint=_make_retention_endpoint,
-        _trusted_write_frame=_retention_write_frame,
-        _trusted_close_process=_close_retention_process,
-        _trusted_token_bytes=secrets.token_bytes,
-        _trusted_getpid=os.getpid,
-        _trusted_set_blocking=os.set_blocking,
-        _trusted_pipe=subprocess.PIPE,
-        _trusted_devnull=subprocess.DEVNULL,
-        _trusted_monotonic=time.monotonic,
-        _trusted_finalize=weakref.finalize,
-    ) -> _RetentionAuthority:
-        _trusted_validator(
-            trusted_popen=_trusted_popen,
-            trusted_executable=_trusted_executable,
-            trusted_module_name=_trusted_module_name,
-            trusted_source_path=_trusted_source_path,
-            trusted_source_digest=_trusted_source_digest,
+    def construct(cls, make_endpoint):
+        trusted_validator(
+            trusted_popen=trusted_popen,
+            trusted_executable=trusted_executable,
+            trusted_module_name=trusted_module_name,
+            trusted_source_path=trusted_source_path,
+            trusted_source_digest=trusted_source_digest,
         )
         command = (
-            _trusted_executable,
+            trusted_executable,
             "-m",
-            _trusted_module_name,
+            trusted_module_name,
             "--retention-authority",
         )
-        secret = _trusted_token_bytes(_RETENTION_SECRET_LENGTH)
+        secret = trusted_token_bytes(_RETENTION_SECRET_LENGTH)
         if type(secret) is not bytes or len(secret) != _RETENTION_SECRET_LENGTH:
             raise RuntimeConfigurationError("canonical retention authority secret is unavailable")
         try:
-            process = _trusted_popen(
+            process = trusted_popen(
                 command,
-                stdin=_trusted_pipe,
-                stdout=_trusted_pipe,
-                stderr=_trusted_devnull,
+                stdin=trusted_pipe,
+                stdout=trusted_pipe,
+                stderr=trusted_devnull,
                 close_fds=True,
             )
         except (OSError, ValueError) as exc:
             raise RuntimeConfigurationError("canonical retention authority could not start") from exc
-        if type(process) is not _trusted_popen or process.stdin is None or process.stdout is None:
-            _trusted_close_process(process)
+        if type(process) is not trusted_popen or process.stdin is None or process.stdout is None:
+            trusted_close_process(process)
             raise RuntimeConfigurationError("canonical retention authority has no trusted typed channel")
         try:
             stdin_fd = process.stdin.fileno()
             stdout_fd = process.stdout.fileno()
             stdin_type = type(process.stdin)
             stdout_type = type(process.stdout)
-            _trusted_set_blocking(stdin_fd, False)
-            _trusted_set_blocking(stdout_fd, False)
+            trusted_set_blocking(stdin_fd, False)
+            trusted_set_blocking(stdout_fd, False)
         except (OSError, ValueError) as exc:
-            _trusted_close_process(process)
+            trusted_close_process(process)
             raise RuntimeConfigurationError("canonical retention authority channel is unavailable") from exc
         try:
-            _trusted_write_frame(
+            trusted_write_frame(
                 stdin_fd,
                 secret,
-                _trusted_monotonic() + _RETENTION_REQUEST_TIMEOUT_SECONDS,
+                trusted_monotonic() + _RETENTION_REQUEST_TIMEOUT_SECONDS,
             )
         except Exception as exc:
-            _trusted_close_process(process, process.stdin, process.stdout)
+            trusted_close_process(process, process.stdin, process.stdout)
             raise RuntimeConfigurationError("canonical retention authority bootstrap failed") from exc
         authority_pid = process.pid
-        parent_pid = _trusted_getpid()
+        parent_pid = trusted_getpid()
         cleanup_cell: list[Callable[[str, object | None], object] | None] = [None]
 
         def bound_request(self: _RetentionAuthority, request: dict[str, object]) -> dict[str, object]:
@@ -2698,7 +2681,7 @@ class _RetentionAuthority:
         authority._lock = threading.RLock()
         authority._closed = False
         try:
-            endpoint = _trusted_make_endpoint(
+            endpoint = make_endpoint(
                 weakref.ref(authority),
                 process,
                 process.stdin,
@@ -2709,24 +2692,24 @@ class _RetentionAuthority:
                 stdout_type,
                 authority._lock,
                 secret,
-                _trusted_source_digest,
-                _trusted_source_path,
+                trusted_source_digest,
+                trusted_source_path,
                 parent_pid,
                 authority_pid,
             )
         except Exception as exc:
-            _trusted_close_process(process, process.stdin, process.stdout)
+            trusted_close_process(process, process.stdin, process.stdout)
             raise RuntimeConfigurationError("canonical retention authority endpoint is unavailable") from exc
         cleanup_cell[0] = endpoint
-        _trusted_finalize(authority, endpoint, "close")
+        trusted_finalize(authority, endpoint, "close")
         try:
             endpoint(
                 "request",
                 {
                     "protocol": _RETENTION_PROTOCOL,
                     "op": "authenticate",
-                    "nonce": _trusted_token_bytes(_RETENTION_SECRET_LENGTH).hex(),
-                    "sourceDigest": _trusted_source_digest,
+                    "nonce": trusted_token_bytes(_RETENTION_SECRET_LENGTH).hex(),
+                    "sourceDigest": trusted_source_digest,
                 },
             )
         except Exception:
@@ -2734,6 +2717,39 @@ class _RetentionAuthority:
             raise
 
         return authority
+
+    def production_new(cls):
+        return construct(cls, trusted_make_endpoint)
+
+    def test_construct(cls, make_endpoint):
+        return construct(cls, make_endpoint)
+
+    return production_new, test_construct
+
+
+_retention_authority_new, _retention_authority_test_constructor = _make_retention_authority_constructor()
+
+
+class _RetentionAuthority:
+    """Typed parent client for the isolated canonical-retention process."""
+
+    __slots__ = (
+        "_process",
+        "_process_identity",
+        "_stdin",
+        "_stdin_identity",
+        "_stdout",
+        "_stdout_identity",
+        "_stdin_fd",
+        "_stdout_fd",
+        "_stdin_type",
+        "_stdout_type",
+        "_lock",
+        "_closed",
+        "__weakref__",
+    )
+
+    __new__ = _retention_authority_new
 
     def __init__(self) -> None:
         pass
@@ -2789,6 +2805,12 @@ class _RetentionAuthority:
 
 
 _EXACT_RETENTION_AUTHORITY = _RetentionAuthority
+
+
+def _make_retention_authority_for_test(*, make_endpoint):
+    """Test-only construction seam; production calls cannot select it."""
+
+    return _retention_authority_test_constructor(_RetentionAuthority, make_endpoint)
 
 
 class InvocationSupervisor:
