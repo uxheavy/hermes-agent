@@ -239,6 +239,15 @@ class HermesKernelAdapter:
                     failure_message="continuation checkpoint is not available to the trusted host",
                     retryable=False,
                 )
+            try:
+                prefill_messages = self._checkpoint_source.load(str(checkpoint_ref))
+            except Exception:
+                return HermesKernelResult(
+                    kind="failed",
+                    failure_code="invalid_continuation",
+                    failure_message="continuation checkpoint could not be reconstructed",
+                    retryable=False,
+                )
         if model_call_allowance is None or isinstance(model_call_allowance, bool) or not isinstance(model_call_allowance, int) or model_call_allowance < 0:
             return HermesKernelResult(
                 kind="failed",
@@ -254,15 +263,6 @@ class HermesKernelAdapter:
                 retryable=False,
                 model_calls=0,
             )
-            try:
-                prefill_messages = self._checkpoint_source.load(str(checkpoint_ref))
-            except Exception:
-                return HermesKernelResult(
-                    kind="failed",
-                    failure_code="invalid_continuation",
-                    failure_message="continuation checkpoint could not be reconstructed",
-                    retryable=False,
-                )
 
         event_limit = int(snapshot.raw["runtimePolicy"]["maxEventPayloadBytes"])
         try:

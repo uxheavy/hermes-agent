@@ -998,6 +998,114 @@ class G1RuntimeProcessTests(unittest.TestCase):
         self.assertEqual(result.failure_code, "budget_exhausted")
         self.assertFalse(constructed)
 
+    def test_approved_checkpoint_is_loaded_once_and_prefilled_before_hermes(self) -> None:
+        snapshot = G1RunSnapshot.from_dict(make_snapshot())
+        invocation_raw = make_invocation(snapshot.to_dict())
+        invocation_raw.update(
+            {
+                "invocationId": "invocation:checkpoint",
+                "trigger": {"kind": "recoverable_restart", "eventRef": "event:checkpoint"},
+                "checkpointRef": "checkpoint:approved",
+            }
+        )
+        invocation = G1InvocationEnvelope.from_dict(invocation_raw)
+        loaded: list[str] = []
+        captured: dict[str, object] = {}
+
+        class CheckpointSource:
+            def load(self, checkpoint_ref: str) -> list[dict[str, str]]:
+                loaded.append(checkpoint_ref)
+                return [{"role": "assistant", "content": "approved checkpoint context"}]
+
+        class FakeAgent:
+            session_api_calls = 1
+
+            def run_conversation(self, message: str, *, system_message: str) -> dict[str, str]:
+                captured["message"] = message
+                captured["system_message"] = system_message
+                return {"final_response": "continued"}
+
+        class Credentials:
+            def resolve(self, provider: str) -> dict[str, str]:
+                del provider
+                return {"api_key": "trusted-host-secret", "api_mode": "chat_completions"}
+
+        def factory(**kwargs: object) -> FakeAgent:
+            captured["kwargs"] = kwargs
+            return FakeAgent()
+
+        result = HermesKernelAdapter(
+            agent_factory=factory,
+            credential_source=Credentials(),
+            checkpoint_source=CheckpointSource(),
+        ).dispatch(snapshot, invocation, lambda: False, lambda body: None, model_call_allowance=1)
+
+        self.assertEqual(result.kind, "completed")
+        self.assertEqual(loaded, ["checkpoint:approved"])
+        self.assertEqual(
+            captured["kwargs"]["prefill_messages"],  # type: ignore[index]
+            [{"role": "assistant", "content": "approved checkpoint context"}],
+        )
+        self.assertEqual(captured["message"], snapshot.objective)
+
+    def test_checkpoint_source_failure_and_zero_allowance_never_start_empty_hermes(self) -> None:
+        snapshot = G1RunSnapshot.from_dict(make_snapshot())
+        invocation_raw = make_invocation(snapshot.to_dict())
+        invocation_raw.update(
+            {
+                "invocationId": "invocation:checkpoint-failure",
+                "trigger": {"kind": "recoverable_restart", "eventRef": "event:checkpoint-failure"},
+                "checkpointRef": "checkpoint:approved",
+            }
+        )
+        invocation = G1InvocationEnvelope.from_dict(invocation_raw)
+        load_calls = 0
+        constructed = False
+
+        class CheckpointSource:
+            def load(self, checkpoint_ref: str) -> list[dict[str, str]]:
+                nonlocal load_calls
+                del checkpoint_ref
+                load_calls += 1
+                raise ValueError("approved checkpoint is malformed or mismatched")
+
+        class Credentials:
+            def resolve(self, provider: str) -> dict[str, str]:
+                del provider
+                return {"api_key": "trusted-host-secret"}
+
+        def factory(**kwargs: object) -> object:
+            nonlocal constructed
+            del kwargs
+            constructed = True
+            return object()
+
+        adapter = HermesKernelAdapter(
+            agent_factory=factory,
+            credential_source=Credentials(),
+            checkpoint_source=CheckpointSource(),
+        )
+        failed = adapter.dispatch(snapshot, invocation, lambda: False, lambda body: None, model_call_allowance=1)
+        self.assertEqual(failed.failure_code, "invalid_continuation")
+        self.assertEqual(load_calls, 1)
+        self.assertFalse(constructed)
+
+        class EmptyCheckpointSource:
+            def load(self, checkpoint_ref: str) -> list[dict[str, str]]:
+                nonlocal load_calls
+                load_calls += 1
+                del checkpoint_ref
+                return [{"role": "assistant", "content": "approved checkpoint context"}]
+
+        zero = HermesKernelAdapter(
+            agent_factory=factory,
+            credential_source=Credentials(),
+            checkpoint_source=EmptyCheckpointSource(),
+        ).dispatch(snapshot, invocation, lambda: False, lambda body: None, model_call_allowance=0)
+        self.assertEqual(zero.failure_code, "budget_exhausted")
+        self.assertEqual(load_calls, 2)
+        self.assertFalse(constructed)
+
     def test_cumulative_budget_cannot_increase_across_invocations(self) -> None:
         snapshot = make_snapshot()
         first = make_invocation(snapshot)
