@@ -723,6 +723,14 @@ def main(argv: list[str] | None = None) -> int:
             raise ContractError("service request must be an object")
         if not isinstance(request, dict) or set(request) != {"run", "invocation"}:
             raise ContractError("production runtime request has unsupported fields")
+        # The accepted G1 contract is a separate, direct-frame path.  Keep the
+        # older proposal-only service available for its existing callers while
+        # making the new child process consume exact G1 values.
+        run_value = request.get("run")
+        if isinstance(run_value, dict) and {"profile", "runtimePolicy"}.issubset(run_value):
+            from .g1_service import serve_once_g1
+
+            return serve_once_g1(request_line, sys.stdout)
         # Parsing proves the fixed command accepts arbitrary valid envelopes,
         # but it does not authorize execution.  A real KernelPort binding must
         # be installed by the future runtime service; fail closed otherwise.

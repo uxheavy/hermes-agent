@@ -1,0 +1,163 @@
+"""One-shot G1 runtime service for a replaceable Hermes child process."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from datetime import datetime, timezone
+from typing import Any, Mapping, TextIO
+
+from .g1_contract import (
+    G1ContractError,
+    G1InvocationEnvelope,
+    G1RunSnapshot,
+    bind_snapshot_and_invocation,
+    build_event,
+    build_exit,
+    validate_g1_frames,
+)
+from .hermes_adapter import DeterministicKernelAdapter, HermesKernelAdapter, HermesKernelResult
+
+
+def _runtime_suffix(invocation_id: str) -> str:
+    return hashlib.sha256(invocation_id.encode("utf-8")).hexdigest()[:16]
+
+
+def _publication(kind: str, suffix: str) -> dict[str, str]:
+    return {
+        "action": "proposal",
+        "productKind": kind,
+        "productRef": f"{kind.replace('_', '-')}:runtime-{suffix}",
+        "operationAttemptRef": f"operation-attempt:runtime-{suffix}",
+    }
+
+
+def _lease_is_alive(invocation: G1InvocationEnvelope) -> bool:
+    expires_at = str(invocation.lease["expiresAt"])
+    try:
+        parsed = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise G1ContractError("lease.expiresAt is not an ISO-8601 timestamp") from exc
+    if parsed.tzinfo is None:
+        raise G1ContractError("lease.expiresAt must include a timezone")
+    return datetime.now(timezone.utc) < parsed.astimezone(timezone.utc)
+
+
+def _failure_result(code: str, message: str, *, retryable: bool = False) -> HermesKernelResult:
+    return HermesKernelResult(
+        kind="failed",
+        failure_code=code,
+        failure_message=message,
+        retryable=retryable,
+    )
+
+
+def _terminal_failure(
+    snapshot: G1RunSnapshot,
+    invocation: G1InvocationEnvelope,
+    result: HermesKernelResult,
+    sequence: int,
+) -> dict[str, Any]:
+    kind = result.kind
+    if kind == "cancelled":
+        exit_kind = "cancelled"
+        code = result.failure_code or "cancelled"
+    elif kind == "waiting_for_input":
+        raise G1ContractError("waiting_for_input must be represented by an input event")
+    elif kind == "blocked":
+        exit_kind = "blocked"
+        code = result.failure_code or "runtime_error"
+    else:
+        exit_kind = "failed"
+        code = result.failure_code or "runtime_error"
+    failure = {
+        "code": code,
+        "message": result.failure_message or "Hermes runtime did not complete",
+        "retryable": bool(result.retryable),
+    }
+    return build_exit(
+        snapshot=snapshot,
+        invocation=invocation,
+        final_sequence=sequence - 1 if sequence else 0,
+        kind=exit_kind,
+        failure=failure,
+    )
+
+
+def serve_once_g1(request_line: str, output: TextIO) -> int:
+    """Consume exactly one G1 request and write direct event/exit frames.
+
+    The child owns no Plane state.  It validates the immutable inputs, invokes
+    one Hermes adapter, and returns observations plus runtime evidence only.
+    """
+
+    request = json.loads(request_line)
+    if not isinstance(request, dict) or set(request) != {"run", "invocation"}:
+        raise G1ContractError("G1 service request must contain run and invocation")
+    snapshot = G1RunSnapshot.from_dict(request["run"])
+    invocation = G1InvocationEnvelope.from_dict(request["invocation"])
+    bind_snapshot_and_invocation(snapshot, invocation)
+
+    frames: list[dict[str, Any]] = []
+
+    def emit_body(body: Mapping[str, Any]) -> None:
+        event = build_event(
+            snapshot=snapshot,
+            invocation=invocation,
+            sequence=len(frames),
+            body=body,
+        )
+        frames.append(event)
+
+    try:
+        if not _lease_is_alive(invocation):
+            result = _failure_result("lease_expired", "invocation lease is no longer valid")
+        elif any(value == 0 for value in invocation.remaining_budget.values()):
+            result = _failure_result("budget_exhausted", "cumulative invocation budget is exhausted")
+        elif snapshot.adapter_name == "deterministic-test-adapter":
+            result = DeterministicKernelAdapter().dispatch(snapshot, invocation, lambda: False, emit_body)
+        else:
+            result = HermesKernelAdapter().dispatch(snapshot, invocation, lambda: False, emit_body)
+    except Exception:
+        result = _failure_result("runtime_error", "Hermes runtime execution failed", retryable=True)
+
+    if result.kind == "completed":
+        exit_frame = build_exit(
+            snapshot=snapshot,
+            invocation=invocation,
+            final_sequence=len(frames) - 1,
+            kind="completed",
+        )
+    elif result.kind == "waiting_for_input":
+        if not result.question:
+            raise G1ContractError("waiting_for_input result has no question")
+        input_event = build_event(
+            snapshot=snapshot,
+            invocation=invocation,
+            sequence=len(frames),
+            body={
+                "kind": "input_request_observed",
+                "question": result.question,
+                "publication": _publication("input_request", _runtime_suffix(invocation.invocation_id)),
+            },
+        )
+        frames.append(input_event)
+        exit_frame = build_exit(
+            snapshot=snapshot,
+            invocation=invocation,
+            final_sequence=len(frames) - 1,
+            kind="waiting_for_input",
+            input_event_ref=input_event["eventId"],
+        )
+    else:
+        exit_frame = _terminal_failure(snapshot, invocation, result, len(frames))
+
+    all_frames = [*frames, exit_frame]
+    validate_g1_frames(all_frames, snapshot.to_dict(), invocation.to_dict())
+    for frame in all_frames:
+        output.write(json.dumps(frame, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n")
+    output.flush()
+    return 0
+
+
+__all__ = ["serve_once_g1"]
