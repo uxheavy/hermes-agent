@@ -1029,6 +1029,84 @@ sys.stdout.flush()
         self.assertEqual(supplied_endpoint_calls, [])
         self.assertEqual(replaced_test_factory_calls, [])
 
+    def test_complete_import_bound_authority_path_ignores_replaced_names_and_reaps_once(self) -> None:
+        original_authority_type = supervisor_module._RetentionAuthority
+        sentinel_calls: list[str] = []
+
+        def sentinel(name: str):
+            def fail(*args, **kwargs):
+                sentinel_calls.append(name)
+                raise AssertionError(f"replaced authority dependency was invoked: {name}")
+
+            return fail
+
+        helper_names = (
+            "_retention_session_key",
+            "_retention_message_mac",
+            "_retention_write_frame",
+            "_retention_read_frame",
+            "_retention_decode_response",
+            "_close_retention_process",
+            "_validate_retention_spawn_contract",
+            "_retention_record_key",
+            "_make_retention_endpoint",
+            "_make_retention_dependency_bundle",
+            "_make_retention_authority_constructor",
+            "_make_production_retention_authority_constructor",
+            "_make_invocation_supervisor_initializer",
+            "_make_retention_authority_for_test",
+            "_make_retention_authority_test_harness",
+            "_validate_policy",
+        )
+        constructor_names = (
+            "InvocationSupervisor",
+            "_RetentionAuthority",
+            "_retention_authority_new",
+            "_retention_authority_test_constructor",
+            "_RETENTION_AUTHORITY_PRODUCTION_CONSTRUCTOR",
+        )
+        registry_names = (
+            "_EXACT_RETENTION_AUTHORITY",
+            "_RETENTION_DEPENDENCIES",
+        )
+        constant_names = (
+            "_RETENTION_MODULE_NAME",
+            "_RETENTION_SOURCE_PATH",
+            "_RETENTION_SOURCE_DIGEST",
+            "_RETENTION_EXECUTABLE",
+            "_RETENTION_POPEN",
+            "_RETENTION_PROTOCOL",
+            "_RETENTION_REQUEST_LIMIT",
+            "_RETENTION_RESPONSE_LIMIT",
+            "_RETENTION_REQUEST_TIMEOUT_SECONDS",
+            "_RETENTION_CLOSE_TIMEOUT_SECONDS",
+            "_RETENTION_SECRET_LENGTH",
+            "_RETENTION_OPERATIONS",
+            "_RETENTION_RECORDS",
+            "_RETENTION_READ_RECORDS",
+            "_RETENTION_STATUSES",
+            "_RETENTION_AUTHENTICATION_LABEL",
+            "_MAX_RETAINED_INVOCATIONS",
+            "canonical_json_bytes",
+        )
+        replacements = {
+            **{name: sentinel(name) for name in helper_names},
+            **{name: sentinel(name) for name in constructor_names},
+            **{name: object() for name in registry_names + constant_names},
+        }
+
+        with patch.multiple(supervisor_module, **replacements):
+            supervisor, _runner = self.make_supervisor(b"")
+            authority = supervisor._retention_authority
+            authority_process = authority._process
+            self.assertIsInstance(authority, original_authority_type)
+            self.assertEqual(authority.count_results(), 0)
+            supervisor.close()
+            supervisor.close()
+            self.assertEqual(authority_process.returncode, 0)
+
+        self.assertEqual(sentinel_calls, [])
+
     def test_authority_construction_failure_reaps_bootstrapped_child(self) -> None:
         captured: list[subprocess.Popen[bytes]] = []
 
@@ -1044,9 +1122,9 @@ sys.stdout.flush()
     def test_source_executable_and_command_replacements_fail_closed_before_launch(self) -> None:
         replacements = (
             (supervisor_module.sys, "executable", "/tmp/ordinary-python"),
-            (supervisor_module, "_RETENTION_MODULE_NAME", "ordinary_module"),
-            (supervisor_module, "_RETENTION_SOURCE_PATH", "/tmp/ordinary-source.py"),
-            (supervisor_module, "_RETENTION_SOURCE_DIGEST", "0" * 64),
+            (supervisor_module, "__name__", "ordinary_module"),
+            (supervisor_module, "__file__", "/tmp/ordinary-source.py"),
+            (supervisor_module.subprocess, "Popen", object()),
         )
         for target, name, value in replacements:
             with self.subTest(name=name), patch.object(target, name, value):
