@@ -1,0 +1,19 @@
+# Reproducible local G1 image from an already-cached Hermes-capable base.
+# The scratch final stage is intentional: it copies the base filesystem but
+# does not inherit its ambient ENV entries, so the Docker supervisor's fixed
+# child environment is complete and attestable.
+FROM company-runner-upstream-runtime:a8e53b6ac7b8@sha256:4c0d9f4dee14a4b2f59bc997baf557066f4394c4adcb285905aaa5838ed5ad39 AS hermes_base
+
+FROM scratch
+COPY --from=hermes_base / /
+WORKDIR /opt/hermes
+ENV LANG=C.UTF-8
+ENV LC_ALL=C.UTF-8
+COPY . /opt/hermes
+
+# The cached base has the Hermes runtime dependencies except python-dotenv.
+# G1 intentionally disables dotenv loading because credentials arrive only
+# through the host broker and the child environment is fixed by the supervisor.
+COPY plane_runtime/g1_runtime_image/dotenv/ /opt/hermes/dotenv/
+
+ENTRYPOINT ["python3", "-m", "plane_runtime.g1_runtime_image.bootstrap", "--once", "--g1-production"]

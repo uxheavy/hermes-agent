@@ -95,16 +95,19 @@ once through its injected `TerminalReconciliationPort`. Product status is
 derived only from the accepted host receipt. G1 has no product-completion
 claim: it returns runtime evidence frames only. `ProductionG1RuntimeRunner`
 is the separate G1 production seam and uses the same fixed Docker supervisor
-policy, with a host-only credential broker mounted read-only at a fixed path.
-`G1LocalTestRunner` is explicitly test-only.
+policy, with a host-owned credential source delivered through one separate
+fixed bootstrap control frame. The trusted container bootstrap stores that
+frame only in tmpfs mode-0600 broker state and authorizes only the spawned
+Hermes service PID; `G1LocalTestRunner` is explicitly test-only.
 
 The fixed child command uses `docker create`, `start`, and `attach` with
 module-private network, namespace, privilege, mount, environment, logging,
 storage, and cleanup controls. `SubprocessDockerRunner` performs bounded
 daemon, image, and post-launch inspections and rejects ambiguity, but those
 checks are bounded Docker enforcement evidence. The G1 production runner adds
-the fixed `--g1-production` command and broker mount; the child reaches
-`HermesKernelAdapter` only through that path. Caller-owned runners remain
+the fixed `--g1-production` bootstrap command and internal peer-authorized
+broker; the child reaches `HermesKernelAdapter` only through that path.
+Caller-owned runners remain
 explicit test seams and cannot produce a product completion claim. The attach
 client is terminated,
 killed if necessary, and reaped on every collector exit before container
@@ -136,7 +139,19 @@ also requires an existing digest-pinned image containing this service and its
 Hermes dependencies. The host broker keeps provider credentials out of the
 snapshot, envelope, child environment, command arguments, logs, events, and
 artifacts. The trusted `serve_once` function remains a host/test convenience;
-fixture/demo authorities are not command-line runtime entrypoints.
+fixture/demo authorities are not command-line runtime entrypoints. The
+bootstrap frame is not part of the request fingerprint, ledger, retained
+frames, or event stream; malformed, duplicate, and post-request control
+frames fail before the Hermes service starts.
+
+For a local no-install G1 execution probe, build
+`plane_runtime/Dockerfile.g1` with the already-cached digest-pinned
+`company-runner-upstream-runtime` base. Its scratch final stage strips the
+base image's ambient environment while retaining its Python/Hermes files;
+the resulting local image digest must be passed unchanged as the production
+`InvocationPolicy.image` value and attested before launch. The image's
+dotenv shim is deliberately a no-op: the only credential path is the fixed
+host bootstrap control frame and the mode-0600 in-container broker.
 
 Verify the package from the repository root:
 

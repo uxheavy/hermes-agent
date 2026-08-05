@@ -309,13 +309,14 @@ class SupervisorTests(unittest.TestCase):
         self.assertIn("--storage-opt", argv)
         self.assertIn("--log-driver", argv)
         self.assertEqual(argv[argv.index("--log-driver") + 1], "none")
-        self.assertEqual(argv.count("--env"), 5)
+        self.assertEqual(argv.count("--env"), 6)
         self.assertNotIn("--env-file", argv)
         self.assertNotIn("--volume", argv)
         self.assertNotIn("-v", argv)
         self.assertEqual(build_invocation_env(self.policy), {
             "LANG": "C.UTF-8",
             "LC_ALL": "C.UTF-8",
+            "HOME": "/tmp/hermes",
             "PATH": "/usr/local/bin:/usr/bin:/bin",
             "PYTHONDONTWRITEBYTECODE": "1",
             "PYTHONUNBUFFERED": "1",

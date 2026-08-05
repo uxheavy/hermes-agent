@@ -6,8 +6,10 @@ import json
 import io
 import os
 import shutil
+import socket
 import stat
 import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -24,6 +26,7 @@ from plane_runtime.g1_contract import (
     validate_g1_frames,
 )
 from plane_runtime.g1_ledger import G1RuntimeLedger
+from plane_runtime.g1_runtime_image import bootstrap
 from plane_runtime.hermes_adapter import HermesKernelAdapter, HermesKernelResult, UnixSocketCredentialSource
 from plane_runtime.invocation_supervisor import (
     G1InvocationSupervisor,
@@ -468,17 +471,33 @@ class G1RuntimeProcessTests(unittest.TestCase):
             ledger.mark_outcome_unknown(run_id=snapshot["runId"], invocation_id=changed["invocationId"], request_fingerprint=fingerprint)
             self.assertEqual(ledger.claim(run_id=snapshot["runId"], invocation_id=changed["invocationId"], request_fingerprint=fingerprint, snapshot_digest=snapshot["contentDigest"], total_budget=snapshot["totalBudget"], remaining_budget=changed["remainingBudget"]).state, "outcome_unknown")
 
-    def test_production_runner_requires_fixed_broker_mount_and_production_command(self) -> None:
+    def test_production_runner_requires_fixed_bootstrap_and_production_command(self) -> None:
         image = "alpine@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce"
         with tempfile.TemporaryDirectory() as directory:
             source = os.path.join(directory, "broker.sock")
             argv = build_g1_docker_argv("a" * 64, InvocationPolicy(image), credential_broker_source=source)
             self.assertIn("--network", argv)
             self.assertEqual(argv[argv.index("--network") + 1], "none")
-            self.assertIn("--mount", argv)
-            self.assertIn("--g1-production", argv)
+            self.assertNotIn("--mount", argv)
+            self.assertIn("plane_runtime.g1_runtime_image.bootstrap", argv)
+            self.assertIn("--interactive", argv)
         with self.assertRaises(Exception):
             ProductionG1RuntimeRunner(image=image, credential_source=object())
+
+    def test_production_runner_does_not_open_ambient_host_broker_socket(self) -> None:
+        class Credentials:
+            def resolve(self, provider: str) -> dict[str, str]:
+                del provider
+                return {"api_key": "host-only"}
+
+        runner = ProductionG1RuntimeRunner(
+            image="alpine@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce",
+            credential_source=Credentials(),
+        )
+        try:
+            self.assertEqual(runner.broker_path, "")
+        finally:
+            runner.close()
 
     def test_host_credential_broker_is_narrow_and_non_ambient(self) -> None:
         secret = "host-only-broker-secret"
@@ -499,6 +518,135 @@ class G1RuntimeProcessTests(unittest.TestCase):
         finally:
             broker.close()
         self.assertFalse(os.path.exists(broker.path))
+
+    def test_credential_bootstrap_accepts_one_control_frame_only(self) -> None:
+        canary = "bootstrap-canary"
+        control = json.dumps(
+            {
+                "protocol": "plane.agent-runtime/credential-control/v1",
+                "credentials": {"api_key": canary},
+            },
+            separators=(",", ":"),
+        ).encode() + b"\n"
+        request = b'{"run":{},"invocation":{}}\n'
+
+        class BinaryStdin:
+            def __init__(self, value: bytes) -> None:
+                self.buffer = io.BytesIO(value)
+
+        with mock.patch.object(bootstrap, "_run", return_value=0) as run:
+            with mock.patch("sys.stdin", BinaryStdin(control + request)):
+                self.assertEqual(bootstrap.main(["--once", "--g1-production"]), 0)
+            run.assert_called_once()
+            self.assertNotIn(canary, repr(run.call_args.args[0]))
+
+            for extra in (
+                b"not-json\n" + request,
+                control + control + request,
+                control + request + control,
+            ):
+                run.reset_mock()
+                diagnostics = io.StringIO()
+                with mock.patch("sys.stdin", BinaryStdin(extra)), mock.patch("sys.stdout", diagnostics), mock.patch(
+                    "sys.stderr", diagnostics
+                ):
+                    self.assertEqual(bootstrap.main(["--once", "--g1-production"]), 2)
+                run.assert_not_called()
+                self.assertNotIn(canary, diagnostics.getvalue())
+
+    @unittest.skipUnless(hasattr(socket, "SO_PEERCRED"), "peer PID credentials are Linux-only")
+    def test_credential_broker_rejects_non_service_pid(self) -> None:
+        canary = "peer-canary"
+        broker = bootstrap._CredentialBroker({"api_key": canary}, "test-provider")
+        broker.start(os.getpid())
+        try:
+            self.assertEqual(stat.S_IMODE(os.stat(bootstrap._BROKER_DIRECTORY).st_mode), 0o700)
+            self.assertEqual(stat.S_IMODE(os.stat(bootstrap._BROKER_PATH).st_mode), 0o600)
+            authorized = UnixSocketCredentialSource(path=bootstrap._BROKER_PATH).resolve("test-provider")
+            self.assertEqual(authorized["api_key"], canary)
+            self.assertEqual(UnixSocketCredentialSource(path=bootstrap._BROKER_PATH).resolve("test-provider"), {})
+            probe = (
+                "import socket; "
+                f"s=socket.socket(socket.AF_UNIX); s.connect({bootstrap._BROKER_PATH!r}); "
+                "s.sendall(b'{\"protocol\":\"plane.agent-runtime/credentials/v1\",\"provider\":\"test-provider\"}\\n'); "
+                "print(s.recv(4096).decode())"
+            )
+            child = subprocess.run((sys.executable, "-c", probe), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
+            self.assertEqual(child.returncode, 0)
+            self.assertNotIn(canary, child.stdout + child.stderr)
+            self.assertIn('"credentials":{}', child.stdout)
+        finally:
+            broker.close()
+
+    def test_credential_source_exception_is_redacted_from_runtime_path(self) -> None:
+        canary = "exception-canary"
+
+        class LeakySource:
+            def resolve(self, provider: str) -> dict[str, str]:
+                del provider
+                raise RuntimeError(canary)
+
+        broker = HostCredentialBroker(LeakySource())
+        broker.allow_provider("test-provider")
+        try:
+            with self.assertRaises(Exception) as raised:
+                broker.resolve_for_provider("test-provider")
+            self.assertNotIn(canary, str(raised.exception))
+        finally:
+            broker.close()
+
+    @unittest.skipUnless(shutil.which("docker") or os.path.exists("/opt/homebrew/bin/docker"), "Docker CLI is unavailable")
+    def test_local_digest_pinned_hermes_image_executes_real_adapter_path(self) -> None:
+        docker = shutil.which("docker") or "/opt/homebrew/bin/docker"
+        inspected = subprocess.run(
+            (docker, "image", "inspect", "--format", "{{index .RepoDigests 0}}", "plane-g1-local:hermes"),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            check=False,
+        )
+        image = inspected.stdout.strip()
+        if inspected.returncode != 0 or "@sha256:" not in image:
+            self.skipTest("local plane-g1-hermes image was not built")
+        snapshot = make_snapshot()
+        snapshot["runtimePolicy"] = dict(snapshot["runtimePolicy"])  # type: ignore[arg-type]
+        snapshot["runtimePolicy"]["adapter"] = "hermes"  # type: ignore[index]
+        snapshot["contentDigest"] = _digest(
+            "snapshot", {key: value for key, value in snapshot.items() if key != "contentDigest"}
+        )
+        invocation = make_invocation(snapshot)
+        canary = "local-image-bootstrap-canary"
+
+        class Credentials:
+            def resolve(self, provider: str) -> dict[str, str]:
+                del provider
+                return {"api_key": canary}
+
+        with tempfile.TemporaryDirectory() as directory:
+            ledger_path = os.path.join(directory, "ledger.sqlite3")
+            runner = ProductionG1RuntimeRunner(
+                image=image,
+                credential_source=Credentials(),
+                policy=InvocationPolicy(image=image, stdout_limit_bytes=65536),
+            )
+            supervisor = G1InvocationSupervisor(runner=runner, hard_timeout_seconds=8.0, ledger_path=ledger_path)
+            try:
+                frames = supervisor.run_once(
+                    G1RunSnapshot.from_dict(snapshot),
+                    G1InvocationEnvelope.from_dict(invocation),
+                    cancellation=None,
+                    lease_valid=lambda: True,
+                )
+            finally:
+                supervisor.close()
+            parsed = validate_g1_frames([json.loads(frame) for frame in frames], snapshot, invocation)
+            self.assertTrue(any(frame.get("body", {}).get("kind") == "progress_observed" for frame in parsed))
+            self.assertEqual(parsed[-1]["kind"], "failed")
+            self.assertNotIn(canary, json.dumps(parsed))
+            with open(ledger_path, "rb") as ledger_file:
+                self.assertNotIn(canary, ledger_file.read().decode("utf-8", "ignore"))
+            self.assertNotIn(canary, " ".join(runner.command))
+            self.assertNotIn(canary, json.dumps(build_invocation_env()))
 
     def test_changed_replay_conflicts_before_a_second_child(self) -> None:
         snapshot = make_snapshot()

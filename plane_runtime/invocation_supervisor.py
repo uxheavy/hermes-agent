@@ -106,8 +106,8 @@ _RETENTION_POPEN = subprocess.Popen
 _FIXED_ENTRYPOINT = "python3"
 _FIXED_SERVICE_MODULE = "plane_runtime.service"
 _FIXED_SERVICE_ARGS = ("--once",)
+_G1_PRODUCTION_SERVICE_MODULE = "plane_runtime.g1_runtime_image.bootstrap"
 _G1_PRODUCTION_SERVICE_ARGS = ("--once", "--g1-production")
-_G1_CREDENTIAL_BROKER_TARGET = "/run/plane-agent-credential-broker"
 _FIXED_NETWORK = "none"
 _FIXED_USER = "65532:65532"
 _FIXED_TMPFS_TARGET = "/tmp"
@@ -123,6 +123,7 @@ _FIXED_PROTOCOL_LABEL = "plane.agent-runtime/protocol=plane.agent-runtime/v1"
 _FIXED_ALLOWED_ENV: tuple[tuple[str, str], ...] = (
     ("LANG", "C.UTF-8"),
     ("LC_ALL", "C.UTF-8"),
+    ("HOME", "/tmp/hermes"),
     ("PATH", "/usr/local/bin:/usr/bin:/bin"),
     ("PYTHONDONTWRITEBYTECODE", "1"),
     ("PYTHONUNBUFFERED", "1"),
@@ -1076,8 +1077,8 @@ def _build_fixed_docker_argv(
     if tuple(service_args) not in {_FIXED_SERVICE_ARGS, _G1_PRODUCTION_SERVICE_ARGS}:
         raise ContractError("fixed Docker service mode is invalid")
     if service_args == _G1_PRODUCTION_SERVICE_ARGS:
-        if broker_source is None or not os.path.isabs(broker_source) or _CONTROL.search(broker_source):
-            raise ContractError("production G1 credential broker path is invalid")
+        if broker_source is not None and (not os.path.isabs(broker_source) or _CONTROL.search(broker_source)):
+            raise ContractError("production G1 credential broker source is invalid")
     elif broker_source is not None:
         raise ContractError("test Docker service cannot receive a credential broker")
     argv: list[str] = [
@@ -1094,6 +1095,7 @@ def _build_fixed_docker_argv(
         "--network",
         _FIXED_NETWORK,
         "--read-only",
+        "--interactive",
         "--security-opt",
         "no-new-privileges",
         "--cap-drop",
@@ -1115,11 +1117,10 @@ def _build_fixed_docker_argv(
         "--log-driver",
         _FIXED_LOG_DRIVER,
     ]
-    if broker_source is not None:
-        argv.extend(("--mount", f"type=bind,src={broker_source},dst={_G1_CREDENTIAL_BROKER_TARGET},readonly"))
     for key, value in _FIXED_ALLOWED_ENV:
         argv.extend(("--env", f"{key}={value}"))
-    argv.extend(("--entrypoint", _FIXED_ENTRYPOINT, str(image), "-m", _FIXED_SERVICE_MODULE, *service_args))
+    service_module = _G1_PRODUCTION_SERVICE_MODULE if tuple(service_args) == _G1_PRODUCTION_SERVICE_ARGS else _FIXED_SERVICE_MODULE
+    argv.extend(("--entrypoint", _FIXED_ENTRYPOINT, str(image), "-m", service_module, *service_args))
     return tuple(argv)
 
 
@@ -1127,7 +1128,7 @@ def build_g1_docker_argv(
     request_fingerprint: str,
     policy: InvocationPolicy,
     *,
-    credential_broker_source: str,
+    credential_broker_source: str | None = None,
 ) -> tuple[str, ...]:
     """Build the production G1 command through the shared Docker policy."""
 
@@ -1558,6 +1559,7 @@ class SubprocessDockerRunner:
             raise ContractError("Docker runner accepts only fixed docker create argv")
         allowed_flags = {
             "--name", "--label", "--pull", "--network", "--read-only",
+            "--interactive",
             "--security-opt", "--cap-drop", "--user", "--cpus", "--memory",
             "--pids-limit", "--stop-timeout", "--tmpfs", "--storage-opt",
             "--log-driver", "--env", "--entrypoint", "--once", "--g1-production", "-m",
@@ -1580,6 +1582,8 @@ class SubprocessDockerRunner:
         for flag in ("--read-only",):
             if list(argv).count(flag) != 1:
                 raise ContractError(f"Docker argv must contain exactly one {flag}")
+        if list(argv).count("--interactive") != 1:
+            raise ContractError("Docker argv must keep the child stdin open")
         if list(argv).count("--name") != 1 or list(argv).count("--label") != 2 or list(argv).count("--env") != len(_FIXED_ALLOWED_ENV):
             raise ContractError("Docker argv labels/environment are not fixed")
         labels = [argv[index + 1] for index, value in enumerate(argv) if value == "--label"]
@@ -1594,24 +1598,17 @@ class SubprocessDockerRunner:
             raise ContractError("Docker argv environment is not the fixed allowlist")
         service_args = tuple(argv[self._service_args_index(argv):])
         if self._production:
-            if service_args != _G1_PRODUCTION_SERVICE_ARGS or list(argv).count("--mount") != 1:
-                raise ContractError("production Docker argv lacks the fixed G1 broker mount")
-            mount = self._flag_value(argv, "--mount")
-            expected_prefix = f"type=bind,src="
-            expected_suffix = f",dst={_G1_CREDENTIAL_BROKER_TARGET},readonly"
-            if not mount.startswith(expected_prefix) or not mount.endswith(expected_suffix):
-                raise ContractError("production Docker credential mount is not fixed")
-            source = mount[len(expected_prefix) : -len(expected_suffix)]
-            if not source or not os.path.isabs(source) or _CONTROL.search(source):
-                raise ContractError("production Docker credential mount source is invalid")
+            if service_args != _G1_PRODUCTION_SERVICE_ARGS or "--mount" in argv:
+                raise ContractError("production Docker argv contains a non-fixed G1 control")
         elif service_args != _FIXED_SERVICE_ARGS or "--mount" in argv:
             raise ContractError("test Docker argv contains a non-test service control")
         self._policy_from_argv(argv)
 
     @staticmethod
     def _service_args_index(argv: Sequence[str]) -> int:
+        modules = {_FIXED_SERVICE_MODULE, _G1_PRODUCTION_SERVICE_MODULE}
         for index in range(len(argv) - 1):
-            if tuple(argv[index : index + 2]) == ("-m", _FIXED_SERVICE_MODULE):
+            if tuple(argv[index : index + 2]) in {("-m", module) for module in modules}:
                 return index + 2
         raise ContractError("Docker argv has no fixed service module")
 
@@ -1672,7 +1669,7 @@ class SubprocessDockerRunner:
         suffix = tuple(argv[image_index + 1 :])
         if suffix not in {
             ("-m", _FIXED_SERVICE_MODULE, *_FIXED_SERVICE_ARGS),
-            ("-m", _FIXED_SERVICE_MODULE, *_G1_PRODUCTION_SERVICE_ARGS),
+            ("-m", _G1_PRODUCTION_SERVICE_MODULE, *_G1_PRODUCTION_SERVICE_ARGS),
         }:
             raise ContractError("Docker argv has an unexpected child command")
         return image
@@ -1760,13 +1757,7 @@ class SubprocessDockerRunner:
         service_args = tuple(argv[SubprocessDockerRunner._service_args_index(argv):])
         mounts = container.get("Mounts")
         binds = host.get("Binds")
-        if service_args == _G1_PRODUCTION_SERVICE_ARGS:
-            if not isinstance(mounts, list) or len(mounts) != 1:
-                raise RuntimeConfigurationError("Docker credential broker mount is missing")
-            mount = mounts[0]
-            if not isinstance(mount, dict) or mount.get("Destination") != _G1_CREDENTIAL_BROKER_TARGET or mount.get("RW") is not False:
-                raise RuntimeConfigurationError("Docker credential broker mount is not read-only")
-        elif mounts not in ([], None) or binds not in ([], None):
+        if mounts not in ([], None) or binds not in ([], None):
             raise RuntimeConfigurationError("Docker mounts/devices are not isolated")
         if host.get("VolumesFrom") not in ([], None) or host.get("Devices") not in ([], None):
             raise RuntimeConfigurationError("Docker volumes/devices are not isolated")
@@ -1782,10 +1773,14 @@ class SubprocessDockerRunner:
             or {item.split("=", 1)[0]: item.split("=", 1)[1] for item in actual_env} != expected_env
         ):
             raise RuntimeConfigurationError("Docker environment did not clear image state")
-        if config.get("Entrypoint") != [_FIXED_ENTRYPOINT] or config.get("Cmd") != ["-m", _FIXED_SERVICE_MODULE, *service_args]:
+        service_module = _G1_PRODUCTION_SERVICE_MODULE if tuple(service_args) == _G1_PRODUCTION_SERVICE_ARGS else _FIXED_SERVICE_MODULE
+        if config.get("Entrypoint") != [_FIXED_ENTRYPOINT] or config.get("Cmd") != ["-m", service_module, *service_args]:
             raise RuntimeConfigurationError("Docker child command did not match the fixed command")
         if container.get("Name") not in (None, f"/{SubprocessDockerRunner._flag_value(argv, '--name')}"):
             raise RuntimeConfigurationError("Docker container identity did not match")
+        config_stdin = config.get("OpenStdin")
+        if config_stdin is not True:
+            raise RuntimeConfigurationError("Docker child stdin is not open for the bounded request")
 
     def launch(
         self,
@@ -4434,34 +4429,100 @@ class G1LocalTestRunner:
         return CleanupReport(invocation_name, False, False, True, (), reaped)
 
 
+def _credential_control_bytes(credentials: Mapping[str, str]) -> bytearray:
+    payload = json.dumps(
+        {
+            "protocol": "plane.agent-runtime/credential-control/v1",
+            "credentials": dict(credentials),
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8") + b"\n"
+    if len(payload) > 16 * 1024:
+        raise RuntimeConfigurationError("G1 credential control frame is too large")
+    return bytearray(payload)
+
+
+class _G1ProductionProcess:
+    """Production child view that consumes a private pre-request control frame."""
+
+    def __init__(self, process: _SubprocessDockerProcess, credentials: Mapping[str, str], max_output_bytes: int) -> None:
+        self._process = process
+        self._credentials = dict(credentials)
+        self._max_output_bytes = max_output_bytes
+
+    def collect(
+        self,
+        *,
+        input_bytes: bytes,
+        deadline: float,
+        is_cancelled: Callable[[], bool],
+        lease_valid: Callable[[], bool],
+    ) -> G1ProcessCapture:
+        control = _credential_control_bytes(self._credentials)
+        control.extend(input_bytes)
+        try:
+            capture = self._process.collect(
+                input_bytes=bytes(control),
+                deadline=deadline,
+                stdout_limit_bytes=self._max_output_bytes,
+                stderr_limit_bytes=self._max_output_bytes,
+                is_cancelled=is_cancelled,
+                lease_valid=lease_valid,
+            )
+        finally:
+            for index in range(len(control)):
+                control[index] = 0
+            self._credentials.clear()
+        return G1ProcessCapture(
+            capture.returncode,
+            capture.stdout,
+            capture.stderr,
+            timed_out=capture.timed_out,
+            cancelled=capture.cancelled,
+            lease_expired=capture.lease_expired,
+            output_exceeded=capture.output_exceeded,
+            reaped=capture.reaped,
+        )
+
+    def cleanup(self) -> bool:
+        self._credentials.clear()
+        return self._process.cleanup()
+
+
 _G1_PRODUCTION_COMMAND = (
     _FIXED_ENTRYPOINT,
     "-m",
-    _FIXED_SERVICE_MODULE,
+    _G1_PRODUCTION_SERVICE_MODULE,
     *_G1_PRODUCTION_SERVICE_ARGS,
 )
 
 
 class HostCredentialBroker:
-    """Host-only Unix socket broker mounted at one fixed container target."""
+    """Host-owned provider source with a bounded local broker test seam."""
 
-    def __init__(self, source: object, *, path: str | None = None) -> None:
+    def __init__(self, source: object, *, path: str | None = None, serve_socket: bool = True) -> None:
         resolve = getattr(source, "resolve", None)
         if not callable(resolve):
             raise RuntimeConfigurationError("production G1 credential source is not callable")
         self._source = source
         self._allowed_provider: str | None = None
         self._temporary_directory = None
+        self._server: socket.socket | None = None
+        self._thread: threading.Thread | None = None
+        self._closed = threading.Event()
+        if not serve_socket:
+            self.path = ""
+            return
         if path is None:
-            # Docker Desktop shares the checkout with the Linux VM; the
-            # default macOS per-process temp roots are not bind-mount sources.
+            # Keep the local broker test endpoint under plane_runtime so its
+            # lifecycle and permissions are easy to inspect and clean up.
             self._temporary_directory = tempfile.TemporaryDirectory(
                 prefix=".plane-g1-broker-",
                 dir=os.path.dirname(os.path.realpath(__file__)),
             )
-            # The directory is an endpoint mount, not a credential store.  It
-            # must be traversable by the fixed non-root Docker UID while the
-            # socket itself remains the only broker object exposed.
+            # This endpoint is only for local broker tests; the production
+            # Docker path uses the private bootstrap control frame instead.
             os.chmod(self._temporary_directory.name, 0o711)
             path = os.path.join(self._temporary_directory.name, "broker.sock")
         if not os.path.isabs(path) or _CONTROL.search(path):
@@ -4476,7 +4537,6 @@ class HostCredentialBroker:
         os.chmod(path, 0o666)
         self._server.listen(8)
         self._server.settimeout(0.2)
-        self._closed = threading.Event()
         self._thread = threading.Thread(target=self._serve, name="plane-g1-credential-broker", daemon=True)
         self._thread.start()
 
@@ -4518,19 +4578,47 @@ class HostCredentialBroker:
             raise RuntimeConfigurationError("credential broker provider binding is invalid")
         self._allowed_provider = provider
 
+    def resolve_for_provider(self, provider: str) -> dict[str, str]:
+        """Resolve one bound provider for the private child control channel."""
+
+        if provider != self._allowed_provider:
+            return {}
+        try:
+            credentials = dict(self._source.resolve(provider))
+        except Exception:
+            raise RuntimeConfigurationError("trusted host credential resolution failed") from None
+        if any(
+            not isinstance(key, str)
+            or not isinstance(value, str)
+            or not key
+            or not value
+            or _CONTROL.search(key)
+            or _CONTROL.search(value)
+            or len(key) > 128
+            or len(value.encode("utf-8")) > 16 * 1024
+            for key, value in credentials.items()
+        ):
+            raise RuntimeConfigurationError("trusted host credential response is invalid")
+        if len(credentials) > 16:
+            raise RuntimeConfigurationError("trusted host credential response is too large")
+        return credentials
+
     def close(self) -> None:
         if self._closed.is_set():
             return
         self._closed.set()
-        try:
-            self._server.close()
-        except OSError:
-            pass
-        self._thread.join(timeout=1.0)
-        try:
-            os.unlink(self.path)
-        except FileNotFoundError:
-            pass
+        if self._server is not None:
+            try:
+                self._server.close()
+            except OSError:
+                pass
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+        if self.path:
+            try:
+                os.unlink(self.path)
+            except FileNotFoundError:
+                pass
         if self._temporary_directory is not None:
             self._temporary_directory.cleanup()
 
@@ -4548,7 +4636,11 @@ class ProductionG1RuntimeRunner:
         policy: InvocationPolicy | None = None,
         max_output_bytes: int = 512 * 1024,
     ) -> None:
-        self._broker = HostCredentialBroker(credential_source)
+        # Production never opens the legacy host-side test socket.  The only
+        # child credential channel is the bootstrap frame sent to the trusted
+        # container host, which creates its mode-0600 tmpfs broker after the
+        # service PID exists.
+        self._broker = HostCredentialBroker(credential_source, serve_socket=False)
         self._policy = policy or InvocationPolicy(image=image, stdout_limit_bytes=max_output_bytes)
         if self._policy.image != image:
             raise ContractError("production G1 image policy is inconsistent")
@@ -4559,23 +4651,26 @@ class ProductionG1RuntimeRunner:
     def broker_path(self) -> str:
         return self._broker.path
 
-    @property
-    def broker_mount_path(self) -> str:
-        return os.path.dirname(self._broker.path)
-
     def attest_invocation(self, command: Sequence[str], *, request_fingerprint: str) -> EnforcementAttestation:
         if tuple(command) != self.command:
             raise RuntimeConfigurationError("production G1 command is not fixed")
         argv = build_g1_docker_argv(
             request_fingerprint,
             self._policy,
-            credential_broker_source=self.broker_mount_path,
         )
         attestation = self._docker.attest_invocation(argv, client_env=dict(_DOCKER_CLIENT_ENV))
         if type(attestation) is not _EXACT_ENFORCEMENT_ATTESTATION or not attestation.is_production:
             raise RuntimeConfigurationError("production G1 Docker attestation was not proven")
         self._argv_by_name[attestation.container_name] = argv
-        return attestation
+        # The G1 supervisor binds its runner seam to the fixed child command;
+        # the Docker runner retains the stronger exact-argv attestation
+        # privately and checks it again at create/start.
+        return EnforcementAttestation(
+            classification="production",
+            argv_digest=_g1_command_digest(command),
+            container_name=attestation.container_name,
+            evidence=attestation.evidence,
+        )
 
     def launch(
         self,
@@ -4593,12 +4688,15 @@ class ProductionG1RuntimeRunner:
         except Exception as exc:
             raise ContractError("production G1 request is invalid") from exc
         self._broker.allow_provider(str(provider))
+        credentials = self._broker.resolve_for_provider(str(provider))
+        if not credentials:
+            raise RuntimeConfigurationError("trusted host credential resolution failed")
         fingerprint = hashlib.sha256(input_bytes.rstrip(b"\n")).hexdigest()
         argv = self._argv_by_name.get(f"{_FIXED_CONTAINER_PREFIX}-{fingerprint[:32]}")
         if argv is None:
             raise RuntimeConfigurationError("production G1 launch lacks an attested request")
         process = self._docker.launch(argv, client_env=dict(_DOCKER_CLIENT_ENV), input_bytes=input_bytes)
-        return _G1LocalProcess(process, min(max_output_bytes, self._policy.stdout_limit_bytes))
+        return _G1ProductionProcess(process, credentials, min(max_output_bytes, self._policy.stdout_limit_bytes))
 
     def cleanup(self, invocation_name: str) -> CleanupReport:
         self._argv_by_name.pop(invocation_name, None)

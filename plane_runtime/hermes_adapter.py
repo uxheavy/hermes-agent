@@ -51,7 +51,7 @@ class UnixSocketCredentialSource:
     closed.
     """
 
-    path: str = "/run/plane-agent-credential-broker/broker.sock"
+    path: str = "/tmp/plane-agent-credential-broker/broker.sock"
     timeout_seconds: float = 2.0
 
     def resolve(self, provider: str) -> Mapping[str, str]:
