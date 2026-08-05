@@ -21,11 +21,11 @@ import math
 import os
 import re
 import selectors
+import secrets
+import sqlite3
 import subprocess
 import time
-import weakref
 from dataclasses import dataclass
-from threading import RLock
 from types import MappingProxyType
 from typing import Callable, Mapping, Protocol, Sequence
 
@@ -62,8 +62,10 @@ from .contract import (
 )
 
 
-# These aliases are captured once at module load.  Authority-bearing result
-# reconstruction never looks up a replaceable module symbol again.
+# These aliases are used only while validating a freshly produced candidate or
+# a death receipt before it crosses the retention seam.  Canonical readback
+# never reconstructs contract objects through these replaceable module names;
+# it returns immutable value views from serialized bytes instead.
 _EXACT_RUNTIME_EXIT = RuntimeExit
 _EXACT_TERMINAL_PROPOSAL = TerminalProposal
 _EXACT_TERMINAL_RECEIPT = TerminalReconciliationReceipt
@@ -477,63 +479,6 @@ class InvocationResult:
 _EXACT_INVOCATION_RESULT = InvocationResult
 
 
-@dataclass(frozen=True)
-class _CanonicalInvocationResult:
-    """Private, immutable snapshot retained for one invocation key.
-
-    No public result or mutable contract object is retained here.  The wire
-    payloads are validated and canonicalized before storage, then parsed into
-    fresh exact values when a caller asks for the result again.
-    """
-
-    run_id: str
-    invocation_id: str
-    status: str
-    container_name: str
-    exit_payload: bytes | None = None
-    proposal_payload: bytes | None = None
-    receipt_payload: bytes | None = None
-    cleanup: tuple[str, bool, bool, bool, tuple[str, ...], bool] | None = None
-    enforcement: tuple[str, str, str, tuple[str, ...]] | None = None
-    evidence: tuple[str, ...] = ()
-
-
-_EXACT_CANONICAL_INVOCATION_RESULT = _CanonicalInvocationResult
-
-
-@dataclass
-class _SupervisorState:
-    """State kept outside the caller-replaceable supervisor instance."""
-
-    results: dict[tuple[str, str], _CanonicalInvocationResult]
-    death_receipts: dict[tuple[str, str], bytes | None]
-    lock: RLock
-
-
-_EXACT_SUPERVISOR_STATE = _SupervisorState
-
-
-_SUPERVISOR_STATES: dict[int, tuple[weakref.ReferenceType[object], _SupervisorState]] = {}
-
-
-def _register_supervisor_state(owner: object) -> _SupervisorState:
-    key = id(owner)
-    state = _EXACT_SUPERVISOR_STATE(results={}, death_receipts={}, lock=RLock())
-
-    def remove(_reference: weakref.ReferenceType[object]) -> None:
-        _SUPERVISOR_STATES.pop(key, None)
-
-    _SUPERVISOR_STATES[key] = (weakref.ref(owner, remove), state)
-    return state
-
-
-def _supervisor_state(owner: object) -> _SupervisorState:
-    entry = _SUPERVISOR_STATES.get(id(owner))
-    if entry is None or entry[0]() is not owner or type(entry[1]) is not _EXACT_SUPERVISOR_STATE:
-        raise RuntimeConfigurationError("invocation supervisor state is unavailable")
-    return entry[1]
-
-
 _RESULT_STATUSES = frozenset(
     {
         "completed",
@@ -550,10 +495,35 @@ _TERMINAL_RESULT_STATUSES = frozenset(
 )
 
 
-def _new_invocation_result(*args: object, _result_type: type = _EXACT_INVOCATION_RESULT, **kwargs: object) -> InvocationResult:
-    """Construct only the exact captured public result representation."""
+def _draft_result(*args: object, **kwargs: object) -> tuple[object, ...]:
+    """Build a transient tuple; no public result constructor is consulted.
 
-    return _result_type(*args, **kwargs)
+    This value exists only until :func:`_canonicalize_result` serializes it.
+    It deliberately has no constructor/type/default capture and is never
+    retained or returned to a caller.
+    """
+
+    if len(args) > 2:
+        raise TypeError("result draft accepts at most status and container name positionally")
+    names = (
+        "status",
+        "container_name",
+        "exit",
+        "proposal",
+        "receipt",
+        "cleanup",
+        "enforcement",
+        "evidence",
+    )
+    values: list[object] = [None] * len(names)
+    values[0] = args[0] if args else kwargs.pop("status")
+    values[1] = args[1] if len(args) == 2 else kwargs.pop("container_name")
+    for index, name in enumerate(names[2:], start=2):
+        if name in kwargs:
+            values[index] = kwargs.pop(name)
+    if kwargs:
+        raise TypeError(f"unknown result draft fields: {tuple(kwargs)}")
+    return tuple(values)
 
 
 def _canonical_contract_payload(
@@ -596,16 +566,13 @@ def _parse_canonical_contract_payload(
 def _canonicalize_result(
     key: tuple[str, str],
     result: object,
-    *,
-    result_type: type = _EXACT_INVOCATION_RESULT,
-) -> _CanonicalInvocationResult:
-    """Validate and copy a result before it can enter retained state."""
+) -> bytes:
+    """Validate a transient tuple and serialize the only retained form."""
 
-    if type(result) is not result_type:
-        raise ContractError("retained result is not the exact public result type")
+    if type(result) is not tuple or len(result) != 8:
+        raise ContractError("retained result is not an exact transient tuple")
     run_id, invocation_id = key
-    status = result.status
-    container_name = result.container_name
+    status, container_name, exit_value, proposal_value, receipt_value, cleanup_value, enforcement_value, evidence = result
     if (
         type(run_id) is not str
         or type(invocation_id) is not str
@@ -616,7 +583,6 @@ def _canonicalize_result(
     ):
         raise ContractError("retained result has an invalid status or binding")
 
-    exit_value = result.exit
     exit_payload = (
         None
         if exit_value is None
@@ -626,7 +592,6 @@ def _canonicalize_result(
             label="retained result exit",
         )
     )
-    proposal_value = result.proposal
     proposal_payload = (
         None
         if proposal_value is None
@@ -640,7 +605,6 @@ def _canonicalize_result(
         proposal_value.run_id != run_id or proposal_value.invocation_id != invocation_id
     ):
         raise BindingError("retained proposal is bound to a different invocation")
-    receipt_value = result.receipt
     receipt_payload = (
         None
         if receipt_value is None
@@ -655,7 +619,6 @@ def _canonicalize_result(
     ):
         raise BindingError("retained receipt is bound to a different invocation")
 
-    cleanup_value = result.cleanup
     cleanup = None
     if cleanup_value is not None:
         if type(cleanup_value) is not _EXACT_CLEANUP_REPORT:
@@ -681,7 +644,6 @@ def _canonicalize_result(
             cleanup_value.post_cleanup_absent,
         )
 
-    enforcement_value = result.enforcement
     enforcement = None
     if enforcement_value is not None:
         if type(enforcement_value) is not _EXACT_ENFORCEMENT_ATTESTATION:
@@ -710,133 +672,249 @@ def _canonicalize_result(
         if status in {"completed", "waiting_for_input", "failed", "blocked"} and enforcement is None:
             raise ContractError("retained terminal result lacks test enforcement evidence")
 
-    evidence = result.evidence
     if (
         type(evidence) is not tuple
         or len(evidence) > 32
         or any(type(item) is not str or not item or len(item) > MAX_REFERENCE_LENGTH for item in evidence)
     ):
         raise ContractError("retained result evidence is malformed")
-    return _EXACT_CANONICAL_INVOCATION_RESULT(
-        run_id=run_id,
-        invocation_id=invocation_id,
-        status=status,
-        container_name=container_name,
-        exit_payload=exit_payload,
-        proposal_payload=proposal_payload,
-        receipt_payload=receipt_payload,
-        cleanup=cleanup,
-        enforcement=enforcement,
-        evidence=tuple(evidence),
+    def decoded(payload: bytes | None) -> object:
+        return None if payload is None else json.loads(payload)
+
+    return canonical_json_bytes(
+        {
+            "run_id": run_id,
+            "invocation_id": invocation_id,
+            "status": status,
+            "container_name": container_name,
+            "exit": decoded(exit_payload),
+            "proposal": decoded(proposal_payload),
+            "receipt": decoded(receipt_payload),
+            "cleanup": cleanup,
+            "enforcement": enforcement,
+            "evidence": list(evidence),
+        }
     )
 
 
 def _public_result_from_canonical(
     key: tuple[str, str],
-    canonical: object,
-) -> InvocationResult:
-    """Validate retained state and reconstruct a fresh exact public result."""
+    payload: bytes,
+) -> object:
+    """Validate bytes and return a fresh immutable value view.
 
-    if type(canonical) is not _EXACT_CANONICAL_INVOCATION_RESULT:
-        raise ContractError("retained result is not an exact canonical record")
+    The view classes are created per read.  Mutating a returned value or its
+    class metadata can therefore affect only that discarded view, never the
+    serialized authority or a later read.  No module result symbol or captured
+    constructor participates in this path.
+    """
+
+    canonical = _validated_canonical_payload(payload)
     run_id, invocation_id = key
-    if canonical.run_id != run_id or canonical.invocation_id != invocation_id:
+    if canonical["run_id"] != run_id or canonical["invocation_id"] != invocation_id:
         raise BindingError("retained canonical result has an invalid invocation binding")
-    exit_value = (
-        None
-        if canonical.exit_payload is None
-        else _parse_canonical_contract_payload(
-            canonical.exit_payload,
-            expected_type=_EXACT_RUNTIME_EXIT,
-            label="retained exit",
-        )
-    )
-    proposal_value = (
-        None
-        if canonical.proposal_payload is None
-        else _parse_canonical_contract_payload(
-            canonical.proposal_payload,
-            expected_type=_EXACT_TERMINAL_PROPOSAL,
-            label="retained proposal",
-        )
-    )
-    if proposal_value is not None and (
-        proposal_value.run_id != run_id or proposal_value.invocation_id != invocation_id
+    return _result_view(canonical)
+
+
+def _record_view(raw: dict[str, object]) -> object:
+    """Create an immutable, per-read attribute view over canonical values."""
+
+    field_names = tuple(_snake_case(name) for name in raw)
+    values = tuple(_view_value(value) for value in raw.values())
+
+    class RecordView(tuple):
+        __slots__ = ()
+
+        def __getattr__(self, name: str) -> object:
+            try:
+                return self[field_names.index(name)]
+            except ValueError as exc:
+                raise AttributeError(name) from exc
+
+    return RecordView(values)
+
+
+def _view_value(value: object) -> object:
+    if type(value) is dict:
+        return _record_view(value)
+    if type(value) is list:
+        return tuple(_view_value(item) for item in value)
+    return value
+
+
+def _snake_case(name: str) -> str:
+    return re.sub(r"(?<!^)(?=[A-Z])", "_", name).lower()
+
+
+def _result_view(canonical: dict[str, object]) -> object:
+    cleanup = canonical["cleanup"]
+    if cleanup is not None:
+        cleanup = {
+            "containerName": cleanup[0],
+            "stopAttempted": cleanup[1],
+            "killAttempted": cleanup[2],
+            "removeAttempted": cleanup[3],
+            "failures": cleanup[4],
+            "postCleanupAbsent": cleanup[5],
+        }
+    enforcement = canonical["enforcement"]
+    if enforcement is not None:
+        enforcement = {
+            "classification": enforcement[0],
+            "argvDigest": enforcement[1],
+            "containerName": enforcement[2],
+            "evidence": enforcement[3],
+        }
+    raw = {
+        "status": canonical["status"],
+        "containerName": canonical["container_name"],
+        "exit": canonical["exit"],
+        "proposal": canonical["proposal"],
+        "receipt": canonical["receipt"],
+        "cleanup": cleanup,
+        "enforcement": enforcement,
+        "evidence": canonical["evidence"],
+    }
+    fields = tuple(_snake_case(name) for name in raw)
+    values = list(_view_value(value) for value in raw.values())
+
+    class ResultView(tuple):
+        __slots__ = ()
+
+        def __getattr__(self, name: str) -> object:
+            try:
+                return self[fields.index(name)]
+            except ValueError as exc:
+                raise AttributeError(name) from exc
+
+        @property
+        def completed(self) -> bool:
+            return self[0] == "completed"
+
+        @property
+        def production_completed(self) -> bool:
+            return False
+
+    if cleanup is not None:
+        values[5] = _cleanup_view(cleanup)
+    if enforcement is not None:
+        values[6] = _enforcement_view(enforcement)
+    return ResultView(tuple(values))
+
+
+def _special_view(raw: dict[str, object], *, succeeded: bool = False, production: bool = False) -> object:
+    field_names = tuple(_snake_case(name) for name in raw)
+    values = tuple(_view_value(value) for value in raw.values())
+
+    class SpecialView(tuple):
+        __slots__ = ()
+
+        def __getattr__(self, name: str) -> object:
+            try:
+                return self[field_names.index(name)]
+            except ValueError as exc:
+                raise AttributeError(name) from exc
+
+        @property
+        def succeeded(self) -> bool:
+            if not succeeded:
+                raise AttributeError("succeeded")
+            return self[4] == () and self[5] is True
+
+        @property
+        def is_production(self) -> bool:
+            if not production:
+                raise AttributeError("is_production")
+            return self[0] == "production"
+
+    return SpecialView(values)
+
+
+def _cleanup_view(raw: dict[str, object]) -> object:
+    return _special_view(raw, succeeded=True)
+
+
+def _enforcement_view(raw: dict[str, object]) -> object:
+    return _special_view(raw, production=True)
+
+
+def _validated_canonical_payload(payload: bytes) -> dict[str, object]:
+    if type(payload) is not bytes:
+        raise ContractError("retained canonical payload has an invalid type")
+    try:
+        raw = json.loads(payload)
+    except Exception as exc:
+        raise ContractError("retained canonical payload is malformed") from exc
+    if type(raw) is not dict or canonical_json_bytes(raw) != payload:
+        raise ContractError("retained canonical payload is not stable")
+    required = {
+        "run_id", "invocation_id", "status", "container_name", "exit", "proposal",
+        "receipt", "cleanup", "enforcement", "evidence",
+    }
+    if set(raw) != required:
+        raise ContractError("retained canonical payload has an invalid shape")
+    if (
+        type(raw["run_id"]) is not str
+        or type(raw["invocation_id"]) is not str
+        or type(raw["status"]) is not str
+        or raw["status"] not in _RESULT_STATUSES
+        or type(raw["container_name"]) is not str
+        or not _CONTAINER_NAME.fullmatch(raw["container_name"])
+        or (raw["exit"] is not None and type(raw["exit"]) is not dict)
+        or (raw["proposal"] is not None and type(raw["proposal"]) is not dict)
+        or (raw["receipt"] is not None and type(raw["receipt"]) is not dict)
+        or (raw["cleanup"] is not None and type(raw["cleanup"]) is not list)
+        or (raw["enforcement"] is not None and type(raw["enforcement"]) is not list)
+        or type(raw["evidence"]) is not list
+        or len(raw["evidence"]) > 32
+        or any(type(item) is not str or not item or len(item) > MAX_REFERENCE_LENGTH for item in raw["evidence"])
+    ):
+        raise ContractError("retained canonical payload has invalid fields")
+    if raw["proposal"] is not None and (
+        raw["proposal"].get("runId") != raw["run_id"]
+        or raw["proposal"].get("invocationId") != raw["invocation_id"]
     ):
         raise BindingError("retained proposal is bound to a different invocation")
-    receipt_value = (
-        None
-        if canonical.receipt_payload is None
-        else _parse_canonical_contract_payload(
-            canonical.receipt_payload,
-            expected_type=_EXACT_TERMINAL_RECEIPT,
-            label="retained receipt",
-        )
-    )
-    if receipt_value is not None and (
-        receipt_value.run_id != run_id or receipt_value.invocation_id != invocation_id
+    if raw["receipt"] is not None and (
+        raw["receipt"].get("runId") != raw["run_id"]
+        or raw["receipt"].get("invocationId") != raw["invocation_id"]
     ):
         raise BindingError("retained receipt is bound to a different invocation")
-    cleanup_value = None
-    if canonical.cleanup is not None:
-        if type(canonical.cleanup) is not tuple or len(canonical.cleanup) != 6:
-            raise ContractError("retained cleanup record is malformed")
-        name, stop, kill, remove, failures, absent = canonical.cleanup
-        if (
-            name != canonical.container_name
-            or type(name) is not str
-            or type(stop) is not bool
-            or type(kill) is not bool
-            or type(remove) is not bool
-            or type(failures) is not tuple
-            or any(type(item) is not str for item in failures)
-            or type(absent) is not bool
-        ):
+    if raw["cleanup"] is not None:
+        cleanup = raw["cleanup"]
+        if len(cleanup) != 6 or cleanup[0] != raw["container_name"] or type(cleanup[0]) is not str:
             raise BindingError("retained cleanup record has an invalid binding")
-        cleanup_value = _EXACT_CLEANUP_REPORT(name, stop, kill, remove, failures, absent)
-    enforcement_value = None
-    if canonical.enforcement is not None:
-        if type(canonical.enforcement) is not tuple or len(canonical.enforcement) != 4:
-            raise ContractError("retained enforcement record is malformed")
-        classification, digest, name, evidence = canonical.enforcement
         if (
-            classification != "test"
-            or type(digest) is not str
-            or type(name) is not str
-            or name != canonical.container_name
-            or type(evidence) is not tuple
-            or any(type(item) is not str for item in evidence)
+            any(type(item) is not bool for item in cleanup[1:4])
+            or type(cleanup[4]) is not list
+            or any(type(item) is not str for item in cleanup[4])
+            or type(cleanup[5]) is not bool
+        ):
+            raise ContractError("retained cleanup record is malformed")
+    if raw["enforcement"] is not None:
+        enforcement = raw["enforcement"]
+        if (
+            len(enforcement) != 4
+            or enforcement[0] != "test"
+            or type(enforcement[1]) is not str
+            or type(enforcement[2]) is not str
+            or enforcement[2] != raw["container_name"]
+            or type(enforcement[3]) is not list
+            or any(type(item) is not str for item in enforcement[3])
         ):
             raise ContractError("retained enforcement record is not test-only")
-        enforcement_value = _EXACT_ENFORCEMENT_ATTESTATION(classification, digest, name, evidence)
-    if (
-        canonical.status not in _RESULT_STATUSES
-        or type(canonical.container_name) is not str
-        or not _CONTAINER_NAME.fullmatch(canonical.container_name)
-        or type(canonical.evidence) is not tuple
-        or any(type(item) is not str or not item for item in canonical.evidence)
-    ):
-        raise ContractError("retained canonical result is malformed")
-    if canonical.status in _TERMINAL_RESULT_STATUSES:
+    if raw["status"] in _TERMINAL_RESULT_STATUSES:
+        receipt = raw["receipt"]
         if (
-            receipt_value is None
-            or not receipt_value.accepted
-            or not receipt_value.legal_transition
-            or receipt_value.kind != canonical.status
+            receipt is None
+            or receipt.get("accepted") is not True
+            or receipt.get("legalTransition") is not True
+            or receipt.get("kind") != raw["status"]
         ):
             raise ContractError("retained terminal result lacks an accepted matching receipt")
-        if canonical.status in {"completed", "waiting_for_input", "failed", "blocked"} and enforcement_value is None:
+        if raw["status"] in {"completed", "waiting_for_input", "failed", "blocked"} and raw["enforcement"] is None:
             raise ContractError("retained terminal result lacks test enforcement evidence")
-    return _new_invocation_result(
-        status=canonical.status,
-        container_name=canonical.container_name,
-        exit=exit_value,
-        proposal=proposal_value,
-        receipt=receipt_value,
-        cleanup=cleanup_value,
-        enforcement=enforcement_value,
-        evidence=tuple(canonical.evidence),
-    )
+    return raw
 
 
 def _argv_digest(argv: Sequence[str]) -> str:
@@ -1685,6 +1763,92 @@ class SubprocessDockerRunner:
             raise RuntimeConfigurationError("Docker cleanup command failed")
 
 
+_RETENTION_SCHEMA = (
+    "CREATE TABLE supervisor_results ("
+    "run_id TEXT NOT NULL, invocation_id TEXT NOT NULL, payload BLOB NOT NULL,"
+    "payload_digest BLOB NOT NULL,"
+    "PRIMARY KEY (run_id, invocation_id))",
+    "CREATE TABLE supervisor_death_receipts ("
+    "run_id TEXT NOT NULL, invocation_id TEXT NOT NULL, payload BLOB, payload_digest BLOB,"
+    "has_receipt INTEGER NOT NULL, PRIMARY KEY (run_id, invocation_id))",
+)
+
+
+def _new_retention_anchor() -> tuple[str, sqlite3.Connection]:
+    """Create an opaque per-supervisor serialized store.
+
+    SQLite owns transaction ordering in its C implementation.  No Python
+    module-global dictionary, weak-reference ledger, live result object, or
+    mutable lock is authoritative.  The URI is an in-memory SQLite name; the
+    anchor connection only keeps that private database alive.
+    """
+
+    uri = f"file:hermes-retention-{secrets.token_hex(32)}?mode=memory&cache=shared"
+    anchor = sqlite3.connect(uri, uri=True, check_same_thread=False, isolation_level=None)
+    for statement in _RETENTION_SCHEMA:
+        anchor.execute(statement)
+    return uri, anchor
+
+
+def _retention_connection(owner: object) -> sqlite3.Connection:
+    try:
+        uri = object.__getattribute__(owner, "_retention_uri")
+        anchor = object.__getattribute__(owner, "_retention_anchor")
+    except AttributeError as exc:
+        raise RuntimeConfigurationError("invocation retention store is unavailable") from exc
+    if (
+        type(uri) is not str
+        or not uri.startswith("file:hermes-retention-")
+        or type(anchor) is not sqlite3.Connection
+    ):
+        raise RuntimeConfigurationError("invocation retention store was replaced")
+    try:
+        connection = sqlite3.connect(uri, uri=True, check_same_thread=False, isolation_level=None, timeout=5.0)
+        connection.execute("PRAGMA busy_timeout = 5000")
+    except Exception as exc:
+        raise RuntimeConfigurationError("invocation retention store is invalid") from exc
+    return connection
+
+
+def _retention_transaction(owner: object) -> sqlite3.Connection:
+    """Acquire SQLite's serialized write transaction with bounded retry."""
+
+    deadline = time.monotonic() + 5.0
+    while True:
+        connection = _retention_connection(owner)
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            return connection
+        except sqlite3.OperationalError as exc:
+            connection.close()
+            if "locked" not in str(exc).lower() or time.monotonic() >= deadline:
+                raise
+            time.sleep(0.005)
+
+
+def _retention_snapshot(owner: object) -> dict[tuple[str, str], bytes]:
+    connection = _retention_connection(owner)
+    try:
+        rows = connection.execute(
+            "SELECT run_id, invocation_id, payload FROM supervisor_results"
+        ).fetchall()
+        return {(run_id, invocation_id): bytes(payload) for run_id, invocation_id, payload in rows}
+    finally:
+        connection.close()
+
+
+def _retention_count(connection: sqlite3.Connection) -> int:
+    row = connection.execute("SELECT COUNT(*) FROM supervisor_results").fetchone()
+    if row is None or type(row[0]) is not int:
+        raise RuntimeConfigurationError("invocation retention count is invalid")
+    return row[0]
+
+
+def _verify_integrity(payload: bytes, expected_digest: object) -> None:
+    if type(expected_digest) is not bytes or expected_digest != hashlib.sha256(payload).digest():
+        raise ContractError("retained canonical payload failed its integrity check")
+
+
 class InvocationSupervisor:
     """Run, bound, reconcile, and dispose of exactly one invocation."""
 
@@ -1719,13 +1883,13 @@ class InvocationSupervisor:
             lease_binding.expires_at,
         )
         self._clock = clock
-        _register_supervisor_state(self)
+        self._retention_uri, self._retention_anchor = _new_retention_anchor()
 
     @property
-    def _results(self) -> Mapping[tuple[str, str], _CanonicalInvocationResult]:
-        """Read-only diagnostic view; it is never the authority used by runs."""
+    def _results(self) -> Mapping[tuple[str, str], bytes]:
+        """Fresh diagnostic bytes; returned mappings are never authoritative."""
 
-        return MappingProxyType(_supervisor_state(self).results)
+        return MappingProxyType(_retention_snapshot(self))
 
     @_results.setter
     def _results(self, replacement: object) -> None:
@@ -1794,49 +1958,69 @@ class InvocationSupervisor:
         return report
 
     @staticmethod
-    def _invalid_retained_result(name: str) -> InvocationResult:
-        return _new_invocation_result(
-            status="supervisor_action_required",
-            container_name=name,
-            evidence=("retained_result_invalid", "supervisor_action_required"),
+    def _invalid_retained_result(name: str) -> object:
+        return _result_view(
+            {
+                "run_id": "invalid",
+                "invocation_id": "invalid",
+                "status": "supervisor_action_required",
+                "container_name": name,
+                "exit": None,
+                "proposal": None,
+                "receipt": None,
+                "cleanup": None,
+                "enforcement": None,
+                "evidence": ["retained_result_invalid", "supervisor_action_required"],
+            }
         )
 
     def _retain_result(
         self,
-        state: _SupervisorState,
+        connection: sqlite3.Connection,
         key: tuple[str, str],
         result: object,
         name: str,
-    ) -> InvocationResult:
-        """Store only a validated canonical snapshot and reconstruct on return."""
+    ) -> object:
+        """Store only canonical bytes and reconstruct a fresh readback view."""
 
         try:
             canonical = _canonicalize_result(key, result)
             public = _public_result_from_canonical(key, canonical)
         except Exception:
             return self._invalid_retained_result(name)
-        state.results[key] = canonical
+        payload_digest = hashlib.sha256(canonical).digest()
+        connection.execute(
+            "INSERT INTO supervisor_results "
+            "(run_id, invocation_id, payload, payload_digest) VALUES (?, ?, ?, ?)",
+            (*key, canonical, payload_digest),
+        )
         return public
 
     def _cached_result(
         self,
-        state: _SupervisorState,
+        connection: sqlite3.Connection,
         key: tuple[str, str],
         name: str,
         expected_argv_digest: str,
-    ) -> InvocationResult:
-        """Validate a retained record; malformed state is discarded fail-closed."""
+    ) -> object:
+        """Validate a retained record; malformed state remains fail-closed."""
 
-        canonical = state.results.get(key)
-        if canonical is None:
+        row = connection.execute(
+            "SELECT payload, payload_digest FROM supervisor_results "
+            "WHERE run_id = ? AND invocation_id = ?",
+            key,
+        ).fetchone()
+        if row is None:
             raise KeyError(key)
         try:
-            result = _public_result_from_canonical(key, canonical)
-            if result.enforcement is not None and result.enforcement.argv_digest != expected_argv_digest:
+            payload = bytes(row[0])
+            _verify_integrity(payload, bytes(row[1]))
+            canonical = _validated_canonical_payload(payload)
+            enforcement = canonical["enforcement"]
+            if enforcement is not None and enforcement[1] != expected_argv_digest:
                 raise BindingError("retained enforcement is bound to a different argv")
-            return result
+            return _public_result_from_canonical(key, payload)
         except Exception:
-            state.results.pop(key, None)
             return self._invalid_retained_result(name)
 
     def _result_for_host_cancellation(
@@ -1853,7 +2037,7 @@ class InvocationSupervisor:
         """Reconcile cancellation from host state, never child evidence."""
 
         if self.cancellation_authority is None:
-            return _new_invocation_result(
+            return _draft_result(
                 status="supervisor_action_required",
                 container_name=name,
                 exit=RuntimeExit("cancelled", final_sequence),
@@ -1870,7 +2054,7 @@ class InvocationSupervisor:
             )
             receipt = reconcile_terminal_proposal(port=self.terminal_port, proposal=proposal)
         except Exception:
-            return _new_invocation_result(
+            return _draft_result(
                 status="supervisor_action_required",
                 container_name=name,
                 exit=RuntimeExit("cancelled", final_sequence),
@@ -1879,7 +2063,7 @@ class InvocationSupervisor:
                 evidence=tuple(dict.fromkeys((*evidence, "host_cancellation_reconciliation_failed", "supervisor_action_required"))),
             )
         if not receipt.accepted or not receipt.legal_transition:
-            return _new_invocation_result(
+            return _draft_result(
                 status="supervisor_action_required",
                 container_name=name,
                 exit=RuntimeExit("cancelled", final_sequence),
@@ -1890,7 +2074,7 @@ class InvocationSupervisor:
                 evidence=tuple(dict.fromkeys((*evidence, "host_cancellation_rejected", "supervisor_action_required"))),
             )
         if cleanup is not None and not cleanup.succeeded:
-            return _new_invocation_result(
+            return _draft_result(
                 status="supervisor_action_required",
                 container_name=name,
                 exit=RuntimeExit("cancelled", final_sequence),
@@ -1900,7 +2084,7 @@ class InvocationSupervisor:
                 enforcement=enforcement,
                 evidence=tuple(dict.fromkeys((*evidence, "host_cancellation", "cleanup_failed", "supervisor_action_required"))),
             )
-        return _new_invocation_result(
+        return _draft_result(
             status="cancelled",
             container_name=name,
             exit=RuntimeExit("cancelled", final_sequence),
@@ -1936,62 +2120,110 @@ class InvocationSupervisor:
         *,
         final_sequence: int = 0,
         reason: str = _SAFE_DEATH_REASON,
-    ) -> TerminalReconciliationReceipt | None:
+    ) -> object:
         """Reconcile one process death once; repeated races reuse its receipt."""
 
         _validate_binding(run, invocation)
         if reason not in _SAFE_DEATH_REASONS:
             reason = _SAFE_DEATH_REASON
         key = (run.run_id, invocation.invocation_id)
-        state = _supervisor_state(self)
-        with state.lock:
-            if key in state.death_receipts:
-                payload = state.death_receipts[key]
-                if payload is None:
-                    return None
-                try:
-                    return _parse_canonical_contract_payload(
-                        payload,
-                        expected_type=_EXACT_TERMINAL_RECEIPT,
-                        label="death receipt",
-                    )
-                except Exception:
-                    state.death_receipts.pop(key, None)
-                    return None
-            if len(state.death_receipts) >= _MAX_RETAINED_INVOCATIONS:
+        connection = _retention_transaction(self)
+        try:
+            self._reconcile_death_locked(
+                connection,
+                run,
+                invocation,
+                final_sequence=final_sequence,
+                reason=reason,
+            )
+            connection.commit()
+            row = connection.execute(
+                "SELECT has_receipt, payload, payload_digest FROM supervisor_death_receipts "
+                "WHERE run_id = ? AND invocation_id = ?",
+                key,
+            ).fetchone()
+            if row is None or row[0] == 0 or row[1] is None or row[2] is None:
                 return None
-            try:
-                receipt = reconcile_process_death(
-                    port=self.terminal_port,
-                    run=run,
-                    invocation_id=invocation.invocation_id,
-                    final_sequence=final_sequence,
-                    reason=reason,
-                )
-            except Exception:
-                receipt = None
-            if receipt is None:
-                state.death_receipts[key] = None
+            payload = bytes(row[1])
+            _verify_integrity(payload, bytes(row[2]))
+            raw = json.loads(payload)
+            if (
+                type(raw) is not dict
+                or canonical_json_bytes(raw) != payload
+                or raw.get("runId") != key[0]
+                or raw.get("invocationId") != key[1]
+            ):
+                raise ContractError("death receipt canonical payload is invalid")
+            return _record_view(raw)
+        except Exception:
+            connection.rollback()
+            return None
+        finally:
+            connection.close()
+
+    def _reconcile_death_locked(
+        self,
+        connection: sqlite3.Connection,
+        run: RunSnapshot,
+        invocation: InvocationEnvelope,
+        *,
+        final_sequence: int,
+        reason: str,
+    ) -> TerminalReconciliationReceipt | None:
+        key = (run.run_id, invocation.invocation_id)
+        row = connection.execute(
+            "SELECT has_receipt, payload, payload_digest FROM supervisor_death_receipts "
+            "WHERE run_id = ? AND invocation_id = ?",
+            key,
+        ).fetchone()
+        if row is not None:
+            if row[0] == 0 or row[1] is None or row[2] is None:
                 return None
-            try:
-                payload = _canonical_contract_payload(
-                    receipt,
-                    expected_type=_EXACT_TERMINAL_RECEIPT,
-                    label="death receipt",
-                )
-                canonical_receipt = _parse_canonical_contract_payload(
-                    payload,
-                    expected_type=_EXACT_TERMINAL_RECEIPT,
-                    label="death receipt",
-                )
-            except Exception:
-                state.death_receipts[key] = None
-                return None
-            state.death_receipts[key] = payload
-            return canonical_receipt
+            payload = bytes(row[1])
+            _verify_integrity(payload, bytes(row[2]))
+            return _parse_canonical_contract_payload(
+                payload,
+                expected_type=_EXACT_TERMINAL_RECEIPT,
+                label="death receipt",
+            )
+        count = connection.execute("SELECT COUNT(*) FROM supervisor_death_receipts").fetchone()
+        if count is None or count[0] >= _MAX_RETAINED_INVOCATIONS:
+            return None
+        try:
+            receipt = reconcile_process_death(
+                port=self.terminal_port,
+                run=run,
+                invocation_id=invocation.invocation_id,
+                final_sequence=final_sequence,
+                reason=reason,
+            )
+        except Exception:
+            receipt = None
+        if receipt is None:
+            connection.execute(
+                "INSERT INTO supervisor_death_receipts "
+                "(run_id, invocation_id, payload, payload_digest, has_receipt) "
+                "VALUES (?, ?, NULL, NULL, 0)",
+                key,
+            )
+            return None
+        payload = _canonical_contract_payload(
+            receipt,
+            expected_type=_EXACT_TERMINAL_RECEIPT,
+            label="death receipt",
+        )
+        payload_digest = hashlib.sha256(payload).digest()
+        connection.execute(
+            "INSERT INTO supervisor_death_receipts "
+            "(run_id, invocation_id, payload, payload_digest, has_receipt) "
+            "VALUES (?, ?, ?, ?, 1)",
+            (*key, payload, payload_digest),
+        )
+        return receipt
 
     def _result_for_death(
         self,
+        connection: sqlite3.Connection,
         run: RunSnapshot,
         invocation: InvocationEnvelope,
         *,
@@ -2001,15 +2233,21 @@ class InvocationSupervisor:
         reason: str,
         evidence: tuple[str, ...],
         enforcement: EnforcementAttestation | None,
-    ) -> InvocationResult:
-        receipt = self.reconcile_death(run, invocation, final_sequence=final_sequence, reason=reason)
+    ) -> tuple[object, ...]:
+        receipt = self._reconcile_death_locked(
+            connection,
+            run,
+            invocation,
+            final_sequence=final_sequence,
+            reason=reason,
+        )
         status = "failed" if receipt is not None and receipt.accepted and cleanup.succeeded else "supervisor_action_required"
         codes = list(evidence)
         if receipt is None:
             codes.append("host_reconciliation_missing")
         if not cleanup.succeeded:
             codes.extend(("cleanup_failed", "supervisor_action_required"))
-        return _new_invocation_result(
+        return _draft_result(
             status=status,
             container_name=name,
             exit=classify_process_death(final_sequence=final_sequence, reason=reason),
@@ -2030,7 +2268,7 @@ class InvocationSupervisor:
         enforcement: EnforcementAttestation,
     ) -> InvocationResult:
         if parsed.proposal.kind == "cancelled":
-            return _new_invocation_result(
+            return _draft_result(
                 status="rejected",
                 container_name=name,
                 exit=parsed.exit,
@@ -2042,7 +2280,7 @@ class InvocationSupervisor:
         try:
             receipt = reconcile_terminal_proposal(port=self.terminal_port, proposal=parsed.proposal)
         except Exception:
-            return _new_invocation_result(
+            return _draft_result(
                 status="supervisor_action_required",
                 container_name=name,
                 exit=parsed.exit,
@@ -2052,7 +2290,7 @@ class InvocationSupervisor:
                 evidence=("host_reconciliation_failed", "supervisor_action_required"),
             )
         if not receipt.accepted or not receipt.legal_transition:
-            return _new_invocation_result(
+            return _draft_result(
                 status="supervisor_action_required",
                 container_name=name,
                 exit=parsed.exit,
@@ -2063,7 +2301,7 @@ class InvocationSupervisor:
                 evidence=("host_reconciliation_rejected", "supervisor_action_required"),
             )
         if not cleanup.succeeded:
-            return _new_invocation_result(
+            return _draft_result(
                 status="supervisor_action_required",
                 container_name=name,
                 exit=parsed.exit,
@@ -2073,7 +2311,7 @@ class InvocationSupervisor:
                 enforcement=enforcement,
                 evidence=("cleanup_failed", "supervisor_action_required"),
             )
-        return _new_invocation_result(
+        return _draft_result(
             status=receipt.kind,
             container_name=name,
             exit=parsed.exit,
@@ -2090,58 +2328,75 @@ class InvocationSupervisor:
         invocation: InvocationEnvelope,
         *,
         cancellation: CancellationSignal | None = None,
-    ) -> InvocationResult:
+    ) -> object:
         """Launch, bound, reconcile, and dispose of one invocation."""
 
         _validate_binding(run, invocation)
         _validate_policy(self.policy)
         key = (run.run_id, invocation.invocation_id)
         name = invocation_container_name(run, invocation)
-        state = _supervisor_state(self)
-        with state.lock:
-            if key not in state.results and len(state.results) >= _MAX_RETAINED_INVOCATIONS:
-                return _new_invocation_result(
-                    "supervisor_action_required",
-                    name,
-                    evidence=("result_not_retained", "supervisor_action_required"),
+        connection = _retention_transaction(self)
+        try:
+            def finish(result: object) -> object:
+                public = self._retain_result(connection, key, result, name)
+                connection.commit()
+                return public
+
+            row = connection.execute(
+                "SELECT payload FROM supervisor_results WHERE run_id = ? AND invocation_id = ?",
+                key,
+            ).fetchone()
+            if row is not None:
+                expected_argv_digest = _argv_digest(build_invocation_argv(run, invocation, self.policy))
+                public = self._cached_result(connection, key, name, expected_argv_digest)
+                connection.commit()
+                return public
+            if _retention_count(connection) >= _MAX_RETAINED_INVOCATIONS:
+                connection.commit()
+                return _result_view(
+                    {
+                        "run_id": run.run_id,
+                        "invocation_id": invocation.invocation_id,
+                        "status": "supervisor_action_required",
+                        "container_name": name,
+                        "exit": None,
+                        "proposal": None,
+                        "receipt": None,
+                        "cleanup": None,
+                        "enforcement": None,
+                        "evidence": ["result_not_retained", "supervisor_action_required"],
+                    }
                 )
             try:
                 self._validate_host_lease(run, invocation)
             except (BindingError, ContractError, RuntimeConfigurationError):
-                return self._retain_result(
-                    state,
-                    key,
-                    _new_invocation_result(
+                return finish(
+                    _draft_result(
                         "rejected", name, evidence=("lease_rejected", "supervisor_action_required")
-                    ),
-                    name,
+                    )
                 )
             expected_argv_digest = _argv_digest(build_invocation_argv(run, invocation, self.policy))
-            if key in state.results:
-                return self._cached_result(state, key, name, expected_argv_digest)
             signal = cancellation or _NeverCancelled()
             cancelled, signal_error = _safe_cancel_check(signal)
             if cancelled:
-                result = self._result_for_host_cancellation(
-                    run,
-                    invocation,
-                    name=name,
-                    final_sequence=0,
-                    cleanup=None,
-                    enforcement=None,
-                    evidence=("cancellation_signal_unavailable",) if signal_error else ("cancellation_signal",),
+                return finish(
+                    self._result_for_host_cancellation(
+                        run,
+                        invocation,
+                        name=name,
+                        final_sequence=0,
+                        cleanup=None,
+                        enforcement=None,
+                        evidence=("cancellation_signal_unavailable",) if signal_error else ("cancellation_signal",),
+                    )
                 )
-                return self._retain_result(state, key, result, name)
             try:
                 argv = build_invocation_argv(run, invocation, self.policy)
                 request = _request_bytes(run, invocation, self.policy)
                 enforcement = self._attest(argv)
             except (ContractError, BoundsError, RuntimeConfigurationError, BindingError):
-                return self._retain_result(
-                    state,
-                    key,
-                    _new_invocation_result("rejected", name, evidence=("policy_rejected", "enforcement_unproven")),
-                    name,
+                return finish(
+                    _draft_result("rejected", name, evidence=("policy_rejected", "enforcement_unproven"))
                 )
             try:
                 process = self._active_runner().launch(
@@ -2151,17 +2406,19 @@ class InvocationSupervisor:
                 )
             except Exception:
                 cleanup = self._cleanup(name)
-                result = self._result_for_death(
-                    run,
-                    invocation,
-                    name=name,
-                    cleanup=cleanup,
-                    final_sequence=0,
-                    reason="runtime launch failed before terminal evidence",
-                    evidence=("launch_failed",),
-                    enforcement=enforcement,
+                return finish(
+                    self._result_for_death(
+                        connection,
+                        run,
+                        invocation,
+                        name=name,
+                        cleanup=cleanup,
+                        final_sequence=0,
+                        reason="runtime launch failed before terminal evidence",
+                        evidence=("launch_failed",),
+                        enforcement=enforcement,
+                    )
                 )
-                return self._retain_result(state, key, result, name)
 
             deadline = self._clock() + float(self.policy.wall_time_seconds)
             collection_failed = False
@@ -2179,21 +2436,19 @@ class InvocationSupervisor:
             cleanup = self._cleanup(name)
             final_sequence = 0
             post_cancelled, post_cancel_error = _safe_cancel_check(signal)
-            # The collector's ``cancelled`` bit is process evidence and cannot
-            # authorize a visible terminal transition.  Only the host-owned
-            # signal, rechecked after collection, can select cancellation.
             active_cancellation = not collection_failed and post_cancelled and not post_cancel_error
             if active_cancellation and self.cancellation_authority is not None:
-                result = self._result_for_host_cancellation(
-                    run,
-                    invocation,
-                    name=name,
-                    final_sequence=0,
-                    cleanup=cleanup,
-                    enforcement=enforcement,
-                    evidence=("cancellation_signal",),
+                return finish(
+                    self._result_for_host_cancellation(
+                        run,
+                        invocation,
+                        name=name,
+                        final_sequence=0,
+                        cleanup=cleanup,
+                        enforcement=enforcement,
+                        evidence=("cancellation_signal",),
+                    )
                 )
-                return self._retain_result(state, key, result, name)
             if collection_failed:
                 reason = "runtime output was malformed or lacked terminal evidence"
                 evidence = ("collection_failed",)
@@ -2203,7 +2458,11 @@ class InvocationSupervisor:
             elif not capture.reaped:
                 reason = "runtime output was malformed or lacked terminal evidence"
                 evidence = ("attach_process_not_reaped", "supervisor_action_required")
-            elif capture.output_exceeded or len(capture.stdout) > int(self.policy.stdout_limit_bytes) or len(capture.stderr) > int(self.policy.stderr_limit_bytes):
+            elif (
+                capture.output_exceeded
+                or len(capture.stdout) > int(self.policy.stdout_limit_bytes)
+                or len(capture.stderr) > int(self.policy.stderr_limit_bytes)
+            ):
                 reason = "runtime output exceeded supervisor bounds"
                 evidence = ("output_limit_exceeded",)
             elif capture.timed_out:
@@ -2219,14 +2478,15 @@ class InvocationSupervisor:
                 try:
                     parsed = _parse_child_output(capture.stdout, run=run, invocation=invocation, policy=self.policy)
                 except ChildCancellationProposalRejected:
-                    result = _new_invocation_result(
-                        status="rejected",
-                        container_name=name,
-                        cleanup=cleanup,
-                        enforcement=enforcement,
-                        evidence=("child_cancellation_untrusted", "supervisor_action_required"),
+                    return finish(
+                        _draft_result(
+                            status="rejected",
+                            container_name=name,
+                            cleanup=cleanup,
+                            enforcement=enforcement,
+                            evidence=("child_cancellation_untrusted", "supervisor_action_required"),
+                        )
                     )
-                    return self._retain_result(state, key, result, name)
                 except Exception:
                     reason = "runtime output was malformed or lacked terminal evidence"
                     evidence = ("invalid_child_output",)
@@ -2236,26 +2496,33 @@ class InvocationSupervisor:
                         reason = "runtime process died before terminal evidence"
                         evidence = ("child_process_died",)
                     else:
-                        result = self._result_from_proposal(
-                            run,
-                            invocation,
-                            name=name,
-                            parsed=parsed,
-                            cleanup=cleanup,
-                            enforcement=enforcement,
+                        return finish(
+                            self._result_from_proposal(
+                                run,
+                                invocation,
+                                name=name,
+                                parsed=parsed,
+                                cleanup=cleanup,
+                                enforcement=enforcement,
+                            )
                         )
-                        return self._retain_result(state, key, result, name)
-            result = self._result_for_death(
-                run,
-                invocation,
-                name=name,
-                cleanup=cleanup,
-                final_sequence=final_sequence,
-                reason=reason,
-                evidence=evidence,
-                enforcement=enforcement,
+            return finish(
+                self._result_for_death(
+                    connection,
+                    run,
+                    invocation,
+                    name=name,
+                    cleanup=cleanup,
+                    final_sequence=final_sequence,
+                    reason=reason,
+                    evidence=evidence,
+                    enforcement=enforcement,
+                )
             )
-            return self._retain_result(state, key, result, name)
+        finally:
+            if connection.in_transaction:
+                connection.rollback()
+            connection.close()
 
 
 __all__ = [

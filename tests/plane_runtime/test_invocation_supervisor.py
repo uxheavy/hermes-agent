@@ -526,28 +526,32 @@ class SupervisorTests(unittest.TestCase):
             proposal_output(self.snapshot, self.invocation),
             port=port,
         )
-        first = supervisor.run_once(self.snapshot, self.invocation)
 
         class ForgedResult(supervisor_module._EXACT_INVOCATION_RESULT):
             @property
             def production_completed(self):
                 return True
 
+        name = invocation_container_name(self.snapshot, self.invocation)
         forged = ForgedResult(
             status="completed",
-            container_name=first.container_name,
+            container_name=name,
             enforcement=EnforcementAttestation(
                 "production",
                 "0" * 64,
-                first.container_name,
+                name,
                 ("forged",),
             ),
         )
         object.__setattr__(supervisor, "_results", {
             (self.snapshot.run_id, self.invocation.invocation_id): forged,
         })
+        first = supervisor.run_once(self.snapshot, self.invocation)
+        object.__setattr__(supervisor, "_results", {
+            (self.snapshot.run_id, self.invocation.invocation_id): forged,
+        })
         second = supervisor.run_once(self.snapshot, self.invocation)
-        self.assertEqual(type(second), supervisor_module._EXACT_INVOCATION_RESULT)
+        self.assertNotIsInstance(second, ForgedResult)
         self.assertFalse(second.production_completed)
         self.assertEqual(second, first)
         self.assertEqual(len(port.proposals), 1)
@@ -565,8 +569,12 @@ class SupervisorTests(unittest.TestCase):
         )
         with patch.object(supervisor_module, "InvocationResult", PatchedResult):
             after = before_supervisor.run_once(self.snapshot, self.invocation)
-        self.assertEqual(type(after), supervisor_module._EXACT_INVOCATION_RESULT)
+        with patch.object(supervisor_module, "InvocationResult", PatchedResult):
+            after_read = before_supervisor.run_once(self.snapshot, self.invocation)
+        self.assertNotIsInstance(after, PatchedResult)
+        self.assertNotIsInstance(after_read, PatchedResult)
         self.assertFalse(after.production_completed)
+        self.assertEqual(after_read, after)
         self.assertEqual(len(before_port.proposals), 1)
 
         inside_port = FixtureTerminalReconciliationPort()
@@ -576,9 +584,66 @@ class SupervisorTests(unittest.TestCase):
                 port=inside_port,
             )
             before = inside_supervisor.run_once(self.snapshot, self.invocation)
-        self.assertEqual(type(before), supervisor_module._EXACT_INVOCATION_RESULT)
+        self.assertNotIsInstance(before, PatchedResult)
         self.assertFalse(before.production_completed)
         self.assertEqual(len(inside_port.proposals), 1)
+
+    def test_legacy_ledger_and_constructor_capture_surfaces_are_not_runtime_authority(self) -> None:
+        self.assertFalse(hasattr(supervisor_module, "_SUPERVISOR_STATES"))
+        self.assertFalse(hasattr(supervisor_module, "_new_invocation_result"))
+        self.assertIsNone(supervisor_module._draft_result.__defaults__)
+        self.assertIsNone(supervisor_module._draft_result.__kwdefaults__)
+
+        original_defaults = supervisor_module._draft_result.__kwdefaults__
+        supervisor_module._draft_result.__kwdefaults__ = {"status": "completed"}
+        try:
+            with patch.object(supervisor_module.InvocationResult, "__dataclass_fields__", {}):
+                supervisor, _runner = self.make_supervisor(
+                    proposal_output(self.snapshot, self.invocation)
+                )
+                result = supervisor.run_once(self.snapshot, self.invocation)
+        finally:
+            supervisor_module._draft_result.__kwdefaults__ = original_defaults
+        self.assertTrue(result.completed)
+        self.assertFalse(result.production_completed)
+
+    def test_returned_value_class_metadata_is_not_shared_with_canonical_readback(self) -> None:
+        supervisor, _runner = self.make_supervisor(
+            proposal_output(self.snapshot, self.invocation)
+        )
+        first = supervisor.run_once(self.snapshot, self.invocation)
+        type(first).production_completed = property(lambda _result: True)
+        second = supervisor.run_once(self.snapshot, self.invocation)
+        self.assertTrue(first.production_completed)
+        self.assertFalse(second.production_completed)
+        self.assertTrue(second.completed)
+        self.assertIsNot(type(first), type(second))
+
+    def test_results_diagnostic_mapping_and_valid_payload_mutation_are_non_authoritative(self) -> None:
+        port = FixtureTerminalReconciliationPort()
+        supervisor, _runner = self.make_supervisor(
+            proposal_output(self.snapshot, self.invocation),
+            port=port,
+        )
+        first = supervisor.run_once(self.snapshot, self.invocation)
+        key = (self.snapshot.run_id, self.invocation.invocation_id)
+        snapshot = supervisor._results
+        with self.assertRaises(TypeError):
+            snapshot[key] = b"forged"  # type: ignore[index]
+        self.assertEqual(snapshot[key], supervisor._results[key])
+
+        canonical = json.loads(snapshot[key])
+        canonical["evidence"].append("forged-but-well-shaped")
+        supervisor._retention_anchor.execute(
+            "UPDATE supervisor_results SET payload = ? WHERE run_id = ? AND invocation_id = ?",
+            (json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode(), *key),
+        )
+        second = supervisor.run_once(self.snapshot, self.invocation)
+        self.assertEqual(second.status, "supervisor_action_required")
+        self.assertIn("retained_result_invalid", second.evidence)
+        self.assertFalse(second.production_completed)
+        self.assertEqual(len(port.proposals), 1)
+        self.assertTrue(first.completed)
 
     def test_malformed_or_production_canonical_records_fail_closed_without_reconciliation(self) -> None:
         for mutation in ("production", "malformed", "binding"):
@@ -590,21 +655,17 @@ class SupervisorTests(unittest.TestCase):
                 )
                 first = supervisor.run_once(self.snapshot, self.invocation)
                 key = (self.snapshot.run_id, self.invocation.invocation_id)
-                canonical = supervisor._results[key]
+                canonical = json.loads(supervisor._results[key])
                 if mutation == "production":
-                    object.__setattr__(
-                        canonical,
-                        "enforcement",
-                        ("production", "0" * 64, first.container_name, ("forged",)),
-                    )
+                    canonical["enforcement"] = ["production", "0" * 64, first.container_name, ["forged"]]
                 elif mutation == "malformed":
-                    object.__setattr__(canonical, "evidence", [])
+                    canonical["evidence"] = {}
                 else:
-                    object.__setattr__(
-                        canonical,
-                        "enforcement",
-                        ("test", "0" * 64, first.container_name, ("forged",)),
-                    )
+                    canonical["enforcement"] = ["test", "0" * 64, "wrong-container", ["forged"]]
+                supervisor._retention_anchor.execute(
+                    "UPDATE supervisor_results SET payload = ? WHERE run_id = ? AND invocation_id = ?",
+                    (json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode(), *key),
+                )
                 second = supervisor.run_once(self.snapshot, self.invocation)
                 self.assertEqual(second.status, "supervisor_action_required")
                 self.assertFalse(second.production_completed)
@@ -618,16 +679,41 @@ class SupervisorTests(unittest.TestCase):
             port=port,
         )
         first = supervisor.run_once(self.snapshot, self.invocation)
-        object.__setattr__(first, "enforcement", EnforcementAttestation(
-            "production",
-            "0" * 64,
-            first.container_name,
-            ("forged",),
-        ))
+        with self.assertRaises(AttributeError):
+            object.__setattr__(first, "enforcement", EnforcementAttestation(
+                "production",
+                "0" * 64,
+                first.container_name,
+                ("forged",),
+            ))
         second = supervisor.run_once(self.snapshot, self.invocation)
         self.assertFalse(first.production_completed)
         self.assertFalse(second.production_completed)
         self.assertEqual(second.enforcement.classification, "test")  # type: ignore[union-attr]
+        self.assertEqual(len(port.proposals), 1)
+
+    def test_death_receipt_payload_tampering_fails_closed_without_reconciliation_replay(self) -> None:
+        port = FixtureTerminalReconciliationPort()
+        supervisor, _runner = self.make_supervisor(
+            b"",
+            runner=FakeRunner(launch_error=RuntimeError("launch failed")),
+            port=port,
+        )
+        result = supervisor.run_once(self.snapshot, self.invocation)
+        self.assertEqual(result.status, "failed")
+        key = (self.snapshot.run_id, self.invocation.invocation_id)
+        row = supervisor._retention_anchor.execute(
+            "SELECT payload FROM supervisor_death_receipts WHERE run_id = ? AND invocation_id = ?",
+            key,
+        ).fetchone()
+        self.assertIsNotNone(row)
+        receipt = json.loads(row[0])
+        receipt["receiptRef"] = "forged-receipt"
+        supervisor._retention_anchor.execute(
+            "UPDATE supervisor_death_receipts SET payload = ? WHERE run_id = ? AND invocation_id = ?",
+            (json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode(), *key),
+        )
+        self.assertIsNone(supervisor.reconcile_death(self.snapshot, self.invocation))
         self.assertEqual(len(port.proposals), 1)
 
     def test_child_cancellation_receipt_is_rejected_without_host_mutation(self) -> None:

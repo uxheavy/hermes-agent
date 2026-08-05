@@ -106,8 +106,11 @@ produce a `production_completed` result; there is deliberately no mutable
 closed-runner production path to replace. The attach client is terminated,
 killed if necessary, and reaped on every collector exit before container
 cleanup. Results are retained under a fixed bound only as validated private
-canonical snapshots; caller-supplied or mutated result objects are never
-trusted, and each lookup reconstructs a fresh exact non-production result.
+canonical bytes in an invocation-local serialized store; caller-supplied or
+mutated result objects are never trusted. Each lookup validates the binding
+and integrity record, then returns a fresh immutable non-production value
+view. The store is ephemeral Hermes execution state, not Plane product or
+database authority.
 Overflow is returned as supervisor action required without inserting past the
 cap. Cleanup proves deterministic container absence after stop/kill/remove-volume
 attempts.
