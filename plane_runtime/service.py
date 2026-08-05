@@ -708,8 +708,8 @@ _PRODUCTION_BINDING: _ProductionBinding | None = None
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run one Plane Agent runtime invocation")
     parser.add_argument("--once", action="store_true", help="accept one JSON-lines invocation (the default)")
+    parser.add_argument("--g1-test-only", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
-    del args
     try:
         with _ServiceFrameReader(sys.stdin) as reader:
             request_line = reader.read_frame()
@@ -728,6 +728,8 @@ def main(argv: list[str] | None = None) -> int:
         # making the new child process consume exact G1 values.
         run_value = request.get("run")
         if isinstance(run_value, dict) and {"profile", "runtimePolicy"}.issubset(run_value):
+            if not args.g1_test_only:
+                raise RuntimeConfigurationError("G1 direct execution requires the supervisor test boundary")
             from .g1_service import serve_once_g1
 
             return serve_once_g1(request_line, sys.stdout)

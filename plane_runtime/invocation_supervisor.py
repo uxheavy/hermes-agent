@@ -62,6 +62,14 @@ from .contract import (
     TerminalReconciliationReceipt,
     canonical_json_bytes,
 )
+from .g1_contract import (
+    G1ContractError,
+    G1InvocationEnvelope,
+    G1RunSnapshot,
+    bind_snapshot_and_invocation,
+    build_exit,
+    validate_g1_frames,
+)
 
 
 # These aliases are used only while validating a freshly produced candidate or
@@ -399,6 +407,7 @@ class ProcessCapture:
     stderr: bytes = b""
     timed_out: bool = False
     cancelled: bool = False
+    lease_expired: bool = False
     output_exceeded: bool = False
     reaped: bool = True
 
@@ -412,6 +421,7 @@ class InvocationProcess(Protocol):
         stdout_limit_bytes: int,
         stderr_limit_bytes: int,
         is_cancelled: Callable[[], bool],
+        lease_valid: Callable[[], bool] | None = None,
     ) -> ProcessCapture:
         ...
 
@@ -1226,6 +1236,7 @@ class _SubprocessDockerProcess:
         stdout_limit_bytes: int,
         stderr_limit_bytes: int,
         is_cancelled: Callable[[], bool],
+        lease_valid: Callable[[], bool] | None = None,
     ) -> ProcessCapture:
         selector = selectors.DefaultSelector()
         stdout = bytearray()
@@ -1257,6 +1268,18 @@ class _SubprocessDockerProcess:
                         stderr=bytes(stderr),
                         cancelled=True,
                     )
+                if lease_valid is not None:
+                    try:
+                        lease_alive = lease_valid()
+                    except Exception:
+                        lease_alive = False
+                    if type(lease_alive) is not bool or not lease_alive:
+                        return finish(
+                            returncode=self._process.poll(),
+                            stdout=bytes(stdout),
+                            stderr=bytes(stderr),
+                            lease_expired=True,
+                        )
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     return finish(
@@ -1317,6 +1340,12 @@ class _SubprocessDockerProcess:
             reaped = self._terminate_and_reap()
             if capture is not None:
                 object.__setattr__(capture, "reaped", reaped)
+
+    def cleanup(self) -> bool:
+        """Terminate and reap an attached process when collection never began."""
+
+        self._close_streams()
+        return self._terminate_and_reap()
 
 
 def _json_object(raw: bytes, label: str) -> dict[str, object]:
@@ -1787,8 +1816,11 @@ _RETENTION_REQUEST_TIMEOUT_SECONDS = 5.0
 _RETENTION_CLOSE_TIMEOUT_SECONDS = 2.0
 _RETENTION_SECRET_LENGTH = 32
 _RETENTION_OPERATIONS = frozenset({"create", "read", "close"})
-_RETENTION_RECORDS = frozenset({"result", "death"})
-_RETENTION_READ_RECORDS = frozenset({"result", "death", "result_count", "death_count"})
+_RETENTION_RECORDS = frozenset({"result", "death", "g1_result"})
+_RETENTION_READ_RECORDS = frozenset({
+    "result", "death", "g1_result",
+    "result_count", "death_count",
+})
 _RETENTION_STATUSES = frozenset({"created", "replayed", "conflict", "missing", "ok", "closed"})
 _RETENTION_AUTHENTICATION_LABEL = b"plane-agent-retention-session/v2"
 
@@ -1912,6 +1944,39 @@ def _retention_record_key(record: str, run_id: str, invocation_id: str) -> tuple
     ):
         raise ContractError("retention record binding is invalid")
     return record, run_id, invocation_id
+
+
+def _validate_g1_retained_value(
+    record: str,
+    value: object,
+    run_id: str,
+    invocation_id: str,
+) -> dict[str, object]:
+    """Validate the bounded G1 values stored by the shared retention authority."""
+
+    if type(value) is not dict:
+        raise ContractError("retained G1 value is not an object")
+    if record == "g1_result":
+        expected = {"runId", "invocationId", "requestFingerprint", "frames"}
+        if set(value) != expected:
+            raise ContractError("retained G1 result has unexpected fields")
+        if value["runId"] != run_id or value["invocationId"] != invocation_id:
+            raise BindingError("retained G1 result is not invocation-bound")
+        fingerprint = value["requestFingerprint"]
+        frames = value["frames"]
+        if (
+            type(fingerprint) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", fingerprint) is None
+            or type(frames) is not list
+            or not frames
+            or len(frames) > 4096
+            or any(type(frame) is not str or not frame for frame in frames)
+        ):
+            raise ContractError("retained G1 result is malformed")
+        if sum(len(frame.encode("utf-8")) + 1 for frame in frames) > 512 * 1024:
+            raise BoundsError("retained G1 result exceeds its bound")
+        return value
+    raise ContractError("unsupported retained G1 record")
 
 
 def _retention_authority_response(
@@ -2117,7 +2182,7 @@ def _retention_authority_main() -> None:
                 canonical = _validated_canonical_payload(payload)
                 if canonical["run_id"] != run_id or canonical["invocation_id"] != invocation_id:
                     raise BindingError("retention result is bound to a different invocation")
-            else:
+            elif record == "death":
                 receipt = _parse_canonical_contract_payload(
                     payload,
                     expected_type=_EXACT_TERMINAL_RECEIPT,
@@ -2125,6 +2190,8 @@ def _retention_authority_main() -> None:
                 )
                 if receipt.run_id != run_id or receipt.invocation_id != invocation_id:
                     raise BindingError("retention death receipt is bound to a different invocation")
+            else:
+                _validate_g1_retained_value(record, value, run_id, invocation_id)
             existing = records.get(key)
             if existing is not None:
                 existing_payload, expected_digest = existing
@@ -2154,7 +2221,7 @@ def _retention_authority_main() -> None:
                         session_key,
                     )
                 continue
-            if record == "result" and sum(key[0] == "result" for key in records) >= _MAX_RETAINED_INVOCATIONS:
+            if record in {"result", "g1_result"} and sum(key[0] in {"result", "g1_result"} for key in records) >= _MAX_RETAINED_INVOCATIONS:
                 emit(
                     _retention_authority_response(
                         status="conflict",
@@ -4057,11 +4124,496 @@ class InvocationSupervisor:
             )
         )
 
+    @classmethod
+    def for_g1(
+        cls,
+        *,
+        runner: "G1RuntimeRunner | None" = None,
+        hard_timeout_seconds: float = 30.0,
+    ) -> "G1InvocationSupervisor":
+        """Construct the G1 facade over this module's canonical supervisor seam."""
+
+        return G1InvocationSupervisor(
+            runner=runner,
+            hard_timeout_seconds=hard_timeout_seconds,
+        )
+
+
+@dataclass(frozen=True)
+class G1ProcessCapture:
+    """Bounded output from a test-classified G1 child."""
+
+    returncode: int | None
+    stdout: bytes = b""
+    stderr: bytes = b""
+    timed_out: bool = False
+    cancelled: bool = False
+    lease_expired: bool = False
+    output_exceeded: bool = False
+    reaped: bool = True
+
+
+class G1RuntimeProcess(Protocol):
+    def collect(
+        self,
+        *,
+        input_bytes: bytes,
+        deadline: float,
+        is_cancelled: Callable[[], bool],
+        lease_valid: Callable[[], bool],
+    ) -> G1ProcessCapture:
+        ...
+
+
+class G1RuntimeRunner(Protocol):
+    def attest_invocation(
+        self,
+        command: Sequence[str],
+        *,
+        request_fingerprint: str,
+    ) -> EnforcementAttestation:
+        ...
+
+    def launch(
+        self,
+        command: Sequence[str],
+        *,
+        input_bytes: bytes,
+        environment: Mapping[str, str],
+        max_output_bytes: int,
+    ) -> G1RuntimeProcess:
+        ...
+
+    def cleanup(self, invocation_name: str) -> CleanupReport:
+        ...
+
+
+_G1_LOCAL_EXECUTABLE = os.path.realpath(sys.executable)
+_G1_LOCAL_COMMAND = (
+    _G1_LOCAL_EXECUTABLE,
+    "-m",
+    _FIXED_SERVICE_MODULE,
+    *_FIXED_SERVICE_ARGS,
+    "--g1-test-only",
+)
+_G1_LOCAL_SOURCE_ROOT = os.path.realpath(os.path.join(os.path.dirname(__file__), ".."))
+
+
+def _g1_command_digest(command: Sequence[str]) -> str:
+    return hashlib.sha256(b"\0".join(value.encode("utf-8") for value in command)).hexdigest()
+
+
+class _G1LocalProcess:
+    """G1 view over the accepted bounded subprocess collector."""
+
+    def __init__(self, process: _SubprocessDockerProcess, max_output_bytes: int) -> None:
+        self._process = process
+        self._max_output_bytes = max_output_bytes
+
+    def collect(
+        self,
+        *,
+        input_bytes: bytes,
+        deadline: float,
+        is_cancelled: Callable[[], bool],
+        lease_valid: Callable[[], bool],
+    ) -> G1ProcessCapture:
+        capture = self._process.collect(
+            input_bytes=input_bytes,
+            deadline=deadline,
+            stdout_limit_bytes=self._max_output_bytes,
+            stderr_limit_bytes=self._max_output_bytes,
+            is_cancelled=is_cancelled,
+            lease_valid=lease_valid,
+        )
+        return G1ProcessCapture(
+            capture.returncode,
+            capture.stdout,
+            capture.stderr,
+            timed_out=capture.timed_out,
+            cancelled=capture.cancelled,
+            lease_expired=capture.lease_expired,
+            output_exceeded=capture.output_exceeded,
+            reaped=capture.reaped,
+        )
+
+    def cleanup(self) -> bool:
+        return self._process.cleanup()
+
+
+class G1LocalTestRunner:
+    """Explicit test-only local runner; it does not claim OS isolation."""
+
+    def __init__(self, *, max_output_bytes: int = 512 * 1024) -> None:
+        if max_output_bytes < MAX_EVENT_BYTES:
+            raise BoundsError("G1 local runner output bound is too small")
+        self._max_output_bytes = max_output_bytes
+        self._processes: dict[str, _G1LocalProcess] = {}
+        self._lock = threading.Lock()
+
+    def attest_invocation(
+        self,
+        command: Sequence[str],
+        *,
+        request_fingerprint: str,
+    ) -> EnforcementAttestation:
+        if tuple(command) != _G1_LOCAL_COMMAND or re.fullmatch(r"[0-9a-f]{64}", request_fingerprint) is None:
+            raise RuntimeConfigurationError("G1 local runner command attestation is invalid")
+        return EnforcementAttestation(
+            classification="test",
+            argv_digest=_g1_command_digest(command),
+            container_name=f"plane-invocation-{request_fingerprint[:32]}",
+            evidence=("fixed_environment", "test_runner_only", "os_isolation_not_claimed"),
+        )
+
+    def launch(
+        self,
+        command: Sequence[str],
+        *,
+        input_bytes: bytes,
+        environment: Mapping[str, str],
+        max_output_bytes: int,
+    ) -> G1RuntimeProcess:
+        if tuple(command) != _G1_LOCAL_COMMAND or dict(environment) != build_invocation_env():
+            raise RuntimeConfigurationError("G1 local runner controls are not fixed")
+        try:
+            request = json.loads(input_bytes.decode("utf-8"))
+            snapshot = G1RunSnapshot.from_dict(request["run"])
+            invocation = G1InvocationEnvelope.from_dict(request["invocation"])
+            bind_snapshot_and_invocation(snapshot, invocation)
+        except Exception as exc:
+            raise ContractError("G1 local runner request is invalid") from exc
+        if snapshot.adapter_name != "deterministic-test-adapter":
+            raise RuntimeConfigurationError("G1 local runner is test-only")
+        process = subprocess.Popen(
+            _G1_LOCAL_COMMAND,
+            cwd=_G1_LOCAL_SOURCE_ROOT,
+            env=dict(build_invocation_env()),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            close_fds=True,
+        )
+        fingerprint = hashlib.sha256(input_bytes.rstrip(b"\n")).hexdigest()
+        handle = _G1LocalProcess(
+            _SubprocessDockerProcess(process),
+            min(self._max_output_bytes, max_output_bytes),
+        )
+        with self._lock:
+            self._processes[f"plane-invocation-{fingerprint[:32]}"] = handle
+        return handle
+
+    def cleanup(self, invocation_name: str) -> CleanupReport:
+        with self._lock:
+            process = self._processes.pop(invocation_name, None)
+        if process is None:
+            return CleanupReport(invocation_name, False, False, True, (), True)
+        try:
+            reaped = process.cleanup()
+        except Exception:
+            reaped = False
+        return CleanupReport(invocation_name, False, False, True, (), reaped)
+
+
+def _g1_failure_frames(
+    snapshot: G1RunSnapshot,
+    invocation: G1InvocationEnvelope,
+    *,
+    kind: str,
+    code: str,
+    message: str,
+) -> tuple[str, ...]:
+    frame = build_exit(
+        snapshot=snapshot,
+        invocation=invocation,
+        final_sequence=0,
+        kind=kind,
+        failure={"code": code, "message": message, "retryable": False},
+    )
+    raw = json.dumps(frame, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return (raw,)
+
+
+class G1InvocationSupervisor:
+    """G1 adapter over the existing authenticated retention/supervisor seam."""
+
+    def __init__(
+        self,
+        *,
+        runner: G1RuntimeRunner | None = None,
+        hard_timeout_seconds: float = 30.0,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        if not isinstance(hard_timeout_seconds, (int, float)) or not math.isfinite(float(hard_timeout_seconds)) or hard_timeout_seconds <= 0:
+            raise ContractError("G1 hard timeout must be positive and finite")
+        self.runner = runner or G1LocalTestRunner()
+        self.hard_timeout_seconds = float(hard_timeout_seconds)
+        self._clock = clock
+        self._retention_authority = _RETENTION_AUTHORITY_PRODUCTION_CONSTRUCTOR()
+        self._retention_finalizer = weakref.finalize(self, self._retention_authority.close)
+        self._g1_budgets: dict[str, dict[str, int]] = {}
+
+    def close(self) -> None:
+        self._retention_finalizer()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    @staticmethod
+    def _fingerprint(snapshot: G1RunSnapshot, invocation: G1InvocationEnvelope) -> str:
+        return hashlib.sha256(
+            canonical_json_bytes({"run": snapshot.to_dict(), "invocation": invocation.to_dict()})
+        ).hexdigest()
+
+    @staticmethod
+    def _cancelled(signal: object | None) -> bool:
+        if signal is None:
+            return False
+        method = getattr(signal, "is_set", None) or getattr(signal, "is_cancelled", None)
+        if not callable(method):
+            raise ContractError("G1 cancellation signal is invalid")
+        value = method()
+        if type(value) is not bool:
+            raise ContractError("G1 cancellation signal must return bool")
+        return value
+
+    @staticmethod
+    def _lease_remaining(invocation: G1InvocationEnvelope) -> float:
+        from datetime import datetime, timezone
+
+        parsed = datetime.fromisoformat(str(invocation.lease["expiresAt"]).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            raise ContractError("G1 lease timestamp must include a timezone")
+        return (parsed.astimezone(timezone.utc) - datetime.now(timezone.utc)).total_seconds()
+
+    @staticmethod
+    def _lease_is_valid(lease_valid: Callable[[], bool]) -> bool:
+        """Treat an unavailable or malformed lease authority as expired."""
+
+        try:
+            value = lease_valid()
+        except Exception:
+            return False
+        return type(value) is bool and value
+
+    @staticmethod
+    def _usage_from_frames(frames: tuple[str, ...]) -> dict[str, int]:
+        """Read bounded usage observations for the next cumulative dispatch."""
+
+        usage = {"inputTokens": 0, "outputTokens": 0, "durationMs": 0}
+        for raw in frames:
+            try:
+                frame = json.loads(raw)
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise G1ContractError("retained G1 frame is not valid JSON") from exc
+            body = frame.get("body") if isinstance(frame, dict) else None
+            if not isinstance(body, dict) or body.get("kind") != "usage_observed":
+                continue
+            observed = body.get("usage")
+            if not isinstance(observed, dict):
+                raise G1ContractError("G1 usage observation is malformed")
+            for name in usage:
+                amount = observed.get(name)
+                if type(amount) is not int or amount < 0 or amount > 2_147_483_647:
+                    raise G1ContractError("G1 usage observation is out of bounds")
+                usage[name] += amount
+                if usage[name] > 2_147_483_647:
+                    raise G1ContractError("G1 cumulative usage exceeds its bound")
+        return usage
+
+    def _record_g1_budget(
+        self,
+        run_id: str,
+        remaining_budget: Mapping[str, int],
+        frames: tuple[str, ...],
+    ) -> None:
+        usage = self._usage_from_frames(frames)
+        if any(usage[name] > remaining_budget[name] for name in usage):
+            raise G1ContractError("G1 usage exceeded the invocation budget")
+        self._g1_budgets[run_id] = {
+            name: remaining_budget[name] - usage[name]
+            for name in usage
+        }
+
+    def run_once(
+        self,
+        snapshot: G1RunSnapshot,
+        invocation: G1InvocationEnvelope,
+        *,
+        cancellation: object | None,
+        lease_valid: Callable[[], bool] | None,
+    ) -> tuple[str, ...]:
+        bind_snapshot_and_invocation(snapshot, invocation)
+        if not callable(lease_valid):
+            raise ContractError("G1 lease validity callback is mandatory")
+        fingerprint = self._fingerprint(snapshot, invocation)
+        return self._retention_authority.exclusive(
+            lambda: self._run_once_locked(
+                snapshot,
+                invocation,
+                fingerprint=fingerprint,
+                cancellation=cancellation,
+                lease_valid=lease_valid,
+            )
+        )
+
+    def _run_once_locked(
+        self,
+        snapshot: G1RunSnapshot,
+        invocation: G1InvocationEnvelope,
+        *,
+        fingerprint: str,
+        cancellation: object | None,
+        lease_valid: Callable[[], bool],
+    ) -> tuple[str, ...]:
+        key = (snapshot.run_id, invocation.invocation_id)
+        cached = self._retention_authority.read("g1_result", key)
+        if cached.get("status") == "ok":
+            value = _validate_g1_retained_value("g1_result", cached.get("value"), *key)
+            if value["requestFingerprint"] != fingerprint:
+                raise G1ContractError("changed replay conflicts with the retained invocation")
+            retained_frames = tuple(value["frames"])
+            if snapshot.run_id not in self._g1_budgets:
+                self._record_g1_budget(snapshot.run_id, invocation.remaining_budget, retained_frames)
+            return retained_frames
+        if cached.get("status") != "missing":
+            raise RuntimeConfigurationError("G1 retained result is unavailable")
+        previous_budget = self._g1_budgets.get(snapshot.run_id)
+        if previous_budget is not None and any(
+            invocation.remaining_budget[name] > previous_budget[name]
+            for name in ("inputTokens", "outputTokens", "durationMs")
+        ):
+            raise G1ContractError("cumulative G1 budget increased across invocations")
+        self._g1_budgets[snapshot.run_id] = dict(invocation.remaining_budget)
+        if self._cancelled(cancellation):
+            frames = _g1_failure_frames(snapshot, invocation, kind="cancelled", code="cancelled", message="runtime cancellation was requested")
+            return self._retain_g1(snapshot, invocation, fingerprint, frames)
+        if not self._lease_is_valid(lease_valid):
+            frames = _g1_failure_frames(snapshot, invocation, kind="failed", code="lease_expired", message="invocation lease is no longer valid")
+            return self._retain_g1(snapshot, invocation, fingerprint, frames)
+        lease_remaining = self._lease_remaining(invocation)
+        remaining_duration = invocation.remaining_budget["durationMs"] / 1000.0
+        if lease_remaining <= 0:
+            frames = _g1_failure_frames(snapshot, invocation, kind="failed", code="lease_expired", message="invocation lease is no longer valid")
+            return self._retain_g1(snapshot, invocation, fingerprint, frames)
+        if remaining_duration <= 0:
+            frames = _g1_failure_frames(snapshot, invocation, kind="failed", code="budget_exhausted", message="cumulative invocation duration budget is exhausted")
+            return self._retain_g1(snapshot, invocation, fingerprint, frames)
+        request = canonical_json_bytes({"run": snapshot.to_dict(), "invocation": invocation.to_dict()}) + b"\n"
+        policy = snapshot.raw["runtimePolicy"]
+        max_output = min(512 * 1024, max(int(policy["maxEventPayloadBytes"]), int(policy["maxReceiptBytes"])))
+        attestation = self.runner.attest_invocation(_G1_LOCAL_COMMAND, request_fingerprint=fingerprint)
+        if type(attestation) is not _EXACT_ENFORCEMENT_ATTESTATION or attestation.classification != "test" or attestation.argv_digest != _g1_command_digest(_G1_LOCAL_COMMAND):
+            raise RuntimeConfigurationError("G1 runner attestation is not an accepted test boundary")
+        name = attestation.container_name
+        try:
+            process = self.runner.launch(
+                _G1_LOCAL_COMMAND,
+                input_bytes=request,
+                environment=build_invocation_env(),
+                max_output_bytes=max_output,
+            )
+        except Exception:
+            try:
+                cleanup = self.runner.cleanup(name)
+            except Exception:
+                cleanup = None
+            message = "supervisor cleanup was not proven" if cleanup is None or not cleanup.succeeded else "G1 child could not be launched"
+            return self._retain_g1(
+                snapshot,
+                invocation,
+                fingerprint,
+                _g1_failure_frames(snapshot, invocation, kind="failed", code="runtime_error", message=message),
+            )
+        deadline = self._clock() + min(self.hard_timeout_seconds, remaining_duration, lease_remaining)
+        try:
+            capture = process.collect(
+                input_bytes=request,
+                deadline=deadline,
+                is_cancelled=lambda: self._cancelled(cancellation),
+                lease_valid=lambda: self._lease_is_valid(lease_valid),
+            )
+        except Exception:
+            capture = G1ProcessCapture(None, reaped=False)
+        try:
+            cleanup = self.runner.cleanup(name)
+        except Exception:
+            cleanup = None
+        if cleanup is None:
+            return self._retain_g1(
+                snapshot,
+                invocation,
+                fingerprint,
+                _g1_failure_frames(snapshot, invocation, kind="failed", code="runtime_error", message="supervisor cleanup was not proven"),
+            )
+        if not cleanup.succeeded:
+            frames = _g1_failure_frames(snapshot, invocation, kind="failed", code="runtime_error", message="supervisor cleanup was not proven")
+            return self._retain_g1(snapshot, invocation, fingerprint, frames)
+        if capture.cancelled:
+            frames = _g1_failure_frames(snapshot, invocation, kind="cancelled", code="cancelled", message="runtime cancellation was requested")
+        elif capture.lease_expired or not self._lease_is_valid(lease_valid):
+            frames = _g1_failure_frames(snapshot, invocation, kind="failed", code="lease_expired", message="invocation lease is no longer valid")
+        elif capture.timed_out:
+            frames = _g1_failure_frames(snapshot, invocation, kind="failed", code="budget_exhausted", message="cumulative invocation duration budget is exhausted")
+        elif capture.output_exceeded or not capture.reaped:
+            frames = _g1_failure_frames(snapshot, invocation, kind="failed", code="runtime_error", message="runtime output exceeded the supervisor bound")
+        else:
+            try:
+                frames_raw = [json.loads(line) for line in capture.stdout.splitlines() if line.strip()]
+                if capture.returncode != 0:
+                    raise G1ContractError("G1 child exited before terminal evidence")
+                validate_g1_frames(frames_raw, snapshot.to_dict(), invocation.to_dict())
+                frames = tuple(json.dumps(frame, ensure_ascii=False, sort_keys=True, separators=(",", ":")) for frame in frames_raw)
+            except Exception:
+                frames = _g1_failure_frames(snapshot, invocation, kind="failed", code="runtime_error", message="runtime output was malformed or exceeded its contract")
+        try:
+            self._record_g1_budget(snapshot.run_id, invocation.remaining_budget, frames)
+        except G1ContractError:
+            frames = _g1_failure_frames(
+                snapshot,
+                invocation,
+                kind="failed",
+                code="budget_exhausted",
+                message="Hermes usage exceeded the cumulative invocation budget",
+            )
+        return self._retain_g1(snapshot, invocation, fingerprint, frames)
+
+    def _retain_g1(
+        self,
+        snapshot: G1RunSnapshot,
+        invocation: G1InvocationEnvelope,
+        fingerprint: str,
+        frames: tuple[str, ...],
+    ) -> tuple[str, ...]:
+        key = (snapshot.run_id, invocation.invocation_id)
+        value = {
+            "runId": snapshot.run_id,
+            "invocationId": invocation.invocation_id,
+            "requestFingerprint": fingerprint,
+            "frames": list(frames),
+        }
+        response = self._retention_authority.create("g1_result", key, value)
+        if response.get("status") == "conflict":
+            raise G1ContractError("changed replay conflicts with the retained invocation")
+        if response.get("status") not in {"created", "replayed"}:
+            raise RuntimeConfigurationError("G1 result was not retained")
+        retained = _validate_g1_retained_value("g1_result", response.get("value"), *key)
+        if retained["requestFingerprint"] != fingerprint:
+            raise G1ContractError("changed replay conflicts with the retained invocation")
+        return tuple(retained["frames"])
+
 
 __all__ = [
     "CleanupReport",
     "DockerRunnerCapabilities",
     "EnforcementAttestation",
+    "G1InvocationSupervisor",
+    "G1LocalTestRunner",
+    "G1ProcessCapture",
+    "G1RuntimeRunner",
     "InvocationPolicy",
     "InvocationResult",
     "InvocationSupervisor",

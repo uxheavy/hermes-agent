@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import os
 import re
+import time
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Protocol, Sequence
 
@@ -32,16 +32,11 @@ class HermesCheckpointSource(Protocol):
 
 @dataclass(frozen=True)
 class EnvironmentCredentialSource:
-    """Read only explicitly runtime-scoped environment credentials."""
+    """Fail closed; ambient environment is never a credential channel."""
 
     def resolve(self, provider: str) -> Mapping[str, str]:
         del provider
-        values = {
-            "api_key": os.environ.get("HERMES_RUNTIME_API_KEY", ""),
-            "base_url": os.environ.get("HERMES_RUNTIME_BASE_URL", ""),
-            "api_mode": os.environ.get("HERMES_RUNTIME_API_MODE", ""),
-        }
-        return {key: value for key, value in values.items() if value}
+        return {}
 
 
 @dataclass(frozen=True)
@@ -52,6 +47,7 @@ class HermesKernelResult:
     failure_code: str | None = None
     failure_message: str | None = None
     retryable: bool = True
+    usage: Mapping[str, int] | None = None
 
 
 def redact_runtime_text(value: str, secrets: Sequence[str]) -> str:
@@ -152,6 +148,13 @@ class HermesKernelAdapter:
                 failure_message="trusted host credential resolution failed",
                 retryable=True,
             )
+        if not credentials:
+            return HermesKernelResult(
+                kind="failed",
+                failure_code="runtime_error",
+                failure_message="trusted host credential source is required",
+                retryable=False,
+            )
         credential_values = tuple(credentials.values())
         emit_body(
             {
@@ -196,6 +199,19 @@ class HermesKernelAdapter:
             "stream_delta_callback": on_delta,
             "step_callback": on_step,
         }
+        try:
+            from agent.iteration_budget import IterationBudget
+
+            agent_kwargs["iteration_budget"] = IterationBudget(
+                max(1, min(90, int(invocation.remaining_budget["outputTokens"])))
+            )
+        except Exception:
+            return HermesKernelResult(
+                kind="failed",
+                failure_code="runtime_error",
+                failure_message="Hermes iteration budget could not be constructed",
+                retryable=False,
+            )
         if credentials.get("api_key"):
             agent_kwargs["api_key"] = credentials["api_key"]
         if credentials.get("base_url"):
@@ -205,6 +221,7 @@ class HermesKernelAdapter:
         if prefill_messages is not None:
             agent_kwargs["prefill_messages"] = [dict(message) for message in prefill_messages]
 
+        started_at = time.monotonic()
         try:
             agent = self._agent_factory(**agent_kwargs)
             prompt = (
@@ -232,6 +249,19 @@ class HermesKernelAdapter:
             )
         if not isinstance(result, Mapping):
             raise G1ContractError("Hermes adapter returned a non-object result")
+        usage = {
+            "inputTokens": max(0, int(getattr(agent, "session_input_tokens", 0) or 0)),
+            "outputTokens": max(0, int(getattr(agent, "session_output_tokens", 0) or 0)),
+            "durationMs": max(0, int((time.monotonic() - started_at) * 1000)),
+        }
+        if any(usage[name] > invocation.remaining_budget[name] for name in usage):
+            return HermesKernelResult(
+                kind="failed",
+                failure_code="budget_exhausted",
+                failure_message="Hermes usage exceeded the cumulative invocation budget",
+                retryable=False,
+                usage=usage,
+            )
         if result.get("interrupted") is True:
             return HermesKernelResult(
                 kind="cancelled",
@@ -248,12 +278,14 @@ class HermesKernelAdapter:
                     event_limit,
                 ),
                 retryable=True,
+                usage=usage,
             )
         question = result.get("input_request") or result.get("waiting_for_input")
         if isinstance(question, str) and question:
             return HermesKernelResult(
                 kind="waiting_for_input",
                 question=bound_runtime_text(redact_runtime_text(question, credential_values), event_limit),
+                usage=usage,
             )
         output = result.get("final_response")
         if output is None:
@@ -264,12 +296,19 @@ class HermesKernelAdapter:
         )
         emit_body(
             {
+                "kind": "usage_observed",
+                "usage": usage,
+                "publication": {"action": "observation_only"},
+            }
+        )
+        emit_body(
+            {
                 "kind": "transcript_evidence_observed",
                 "payload": {"kind": "inline_text", "contentType": "text/plain", "text": output_text or "Hermes invocation completed."},
                 "publication": {"action": "observation_only"},
             }
         )
-        return HermesKernelResult(kind="completed", output_text=output_text)
+        return HermesKernelResult(kind="completed", output_text=output_text, usage=usage)
 
 
 class DeterministicKernelAdapter:
@@ -282,13 +321,19 @@ class DeterministicKernelAdapter:
         cancellation: Callable[[], bool],
         emit_body: Callable[[Mapping[str, Any]], None],
     ) -> HermesKernelResult:
-        del invocation
         if cancellation():
             return HermesKernelResult("cancelled", failure_code="cancelled", failure_message="runtime cancellation was requested", retryable=False)
         emit_body(
             {
                 "kind": "progress_observed",
                 "payload": {"kind": "inline_text", "contentType": "text/plain", "text": "Deterministic Hermes adapter started."},
+                "publication": {"action": "observation_only"},
+            }
+        )
+        emit_body(
+            {
+                "kind": "usage_observed",
+                "usage": {"inputTokens": 0, "outputTokens": 0, "durationMs": 0},
                 "publication": {"action": "observation_only"},
             }
         )
