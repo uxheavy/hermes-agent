@@ -16,7 +16,13 @@ from .g1_contract import (
     build_exit,
     validate_g1_frames,
 )
-from .hermes_adapter import DeterministicKernelAdapter, HermesKernelAdapter, HermesKernelResult, UnixSocketCredentialSource
+from .hermes_adapter import (
+    DeterministicKernelAdapter,
+    HermesKernelAdapter,
+    HermesKernelResult,
+    UnixSocketCredentialSource,
+)
+from .host_port import PlaneHostPort
 
 
 _MODEL_USAGE_PROTOCOL = "plane.agent-runtime/internal-usage/v1"
@@ -106,6 +112,7 @@ def serve_once_g1(
     production: bool = False,
     diagnostics: TextIO | None = None,
     model_call_allowance: int | None = None,
+    host_port: PlaneHostPort | None = None,
 ) -> int:
     """Consume exactly one G1 request and write direct event/exit frames.
 
@@ -143,7 +150,10 @@ def serve_once_g1(
         elif snapshot.adapter_name == "deterministic-test-adapter" and production:
             result = _failure_result("runtime_error", "deterministic adapter is test-only")
         else:
-            result = HermesKernelAdapter(credential_source=UnixSocketCredentialSource()).dispatch(
+            result = HermesKernelAdapter(
+                credential_source=UnixSocketCredentialSource(),
+                host_port=host_port,
+            ).dispatch(
                 snapshot,
                 invocation,
                 lambda: False,

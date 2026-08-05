@@ -582,6 +582,35 @@ class G1RuntimeProcessTests(unittest.TestCase):
                 run.assert_not_called()
                 self.assertNotIn(canary, diagnostics.getvalue())
 
+    def test_credential_bootstrap_forwards_dedicated_plane_host_socket_argument(self) -> None:
+        dispatch = json.dumps(
+            {"modelCallAllowance": 1, "protocol": "plane.agent-runtime/dispatch-control/v1"},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode() + b"\n"
+        control = json.dumps(
+            {"credentials": {}, "protocol": "plane.agent-runtime/credential-control/v1"},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode() + b"\n"
+        request = b'{"invocation":{},"run":{}}\n'
+
+        class BinaryStdin:
+            def __init__(self, value: bytes) -> None:
+                self.buffer = io.BytesIO(value)
+
+        socket_path = "/tmp/plane-agent-host.sock"
+        with mock.patch.object(bootstrap, "_run", return_value=0) as run:
+            with mock.patch("sys.stdin", BinaryStdin(dispatch + control + request)):
+                self.assertEqual(
+                    bootstrap.main(
+                        ["--once", "--g1-production", "--plane-host-socket", socket_path]
+                    ),
+                    0,
+                )
+        run.assert_called_once()
+        self.assertEqual(run.call_args.args[3], socket_path)
+
     @unittest.skipUnless(hasattr(socket, "SO_PEERCRED"), "peer PID credentials are Linux-only")
     def test_credential_broker_rejects_non_service_pid(self) -> None:
         canary = "peer-canary"

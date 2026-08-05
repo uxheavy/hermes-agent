@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 import json
+import io
 import os
+import socket
 import tempfile
+import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
@@ -15,7 +19,10 @@ from plane_runtime.host_port import (
     PlaneHostBinding,
     PlaneHostBoundsError,
     PlaneHostCancelled,
+    PlaneHostError,
     PlaneHostUnavailable,
+    HostCallRequest,
+    UnixSocketPlaneHostPort,
     bind_plane_host,
     install_plane_tools,
     plane_code_mode,
@@ -26,6 +33,64 @@ from tools.registry import registry
 # Hermes' logging monitor may still emit after an AIAgent returns. Keep this
 # hermetic home alive for the process instead of deleting it mid-test.
 _TEST_HERMES_HOME = tempfile.TemporaryDirectory(prefix="hermes-plane-host-")
+
+
+class _LocalHostServer:
+    """One-request JSONL server used to exercise the real Unix socket seam."""
+
+    def __init__(self, responder):
+        self._directory = tempfile.TemporaryDirectory(prefix="plane-host-rpc-")
+        self.path = os.path.join(self._directory.name, "host.sock")
+        self._responder = responder
+        self.requests: list[dict] = []
+        self.raw_requests: list[bytes] = []
+        self._ready = threading.Event()
+        self._stop = threading.Event()
+        self._server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self._server.bind(self.path)
+        self._server.listen(4)
+        self._server.settimeout(0.05)
+        self._thread = threading.Thread(target=self._serve, daemon=True)
+
+    def __enter__(self):
+        self._thread.start()
+        self._ready.wait(timeout=1)
+        return self
+
+    def __exit__(self, *_args):
+        self._stop.set()
+        self._server.close()
+        self._thread.join(timeout=1)
+        self._directory.cleanup()
+
+    def _serve(self):
+        self._ready.set()
+        while not self._stop.is_set():
+            try:
+                channel, _ = self._server.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            with channel:
+                channel.settimeout(1)
+                raw = bytearray()
+                while b"\n" not in raw and len(raw) <= 16 * 1024:
+                    chunk = channel.recv(4096)
+                    if not chunk:
+                        break
+                    raw.extend(chunk)
+                if not raw.endswith(b"\n"):
+                    continue
+                self.raw_requests.append(bytes(raw))
+                request = json.loads(bytes(raw[:-1]).decode("utf-8"))
+                self.requests.append(request)
+                response = self._responder(request)
+                if response is not None:
+                    try:
+                        channel.sendall(response)
+                    except OSError:
+                        pass
 
 
 def _result(request: dict, *, status: str = "ok", output: object = None, **extra: object) -> dict:
@@ -42,6 +107,359 @@ def _result(request: dict, *, status: str = "ok", output: object = None, **extra
 
 
 class HostPortTests(unittest.TestCase):
+    def test_production_one_shot_service_binds_socket_host_before_real_hermes_turn(self) -> None:
+        from plane_runtime.hermes_adapter import HermesKernelAdapter
+        from plane_runtime.service import main as service_main
+        from run_agent import AIAgent
+        from tests.plane_runtime.test_g1_runtime_process import (
+            G1InvocationEnvelope,
+            G1RunSnapshot,
+            _digest,
+            make_invocation,
+            make_snapshot,
+        )
+
+        snapshot_raw = make_snapshot()
+        snapshot_raw["runtimePolicy"] = dict(snapshot_raw["runtimePolicy"])  # type: ignore[index]
+        snapshot_raw["runtimePolicy"]["adapter"] = "hermes"  # type: ignore[index]
+        snapshot_raw["runtimePolicy"]["model"] = {  # type: ignore[index]
+            "provider": "test-provider",
+            "model": "deterministic-local",
+        }
+        snapshot_raw["contentDigest"] = _digest(  # type: ignore[assignment]
+            "snapshot",
+            {key: value for key, value in snapshot_raw.items() if key != "contentDigest"},
+        )
+        snapshot = G1RunSnapshot.from_dict(snapshot_raw)
+        invocation = G1InvocationEnvelope.from_dict(make_invocation(snapshot.to_dict()))
+        request_line = json.dumps(
+            {"run": snapshot.to_dict(), "invocation": invocation.to_dict()},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ) + "\n"
+
+        class Credentials:
+            def resolve(self, provider: str) -> dict[str, str]:
+                self.provider = provider
+                return {"api_key": "model-only-secret", "base_url": "http://127.0.0.1"}
+
+        class Completions:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def create(self, **_kwargs):
+                self.calls += 1
+                if self.calls == 1:
+                    call = SimpleNamespace(
+                        id="call-read",
+                        function=SimpleNamespace(
+                            name="tool_call",
+                            arguments=json.dumps(
+                                {
+                                    "name": "plane_operation",
+                                    "arguments": {
+                                        "action": "read",
+                                        "operationRef": "operation:work-item-get@1",
+                                        "input": {"workItemRef": "work-item:test"},
+                                    },
+                                }
+                            ),
+                        ),
+                        extra_content=None,
+                    )
+                    message = SimpleNamespace(
+                        content=None,
+                        tool_calls=[call],
+                        reasoning=None,
+                        reasoning_content=None,
+                        refusal=None,
+                    )
+                    finish_reason = "tool_calls"
+                else:
+                    message = SimpleNamespace(
+                        content="ordinary final evidence",
+                        tool_calls=None,
+                        reasoning=None,
+                        reasoning_content=None,
+                        refusal=None,
+                    )
+                    finish_reason = "stop"
+                return SimpleNamespace(
+                    choices=[SimpleNamespace(finish_reason=finish_reason, message=message)],
+                    usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+                )
+
+        class Client:
+            def __init__(self) -> None:
+                self.chat = SimpleNamespace(completions=Completions())
+
+        def agent_factory(**kwargs):
+            agent = AIAgent(**kwargs)
+            client = Client()
+            agent._create_request_openai_client = lambda **_kwargs: client  # type: ignore[method-assign]
+            return agent
+
+        bodies: list[dict] = []
+        with _LocalHostServer(
+            lambda request: (
+                json.dumps(
+                    _result(request, output={"read": True}),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode()
+                + b"\n"
+            )
+        ) as server:
+            output = io.StringIO()
+            diagnostics = io.StringIO()
+            import run_agent
+
+            run_agent._hermes_home = Path(_TEST_HERMES_HOME.name)
+            with mock.patch.object(
+                HermesKernelAdapter,
+                "_default_agent_factory",
+                staticmethod(agent_factory),
+            ), mock.patch(
+                "plane_runtime.g1_service.UnixSocketCredentialSource",
+                return_value=Credentials(),
+            ), mock.patch("sys.stdin", io.StringIO(request_line)), mock.patch(
+                "sys.stdout", output
+            ), mock.patch("sys.stderr", diagnostics), mock.patch.dict(
+                os.environ, {"HERMES_HOME": _TEST_HERMES_HOME.name}
+            ):
+                status = service_main(
+                    [
+                        "--once",
+                        "--g1-production",
+                        "--model-call-allowance",
+                        "4",
+                        "--plane-host-socket",
+                        server.path,
+                    ]
+                )
+
+            self.assertEqual(status, 0)
+            self.assertEqual([request["action"] for request in server.requests], ["read"])
+            self.assertNotIn(server.path, output.getvalue())
+            self.assertIn('"modelCalls":2', diagnostics.getvalue())
+            self.assertTrue(
+                any(
+                    frame.get("body", {}).get("kind")
+                    == "transcript_evidence_observed"
+                    for frame in map(json.loads, output.getvalue().splitlines())
+                )
+            )
+
+    def test_unix_socket_client_round_trips_exact_canonical_contract(self) -> None:
+        with _LocalHostServer(
+            lambda request: (
+                json.dumps(
+                    _result(request, output={"accepted": True}),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+                + b"\n"
+            )
+        ) as server:
+            binding = PlaneHostBinding(
+                port=UnixSocketPlaneHostPort(server.path, timeout_seconds=1),
+                run_id="run:test",
+                invocation_id="invocation:test",
+                correlation_id="correlation:test",
+                cancellation=lambda: False,
+            )
+            result = binding.call(
+                action="read",
+                operation_ref="operation:work-item-get@1",
+                input={"workItemRef": "work-item:test"},
+                source="model",
+            )
+
+            self.assertEqual(result.status, "ok")
+            self.assertEqual(server.requests[0]["protocol"], "plane.agent-runtime/v1")
+            self.assertEqual(
+                server.raw_requests[0],
+                json.dumps(
+                    server.requests[0],
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode()
+                + b"\n",
+            )
+            self.assertEqual(
+                set(server.requests[0]),
+                {
+                    "protocol",
+                    "runId",
+                    "invocationId",
+                    "correlationId",
+                    "action",
+                    "operationRef",
+                    "input",
+                    "source",
+                    "requestRef",
+                    "idempotencyKey",
+                },
+            )
+            self.assertNotIn(server.path, json.dumps(server.requests))
+
+    def test_unix_socket_client_fails_closed_on_missing_malformed_and_mismatched_results(self) -> None:
+        request_ref = "host-request:changed"
+
+        def malformed(_request):
+            return b'{"output":null,"output":null}\n'
+
+        with _LocalHostServer(malformed) as server:
+            port = UnixSocketPlaneHostPort(server.path, timeout_seconds=1)
+            request = PlaneHostBinding(
+                port=port,
+                run_id="run:test",
+                invocation_id="invocation:test",
+                correlation_id="correlation:test",
+                cancellation=lambda: False,
+            )
+            with self.assertRaises(PlaneHostUnavailable) as raised:
+                request.call(
+                    action="read",
+                    operation_ref="operation:read@1",
+                    input={},
+                    source="model",
+                )
+            self.assertNotIn(server.path, str(raised.exception))
+
+        def mismatched(request):
+            response = _result(request)
+            response["requestRef"] = request_ref
+            return (
+                json.dumps(response, sort_keys=True, separators=(",", ":")).encode()
+                + b"\n"
+            )
+
+        with _LocalHostServer(mismatched) as server:
+            binding = PlaneHostBinding(
+                port=UnixSocketPlaneHostPort(server.path),
+                run_id="run:test",
+                invocation_id="invocation:test",
+                correlation_id="correlation:test",
+                cancellation=lambda: False,
+            )
+            with self.assertRaises(PlaneHostUnavailable):
+                binding.call(
+                    action="read",
+                    operation_ref="operation:read@1",
+                    input={},
+                    source="model",
+                )
+
+        def rejected(raw_response):
+            responder = raw_response if callable(raw_response) else lambda _request: raw_response
+            with _LocalHostServer(responder) as server:
+                binding = PlaneHostBinding(
+                    port=UnixSocketPlaneHostPort(server.path),
+                    run_id="run:test",
+                    invocation_id="invocation:test",
+                    correlation_id="correlation:test",
+                    cancellation=lambda: False,
+                )
+                with self.assertRaises(PlaneHostError):
+                    binding.call(
+                        action="read",
+                        operation_ref="operation:read@1",
+                        input={},
+                        source="model",
+                    )
+
+        def unknown(request):
+            response = _result(request)
+            response["unknown"] = True
+            return json.dumps(response, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+
+        def truncated(request):
+            return json.dumps(_result(request), sort_keys=True, separators=(",", ":")).encode()
+
+        rejected(unknown)
+        rejected(truncated)
+        rejected(lambda _request: b"{" + (b"x" * (17 * 1024)) + b"}\n")
+        rejected(lambda _request: None)
+
+        missing = os.path.join(tempfile.gettempdir(), "plane-host-rpc-missing.sock")
+        with self.assertRaises(PlaneHostUnavailable) as raised:
+            UnixSocketPlaneHostPort(missing).invoke(
+                HostCallRequest(
+                    run_id="run:test",
+                    invocation_id="invocation:test",
+                    correlation_id="correlation:test",
+                    action="read",
+                    operation_ref="operation:read@1",
+                    input={},
+                    source="model",
+                )
+            )
+        self.assertNotIn(missing, str(raised.exception))
+
+    def test_unix_socket_client_honors_deadline_and_active_cancellation(self) -> None:
+        release = threading.Event()
+
+        def delayed(request):
+            release.wait(timeout=1)
+            return (
+                json.dumps(_result(request), sort_keys=True, separators=(",", ":")).encode()
+                + b"\n"
+            )
+
+        cancelled = threading.Event()
+        with _LocalHostServer(delayed) as server:
+            binding = PlaneHostBinding(
+                port=UnixSocketPlaneHostPort(
+                    server.path,
+                    timeout_seconds=1,
+                    cancellation=lambda: cancelled.is_set(),
+                ),
+                run_id="run:test",
+                invocation_id="invocation:test",
+                correlation_id="correlation:test",
+                cancellation=lambda: cancelled.is_set(),
+            )
+            threading.Timer(0.05, cancelled.set).start()
+            with self.assertRaises(PlaneHostCancelled):
+                binding.call(
+                    action="read",
+                    operation_ref="operation:read@1",
+                    input={},
+                    source="model",
+                )
+            release.set()
+
+        timeout_release = threading.Event()
+
+        def timeout_delayed(request):
+            timeout_release.wait(timeout=1)
+            return (
+                json.dumps(_result(request), sort_keys=True, separators=(",", ":")).encode()
+                + b"\n"
+            )
+
+        with _LocalHostServer(timeout_delayed) as server:
+            started = time.monotonic()
+            with self.assertRaises(PlaneHostUnavailable):
+                UnixSocketPlaneHostPort(server.path, timeout_seconds=0.05).invoke(
+                    HostCallRequest(
+                        run_id="run:test",
+                        invocation_id="invocation:test",
+                        correlation_id="correlation:test",
+                        action="read",
+                        operation_ref="operation:read@1",
+                        input={},
+                        source="model",
+                    )
+                )
+            self.assertLess(time.monotonic() - started, 0.5)
+            timeout_release.set()
+
     def test_request_identity_is_stable_and_credential_free(self) -> None:
         requests: list[dict] = []
 

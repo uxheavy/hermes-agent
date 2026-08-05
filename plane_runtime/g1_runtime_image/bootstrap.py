@@ -30,6 +30,7 @@ _MAX_CONTROL_BYTES = 16 * 1024
 _MAX_DISPATCH_BYTES = 4096
 _MAX_BROKER_BYTES = 4096
 _MAX_DIAGNOSTIC_BYTES = 16 * 1024
+_MAX_UNIX_SOCKET_PATH_BYTES = 103
 
 
 def _read_line(stream: Any, limit: int) -> bytes:
@@ -84,6 +85,19 @@ def _bounded_credentials(value: object) -> dict[str, str]:
 def _dispatch_allowance(value: object) -> int:
     if not isinstance(value, int) or isinstance(value, bool) or not 0 <= value <= 4096:
         raise ValueError("model-call allowance is invalid")
+    return value
+
+
+def _plane_host_socket(value: object) -> str | None:
+    if value is None:
+        return None
+    if (
+        not isinstance(value, str)
+        or not value.startswith("/")
+        or any(ord(char) < 0x20 or ord(char) == 0x7F for char in value)
+        or len(value.encode("utf-8")) > _MAX_UNIX_SOCKET_PATH_BYTES
+    ):
+        raise ValueError("Plane host socket configuration is invalid")
     return value
 
 
@@ -213,7 +227,13 @@ def _forward_valid_model_usage(raw: bytes, overflow: bool) -> None:
         return
 
 
-def _run(request: bytes, credentials: Mapping[str, str], model_call_allowance: int) -> int:
+def _run(
+    request: bytes,
+    credentials: Mapping[str, str],
+    model_call_allowance: int,
+    plane_host_socket: str | None = None,
+) -> int:
+    plane_host_socket = _plane_host_socket(plane_host_socket)
     request_value = _strict_object(request.rstrip(b"\n"), {"invocation", "run"}, "G1 request", limit=512 * 1024)
     provider = request_value["run"]["runtimePolicy"]["model"]["provider"]
     if not isinstance(provider, str):
@@ -224,8 +244,19 @@ def _run(request: bytes, credentials: Mapping[str, str], model_call_allowance: i
     overflow = [False]
     stderr_thread: threading.Thread | None = None
     try:
+        child_command = [
+            "python3",
+            "-m",
+            "plane_runtime.service",
+            "--once",
+            "--g1-production",
+            "--model-call-allowance",
+            str(model_call_allowance),
+        ]
+        if plane_host_socket is not None:
+            child_command.extend(("--plane-host-socket", plane_host_socket))
         child = subprocess.Popen(
-            ("python3", "-m", "plane_runtime.service", "--once", "--g1-production", "--model-call-allowance", str(model_call_allowance)),
+            tuple(child_command),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -256,6 +287,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--g1-production", action="store_true")
+    parser.add_argument("--plane-host-socket", default=None, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     if not args.once or not args.g1_production:
         return 2
@@ -285,7 +317,12 @@ def main(argv: list[str] | None = None) -> int:
         if sys.stdin.buffer.read(1):
             return 2
         try:
-            return _run(request + b"\n", credentials, allowance)
+            return _run(
+                request + b"\n",
+                credentials,
+                allowance,
+                _plane_host_socket(args.plane_host_socket),
+            )
         finally:
             credentials.clear()
     except Exception:

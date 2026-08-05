@@ -15,9 +15,14 @@ reuse this invocation's host binding.
 from __future__ import annotations
 
 import contextvars
+import errno
 import hashlib
 import json
+import math
+import select
+import socket
 import threading
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterator, Mapping, Protocol
@@ -338,18 +343,190 @@ class CallablePlaneHostPort:
             raise PlaneHostUnavailable("host request is not a validated HostCallRequest")
         try:
             raw = self._rpc(request.to_dict())
-            result = HostCallResult.from_wire(raw)
+            result = _bound_host_result(request, raw)
         except PlaneHostError:
             raise
         except Exception as exc:
             raise PlaneHostUnavailable("Plane host RPC was unavailable") from exc
-        if (
-            result.request_ref != request.request_ref
-            or result.correlation_id != request.correlation_id
-            or result.idempotency_key != request.idempotency_key
-        ):
-            raise PlaneHostUnavailable("host result is not bound to the request")
         return result
+
+
+def _bound_host_result(request: HostCallRequest, raw: Any) -> HostCallResult:
+    result = HostCallResult.from_wire(raw)
+    if (
+        result.request_ref != request.request_ref
+        or result.correlation_id != request.correlation_id
+        or result.idempotency_key != request.idempotency_key
+    ):
+        raise PlaneHostUnavailable("host result is not bound to the request")
+    return result
+
+
+class UnixSocketPlaneHostPort:
+    """Invocation-scoped canonical JSONL client for the trusted Plane host.
+
+    The endpoint is trusted bootstrap configuration, not part of the Plane
+    request contract.  A fresh connection is used for every callback so the
+    client retains no run-lifetime transport state.  The peer must return one
+    canonical JSON object followed by one newline and close the connection.
+    """
+
+    _MAX_SOCKET_PATH_BYTES = 103
+    _POLL_SECONDS = 0.05
+
+    def __init__(
+        self,
+        socket_path: str,
+        *,
+        timeout_seconds: float = 2.0,
+        cancellation: Callable[[], bool] | None = None,
+    ) -> None:
+        if (
+            not isinstance(socket_path, str)
+            or not socket_path.startswith("/")
+            or not socket_path
+            or any(ord(char) < 0x20 or ord(char) == 0x7F for char in socket_path)
+            or len(socket_path.encode("utf-8")) > self._MAX_SOCKET_PATH_BYTES
+        ):
+            raise PlaneHostError("Plane host socket configuration is invalid")
+        if (
+            isinstance(timeout_seconds, bool)
+            or not isinstance(timeout_seconds, (int, float))
+            or not math.isfinite(float(timeout_seconds))
+            or timeout_seconds <= 0
+            or timeout_seconds > 60
+        ):
+            raise PlaneHostError("Plane host socket timeout is invalid")
+        if cancellation is not None and not callable(cancellation):
+            raise PlaneHostError("Plane host cancellation signal is invalid")
+        self._socket_path = socket_path
+        self._timeout_seconds = float(timeout_seconds)
+        self._cancellation = cancellation or (lambda: False)
+        self._closed = False
+        self._lock = threading.Lock()
+
+    def __enter__(self) -> "UnixSocketPlaneHostPort":
+        return self
+
+    def __exit__(self, *_args: Any) -> None:
+        self.close()
+
+    def close(self) -> None:
+        """Make later calls fail closed; no socket survives a callback."""
+
+        with self._lock:
+            self._closed = True
+
+    def _check_state(self) -> None:
+        if self._closed:
+            raise PlaneHostUnavailable("Plane host RPC is closed")
+        try:
+            cancelled = self._cancellation()
+        except Exception as exc:
+            raise PlaneHostUnavailable("Plane host cancellation signal failed") from exc
+        if type(cancelled) is not bool:
+            raise PlaneHostUnavailable("Plane host cancellation signal was invalid")
+        if cancelled:
+            raise PlaneHostCancelled("Plane host callback cancelled")
+
+    def _wait(self, channel: socket.socket, *, writable: bool, deadline: float) -> None:
+        while True:
+            self._check_state()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise PlaneHostUnavailable("Plane host RPC deadline exceeded")
+            try:
+                readable, writable_ready, _ = select.select(
+                    [] if writable else [channel],
+                    [channel] if writable else [],
+                    [],
+                    min(remaining, self._POLL_SECONDS),
+                )
+            except (OSError, ValueError) as exc:
+                raise PlaneHostUnavailable("Plane host RPC wait failed") from exc
+            if (writable and writable_ready) or (not writable and readable):
+                return
+
+    def _connect(self, channel: socket.socket, deadline: float) -> None:
+        try:
+            error = channel.connect_ex(self._socket_path)
+        except OSError as exc:
+            raise PlaneHostUnavailable("Plane host RPC was unavailable") from exc
+        if error == 0:
+            return
+        if error not in {
+            errno.EINPROGRESS,
+            errno.EALREADY,
+            errno.EWOULDBLOCK,
+            errno.EAGAIN,
+        }:
+            raise PlaneHostUnavailable("Plane host RPC was unavailable")
+        self._wait(channel, writable=True, deadline=deadline)
+        try:
+            error = channel.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+        except OSError as exc:
+            raise PlaneHostUnavailable("Plane host RPC was unavailable") from exc
+        if error:
+            raise PlaneHostUnavailable("Plane host RPC was unavailable")
+
+    def _send(self, channel: socket.socket, payload: bytes, deadline: float) -> None:
+        offset = 0
+        while offset < len(payload):
+            self._check_state()
+            try:
+                sent = channel.send(payload[offset:])
+            except BlockingIOError:
+                self._wait(channel, writable=True, deadline=deadline)
+                continue
+            except OSError as exc:
+                raise PlaneHostUnavailable("Plane host RPC was unavailable") from exc
+            if sent <= 0:
+                raise PlaneHostUnavailable("Plane host RPC peer closed")
+            offset += sent
+
+    def _receive(self, channel: socket.socket, deadline: float) -> bytes:
+        response = bytearray()
+        while True:
+            self._check_state()
+            if len(response) > MAX_HOST_RESULT_BYTES + 1:
+                raise PlaneHostBoundsError("Plane host RPC result exceeded its bound")
+            try:
+                chunk = channel.recv(
+                    min(4096, MAX_HOST_RESULT_BYTES + 2 - len(response))
+                )
+            except BlockingIOError:
+                self._wait(channel, writable=False, deadline=deadline)
+                continue
+            except OSError as exc:
+                raise PlaneHostUnavailable("Plane host RPC was unavailable") from exc
+            if not chunk:
+                break
+            response.extend(chunk)
+        if len(response) > MAX_HOST_RESULT_BYTES + 1 or response.count(b"\n") != 1 or not response.endswith(b"\n"):
+            raise PlaneHostUnavailable("Plane host RPC response framing was invalid")
+        return bytes(response[:-1])
+
+    def invoke(self, request: HostCallRequest) -> HostCallResult:
+        if not isinstance(request, HostCallRequest):
+            raise PlaneHostUnavailable("host request is not a validated HostCallRequest")
+        self._check_state()
+        payload = _bounded_json(request.to_dict(), "host.request", MAX_HOST_REQUEST_BYTES) + b"\n"
+        deadline = time.monotonic() + self._timeout_seconds
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as channel:
+                channel.setblocking(False)
+                self._connect(channel, deadline)
+                self._send(channel, payload, deadline)
+                try:
+                    channel.shutdown(socket.SHUT_WR)
+                except OSError:
+                    pass
+                raw = self._receive(channel, deadline)
+        except (PlaneHostCancelled, PlaneHostBoundsError, PlaneHostUnavailable):
+            raise
+        except Exception as exc:
+            raise PlaneHostUnavailable("Plane host RPC was unavailable") from exc
+        return _bound_host_result(request, raw)
 
 
 @dataclass(frozen=True)

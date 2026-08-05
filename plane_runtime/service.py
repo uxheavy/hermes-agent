@@ -49,6 +49,7 @@ from .contract import (
     TerminalProposal,
     _check_raw_wire_size,
 )
+from .host_port import UnixSocketPlaneHostPort
 
 
 GENERIC_RUNTIME_FAILURE = "runtime execution failed; Plane reconciliation is required"
@@ -711,6 +712,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--g1-test-only", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--g1-production", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--model-call-allowance", type=int, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--plane-host-socket", default=None, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     try:
         with _ServiceFrameReader(sys.stdin) as reader:
@@ -736,13 +738,23 @@ def main(argv: list[str] | None = None) -> int:
                 raise RuntimeConfigurationError("G1 execution requires an attested supervisor mode")
             from .g1_service import serve_once_g1
 
-            return serve_once_g1(
-                request_line,
-                sys.stdout,
-                production=args.g1_production,
-                diagnostics=sys.stderr if args.g1_production else None,
-                model_call_allowance=args.model_call_allowance,
+            host_port = (
+                UnixSocketPlaneHostPort(args.plane_host_socket)
+                if args.plane_host_socket is not None
+                else None
             )
+            try:
+                return serve_once_g1(
+                    request_line,
+                    sys.stdout,
+                    production=args.g1_production,
+                    diagnostics=sys.stderr if args.g1_production else None,
+                    model_call_allowance=args.model_call_allowance,
+                    host_port=host_port,
+                )
+            finally:
+                if host_port is not None:
+                    host_port.close()
         # Parsing proves the fixed command accepts arbitrary valid envelopes,
         # but it does not authorize execution.  A real KernelPort binding must
         # be installed by the future runtime service; fail closed otherwise.

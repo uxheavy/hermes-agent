@@ -143,6 +143,32 @@ cancelled, or over-budget calls.  Ordinary final text still emits only
 the authority for catalog disclosure, authorization, application, receipts,
 and durable product state.
 
+The production one-shot service binds the concrete `UnixSocketPlaneHostPort`
+when the trusted supervisor supplies `--plane-host-socket <absolute-path>`.
+The bootstrap forwards this dedicated argument to the child service; it is not
+read from the runtime request, environment, model prompt, tool result,
+transcript, event, or generated code. The client opens a fresh local `AF_UNIX`
+stream for each callback and closes it after the one canonical JSON-lines
+response, so the endpoint and connection are invocation-scoped.
+
+The host callback wire contract is exactly `plane.agent-runtime/v1`:
+
+```text
+request:  protocol, runId, invocationId, correlationId, action,
+          operationRef, input, source, requestRef, idempotencyKey
+response: protocol, requestRef, correlationId, idempotencyKey, status,
+          replayed, output, optional errorCode/errorMessage, optional publication
+```
+
+Both sides use sorted-key, compact UTF-8 JSON with one object and one trailing
+newline per connection. Hermes rejects duplicate or unknown response keys,
+non-canonical JSON, missing/truncated/oversized frames, peer closure,
+timeouts, cancellation, malformed status/error shapes, and any response whose
+request, correlation, or idempotency binding differs. It never retries or
+falls back to Plane REST/MCP or ambient credentials. A successful explicit
+publication must carry the existing bounded Plane gateway receipt shape;
+ordinary final model text remains transcript evidence only.
+
 This seam does not claim a TypeScript/Deno runner: Hermes' existing restricted
 code execution is Python PTC behind the same parent-RPC callback.  Plane's
 `plane.typescript.compose@1` supervisor can use the same logical host request
