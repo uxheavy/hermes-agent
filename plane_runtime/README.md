@@ -130,7 +130,26 @@ Overflow is returned as supervisor action required without inserting past the
 cap. Cleanup proves deterministic container absence after stop/kill/remove-volume
 attempts.
 
-The package does not claim an Operation Gateway, deployment, checkpoint
+The `HermesKernelAdapter` now exposes one optional, invocation-scoped
+`PlaneHostPort`.  Its dynamic `plane_runtime` toolset reuses Hermes' registry,
+tool dispatch, bounded result handling, and `execute_code` parent-RPC sandbox:
+`plane_operation` covers discovery/read/mutation and the same callback from
+code execution, while `plane_publish` is the only explicit publication/outcome
+action.  The port accepts only the versioned, credential-free host request and
+result vocabulary; it derives correlation/idempotency references from the
+trusted invocation and fails closed on malformed, conflicting, unavailable,
+cancelled, or over-budget calls.  Ordinary final text still emits only
+`transcript_evidence_observed`; it never invokes publication.  Plane remains
+the authority for catalog disclosure, authorization, application, receipts,
+and durable product state.
+
+This seam does not claim a TypeScript/Deno runner: Hermes' existing restricted
+code execution is Python PTC behind the same parent-RPC callback.  Plane's
+`plane.typescript.compose@1` supervisor can use the same logical host request
+shape when its runtime service is wired to the host port; generated code still
+receives no credential, actor, workspace, or idempotency controls.
+
+The package does not claim an Operation Gateway deployment, checkpoint
 service, or generated TypeScript isolation. Real Docker enforcement is
 unproven unless a local daemon and already-present digest-pinned image pass
 the inspection path; this slice does not pull images or contact a registry.

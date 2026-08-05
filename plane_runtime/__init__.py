@@ -104,6 +104,22 @@ from .contract import (
     VersionedContextRef,
     parse_utc_timestamp,
 )
+from .host_port import (
+    CallablePlaneHostPort,
+    HostCallRecord,
+    HostCallRequest,
+    HostCallResult,
+    PlaneHostBinding,
+    PlaneHostBoundsError,
+    PlaneHostCancelled,
+    PlaneHostError,
+    PlaneHostPort,
+    PlaneHostUnavailable,
+    bind_plane_host,
+    current_plane_host,
+    install_plane_tools,
+    plane_code_mode,
+)
 
 __all__ = [
     "PROTOCOL",
@@ -206,4 +222,18 @@ __all__ = [
     "reconcile_process_death",
     "validate_terminal_proposal",
     "build_host_cancellation_proposal",
+    "CallablePlaneHostPort",
+    "HostCallRecord",
+    "HostCallRequest",
+    "HostCallResult",
+    "PlaneHostBinding",
+    "PlaneHostBoundsError",
+    "PlaneHostCancelled",
+    "PlaneHostError",
+    "PlaneHostPort",
+    "PlaneHostUnavailable",
+    "bind_plane_host",
+    "current_plane_host",
+    "install_plane_tools",
+    "plane_code_mode",
 ]

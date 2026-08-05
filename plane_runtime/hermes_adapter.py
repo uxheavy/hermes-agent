@@ -16,6 +16,12 @@ from .g1_contract import (
     MAX_PROMPT_BYTES,
     MAX_TEXT_BYTES,
 )
+from .host_port import (
+    PlaneHostBinding,
+    PlaneHostPort,
+    bind_plane_host,
+    install_plane_tools,
+)
 
 
 _CREDENTIAL_PROTOCOL = "plane.agent-runtime/credentials/v1"
@@ -200,11 +206,16 @@ class HermesKernelAdapter:
         credential_source: HermesCredentialSource | None = None,
         checkpoint_source: HermesCheckpointSource | None = None,
         enabled_toolsets: Sequence[str] = (),
+        host_port: PlaneHostPort | None = None,
     ) -> None:
         self._agent_factory = agent_factory or self._default_agent_factory
         self._credential_source = credential_source or EnvironmentCredentialSource()
         self._checkpoint_source = checkpoint_source
         self._enabled_toolsets = tuple(enabled_toolsets)
+        self._host_port = host_port
+        if host_port is not None:
+            # Dynamic and invocation-gated: never part of Hermes' default schema.
+            install_plane_tools()
 
     @staticmethod
     def _default_agent_factory(**kwargs: Any) -> Any:
@@ -320,7 +331,8 @@ class HermesKernelAdapter:
             "max_tokens": max(1, int(invocation.remaining_budget["outputTokens"])),
             "max_iterations": model_call_allowance,
             "session_id": invocation.invocation_id,
-            "enabled_toolsets": list(self._enabled_toolsets),
+            "enabled_toolsets": list(self._enabled_toolsets)
+            + (["plane_runtime"] if self._host_port is not None else []),
             "quiet_mode": True,
             "skip_context_files": True,
             "skip_memory": True,
@@ -353,6 +365,18 @@ class HermesKernelAdapter:
 
         started_at = time.monotonic()
         agent: Any | None = None
+        host_binding = (
+            PlaneHostBinding(
+                port=self._host_port,
+                run_id=snapshot.run_id,
+                invocation_id=invocation.invocation_id,
+                correlation_id=invocation.correlation_id,
+                cancellation=cancellation,
+                emit_body=emit_body,
+            )
+            if self._host_port is not None
+            else None
+        )
         try:
             agent = self._agent_factory(**agent_kwargs)
             prompt = (
@@ -361,7 +385,11 @@ class HermesKernelAdapter:
                 "Context references are Plane-owned and immutable: "
                 + ", ".join(str(item["contextRef"]) for item in snapshot.raw["context"])
             )
-            result = agent.run_conversation(snapshot.objective, system_message=prompt)
+            if host_binding is None:
+                result = agent.run_conversation(snapshot.objective, system_message=prompt)
+            else:
+                with bind_plane_host(host_binding):
+                    result = agent.run_conversation(snapshot.objective, system_message=prompt)
         except Exception as exc:
             message = bound_runtime_text(redact_runtime_text(str(exc), credential_values), event_limit)
             return HermesKernelResult(
@@ -378,6 +406,14 @@ class HermesKernelAdapter:
                 failure_code="cancelled",
                 failure_message="runtime cancellation was requested",
                 retryable=False,
+            )
+        if host_binding is not None and host_binding.fatal_error is not None:
+            return HermesKernelResult(
+                kind="failed",
+                failure_code="runtime_error",
+                failure_message=bound_runtime_text(host_binding.fatal_error, event_limit),
+                retryable=False,
+                model_calls=self._observed_model_calls(agent, result),
             )
         if not isinstance(result, Mapping):
             raise G1ContractError("Hermes adapter returned a non-object result")
