@@ -291,6 +291,7 @@ class G1RuntimeProcessTests(unittest.TestCase):
         """Exercise the production three-frame path without a paid model."""
 
         model_requests: list[dict[str, object]] = []
+        model_tool_names: list[list[str]] = []
         stream_count = [0]
 
         class ModelHandler(BaseHTTPRequestHandler):
@@ -298,6 +299,12 @@ class G1RuntimeProcessTests(unittest.TestCase):
                 size = int(self.headers.get("content-length", "0"))
                 request = json.loads(self.rfile.read(size))
                 model_requests.append(request)
+                model_tool_names.append(
+                    [
+                        tool["function"]["name"]
+                        for tool in request.get("tools", [])
+                    ]
+                )
                 if request.get("stream") is True:
                     stream_count[0] += 1
                     if stream_count[0] == 2:
@@ -315,7 +322,31 @@ class G1RuntimeProcessTests(unittest.TestCase):
                             },
                         }
                         finish_reason = "tool_calls"
-                    elif stream_count[0] >= 4:
+                    elif stream_count[0] == 4:
+                        # A model-controlled tool call cannot self-authorize
+                        # Code Mode; the host must see no model-sourced code
+                        # action before the real execute_code callback.
+                        function_name = "tool_call"
+                        arguments = {
+                            "name": "plane_operation",
+                            "arguments": {
+                                "action": "code",
+                                "operationRef": "operation:compose@1",
+                                "input": {"workItemRef": "work-item:forged"},
+                            },
+                        }
+                        finish_reason = "tool_calls"
+                    elif stream_count[0] == 5:
+                        function_name = "execute_code"
+                        arguments = {
+                            "code": (
+                                "from hermes_tools import plane_operation\n"
+                                "print(plane_operation('code', 'operation:compose@1', "
+                                "{'workItemRef': 'work-item:test'}))"
+                            )
+                        }
+                        finish_reason = "tool_calls"
+                    elif stream_count[0] >= 6:
                         function_name = None
                         arguments = None
                         finish_reason = "stop"
@@ -431,6 +462,13 @@ class G1RuntimeProcessTests(unittest.TestCase):
                     "provider": "openai",
                     "model": "deterministic-local",
                 }
+                snapshot["runtimePolicy"].update(  # type: ignore[union-attr]
+                    {
+                        "maxCodeModeInputBytes": 65_536,
+                        "maxCodeModeOutputBytes": 65_536,
+                        "maxCodeModeCalls": 4,
+                    }
+                )
                 snapshot["contentDigest"] = _digest(
                     "snapshot", {key: value for key, value in snapshot.items() if key != "contentDigest"}
                 )
@@ -495,15 +533,32 @@ class G1RuntimeProcessTests(unittest.TestCase):
         self.assertEqual(parsed[-1]["kind"], "completed")
         self.assertEqual(
             [request["action"] for request in host_requests],
-            ["read"],
+            ["read", "code"],
             completed.stdout.decode(errors="replace")
             + completed.stderr.decode(errors="replace")
             + json.dumps(model_requests, default=str),
         )
+        self.assertEqual([request["source"] for request in host_requests], ["model", "code"])
+        self.assertTrue(any("tool_search" in names for names in model_tool_names))
+        self.assertTrue(any("tool_describe" in names for names in model_tool_names))
+        self.assertTrue(any("tool_call" in names for names in model_tool_names))
+        self.assertTrue(
+            any("execute_code" in names for names in model_tool_names),
+            "event=plane.code_mode.bootstrap_exposure actor=production-invocation "
+            "operation=model_tool_schema risk=granted_code_mode_missing expected=execute_code_exposed "
+            "actual=execute_code_missing suggestion=trace_three_frame_policy_to_agent_toolsets",
+        )
         self.assertNotIn(b"local-bootstrap-secret", completed.stdout + completed.stderr)
         self.assertNotIn(host_path.encode(), completed.stdout + completed.stderr)
-        self.assertNotIn("local-bootstrap-secret", json.dumps(model_requests, default=str))
-        self.assertNotIn(host_path, json.dumps(model_requests, default=str))
+        model_wire = json.dumps(model_requests, default=str)
+        self.assertNotIn("local-bootstrap-secret", model_wire)
+        self.assertNotIn(host_path, model_wire)
+        self.assertNotIn("maxCodeModeInputBytes", model_wire)
+        self.assertNotIn("maxCodeModeOutputBytes", model_wire)
+        self.assertNotIn("maxCodeModeCalls", model_wire)
+        self.assertNotIn("requestRef", model_wire)
+        self.assertNotIn("idempotencyKey", model_wire)
+        self.assertNotIn("maxCodeModeInputBytes", json.dumps(parsed, default=str))
         self.assertFalse(any(frame.get("body", {}).get("kind") == "conversation_publication_observed" for frame in parsed))
 
     def test_malformed_binding_and_changed_replay_fail_before_spawn(self) -> None:

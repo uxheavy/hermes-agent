@@ -292,7 +292,21 @@ def _validate_snapshot(raw: Any) -> dict[str, Any]:
             raise G1ContractError("toolCatalog operation disclosure is unsupported")
 
     policy = _object(data["runtimePolicy"], "RunSnapshot.runtimePolicy")
-    _reject_unknown(policy, {"model", "adapter", "isolation", "maxEventPayloadBytes", "maxArtifactBytes", "maxReceiptBytes"}, "runtimePolicy")
+    _reject_unknown(
+        policy,
+        {
+            "model",
+            "adapter",
+            "isolation",
+            "maxEventPayloadBytes",
+            "maxArtifactBytes",
+            "maxReceiptBytes",
+            "maxCodeModeInputBytes",
+            "maxCodeModeOutputBytes",
+            "maxCodeModeCalls",
+        },
+        "runtimePolicy",
+    )
     _required(policy, {"model", "adapter", "isolation", "maxEventPayloadBytes", "maxArtifactBytes", "maxReceiptBytes"}, "runtimePolicy")
     model = _object(policy["model"], "runtimePolicy.model")
     _reject_unknown(model, {"provider", "model"}, "runtimePolicy.model")
@@ -304,6 +318,11 @@ def _validate_snapshot(raw: Any) -> dict[str, Any]:
         raise G1ContractError("runtimePolicy.isolation must be single-invocation")
     for key in ("maxEventPayloadBytes", "maxArtifactBytes", "maxReceiptBytes"):
         _bounded_byte_count(policy[key], f"runtimePolicy.{key}")
+    for key in ("maxCodeModeInputBytes", "maxCodeModeOutputBytes"):
+        if key in policy:
+            _bounded_byte_count(policy[key], f"runtimePolicy.{key}")
+    if "maxCodeModeCalls" in policy:
+        _bounded_integer(policy["maxCodeModeCalls"], "runtimePolicy.maxCodeModeCalls")
     _bounded_budget(data["totalBudget"], "totalBudget")
 
     digests = _object(data["contractDigests"], "contractDigests")

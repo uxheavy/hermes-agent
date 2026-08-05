@@ -31,6 +31,24 @@ _CREDENTIAL_PROTOCOL = "plane.agent-runtime/credentials/v1"
 _MAX_CREDENTIALS = 16
 _MAX_CREDENTIAL_KEY_BYTES = 128
 _MAX_CREDENTIAL_VALUE_BYTES = 16 * 1024
+_CODE_MODE_RUNTIME_POLICY_FIELDS = (
+    "maxCodeModeInputBytes",
+    "maxCodeModeOutputBytes",
+    "maxCodeModeCalls",
+)
+
+
+def _code_mode_is_available(snapshot: G1RunSnapshot) -> bool:
+    """Translate Plane's immutable Code Mode availability declaration.
+
+    The values are validated by the G1 contract before this adapter sees the
+    snapshot.  Presence of all three positive limits is the existing Plane
+    contract's declaration that this invocation may use restricted Code Mode;
+    it is not a permission check and does not replace live host authorization.
+    """
+
+    policy = snapshot.raw["runtimePolicy"]
+    return all(policy.get(key, 0) > 0 for key in _CODE_MODE_RUNTIME_POLICY_FIELDS)
 
 
 def _strict_json_object(raw: bytes, expected: set[str], name: str) -> dict[str, Any]:
@@ -414,6 +432,19 @@ class HermesKernelAdapter:
                     }
                 )
 
+        enabled_toolsets = [
+            toolset
+            for toolset in self._enabled_toolsets
+            if toolset != "code_execution"
+        ]
+        if _code_mode_is_available(snapshot):
+            enabled_toolsets.append("code_execution")
+        if self._host_port is not None:
+            enabled_toolsets.append("plane_runtime")
+        # Preserve caller ordering while keeping adapter-added toolsets
+        # idempotent when a compatibility caller already supplied one.
+        enabled_toolsets = list(dict.fromkeys(enabled_toolsets))
+
         agent_kwargs: dict[str, Any] = {
             "provider": snapshot.model_provider,
             "model": snapshot.model_name,
@@ -422,8 +453,7 @@ class HermesKernelAdapter:
             "max_tokens": max(1, int(invocation.remaining_budget["outputTokens"])),
             "max_iterations": model_call_allowance,
             "session_id": invocation.invocation_id,
-            "enabled_toolsets": list(self._enabled_toolsets)
-            + (["plane_runtime"] if self._host_port is not None else []),
+            "enabled_toolsets": enabled_toolsets,
             "quiet_mode": True,
             "skip_context_files": True,
             "skip_memory": True,

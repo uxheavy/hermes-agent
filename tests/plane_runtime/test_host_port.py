@@ -705,12 +705,21 @@ class HostPortTests(unittest.TestCase):
             "provider": "openai",
             "model": "deterministic-local",
         }
+        snapshot_raw["runtimePolicy"].update(  # type: ignore[union-attr]
+            {
+                "maxCodeModeInputBytes": 65_536,
+                "maxCodeModeOutputBytes": 65_536,
+                "maxCodeModeCalls": 4,
+            }
+        )
         snapshot_raw["contentDigest"] = _digest(  # type: ignore[assignment]
             "snapshot",
             {key: value for key, value in snapshot_raw.items() if key != "contentDigest"},
         )
         snapshot = G1RunSnapshot.from_dict(snapshot_raw)
         invocation = G1InvocationEnvelope.from_dict(make_invocation(snapshot.to_dict()))
+
+        model_tool_names: list[list[str]] = []
 
         class DeterministicCompletions:
             def __init__(self) -> None:
@@ -727,8 +736,14 @@ class HostPortTests(unittest.TestCase):
                     extra_content=None,
                 )
 
-            def create(self, **_: object):
+            def create(self, **kwargs: object):
                 self.calls += 1
+                model_tool_names.append(
+                    [
+                        tool["function"]["name"]
+                        for tool in kwargs.get("tools", [])  # type: ignore[union-attr]
+                    ]
+                )
                 if self.calls == 1:
                     tool_calls = [
                         self.tool_call(
@@ -887,7 +902,6 @@ class HostPortTests(unittest.TestCase):
             result = HermesKernelAdapter(
                 agent_factory=agent_factory,
                 credential_source=ModelCredentials(),
-                enabled_toolsets=("code_execution",),
                 host_port=CallablePlaneHostPort(rpc),
             ).dispatch(
                 snapshot,
@@ -898,6 +912,12 @@ class HostPortTests(unittest.TestCase):
             )
 
         self.assertEqual(result.kind, "completed")
+        self.assertTrue(
+            any("execute_code" in names for names in model_tool_names),
+            "event=plane.code_mode.exposure actor=hermes operation=build_model_tools "
+            "risk=granted_code_mode_is_unavailable expected=execute_code_exposed "
+            "actual=execute_code_missing suggestion=inspect_snapshot_policy_mapping",
+        )
         self.assertEqual(
             [(request["action"], request["source"]) for request in requests],
             [
@@ -918,6 +938,55 @@ class HostPortTests(unittest.TestCase):
         self.assertEqual(
             [body["payload"]["text"] for body in bodies if body["kind"] == "transcript_evidence_observed"],
             ["ordinary final evidence"],
+        )
+
+    def test_ungranted_snapshot_cannot_enable_execute_code_from_adapter_override(self) -> None:
+        from tests.plane_runtime.test_g1_runtime_process import (
+            G1InvocationEnvelope,
+            G1RunSnapshot,
+            make_invocation,
+            make_snapshot,
+        )
+        from plane_runtime.hermes_adapter import HermesKernelAdapter
+
+        snapshot = G1RunSnapshot.from_dict(make_snapshot())
+        invocation = G1InvocationEnvelope.from_dict(make_invocation(snapshot.to_dict()))
+        captured: dict[str, object] = {}
+
+        class Agent:
+            session_input_tokens = 1
+            session_output_tokens = 1
+            session_api_calls = 1
+
+            def run_conversation(self, *_args: object, **_kwargs: object) -> dict[str, str]:
+                return {"final_response": "ordinary final evidence"}
+
+            def interrupt(self, _reason: str) -> None:
+                return
+
+        def agent_factory(**kwargs: object) -> Agent:
+            captured.update(kwargs)
+            return Agent()
+
+        result = HermesKernelAdapter(
+            agent_factory=agent_factory,
+            credential_source=type("Credentials", (), {"resolve": lambda _self, _provider: {"api_key": "secret"}})(),
+            enabled_toolsets=("code_execution",),
+        ).dispatch(
+            snapshot,
+            invocation,
+            lambda: False,
+            lambda _body: None,
+            model_call_allowance=1,
+        )
+
+        self.assertEqual(result.kind, "completed")
+        self.assertNotIn(
+            "code_execution",
+            captured["enabled_toolsets"],
+            "event=plane.code_mode.prevention actor=ungranted-invocation operation=adapter_dispatch "
+            "risk=caller-controlled_toolset_grants_code_mode expected=code_execution_filtered "
+            "actual=code_execution_present suggestion=keep_code_mode_activation_snapshot_bound",
         )
 
     def test_ordinary_final_text_never_publishes_and_host_failure_fails_closed(self) -> None:
