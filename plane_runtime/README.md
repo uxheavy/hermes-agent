@@ -92,18 +92,21 @@ terminal proposal, and one exit; it never emits a reconciliation receipt or
 Plane proof. The trusted supervisor validates the exact run, invocation,
 snapshot, lease, sequence, and proposal bindings, then submits the proposal
 once through its injected `TerminalReconciliationPort`. Product status is
-derived only from the accepted host receipt. The current foundation has no
-trusted production entrypoint, so every accepted runner attestation is
-explicitly test-only and `production_completed` is permanently false.
+derived only from the accepted host receipt. G1 has no product-completion
+claim: it returns runtime evidence frames only. `ProductionG1RuntimeRunner`
+is the separate G1 production seam and uses the same fixed Docker supervisor
+policy, with a host-only credential broker mounted read-only at a fixed path.
+`G1LocalTestRunner` is explicitly test-only.
 
 The fixed child command uses `docker create`, `start`, and `attach` with
 module-private network, namespace, privilege, mount, environment, logging,
 storage, and cleanup controls. `SubprocessDockerRunner` performs bounded
 daemon, image, and post-launch inspections and rejects ambiguity, but those
-checks are test/integration evidence only until the real kernel/service
-binding exists. Caller-owned runners are explicit test seams and cannot
-produce a `production_completed` result; there is deliberately no mutable
-closed-runner production path to replace. The attach client is terminated,
+checks are bounded Docker enforcement evidence. The G1 production runner adds
+the fixed `--g1-production` command and broker mount; the child reaches
+`HermesKernelAdapter` only through that path. Caller-owned runners remain
+explicit test seams and cannot produce a product completion claim. The attach
+client is terminated,
 killed if necessary, and reaped on every collector exit before container
 cleanup. Results are retained under a fixed bound only as validated private
 canonical values inside one invocation-scoped authority process. The parent
@@ -124,17 +127,16 @@ Overflow is returned as supervisor action required without inserting past the
 cap. Cleanup proves deterministic container absence after stop/kill/remove-volume
 attempts.
 
-The package does not claim a real Hermes `KernelPort`, provider credentials,
-Operation Gateway, deployment, checkpoint service, or generated TypeScript
-isolation. Real Docker enforcement is unproven unless a local daemon and
-already-present digest-pinned image pass the inspection path; this slice does
-not pull images or contact a registry. More importantly, a passing Docker
-inspection alone is not the missing production entrypoint: a real Hermes
-kernel/service binding and its trusted host-owned evidence path are still
-absent. Current supervisor executions remain explicitly non-production and
-fail closed on production-shaped runner attestations. The trusted
-`serve_once` function remains a host/test convenience; fixture/demo
-authorities are not command-line runtime entrypoints.
+The package does not claim an Operation Gateway, deployment, checkpoint
+service, or generated TypeScript isolation. Real Docker enforcement is
+unproven unless a local daemon and already-present digest-pinned image pass
+the inspection path; this slice does not pull images or contact a registry.
+The production G1 seam is wired to Hermes, but successful model execution
+also requires an existing digest-pinned image containing this service and its
+Hermes dependencies. The host broker keeps provider credentials out of the
+snapshot, envelope, child environment, command arguments, logs, events, and
+artifacts. The trusted `serve_once` function remains a host/test convenience;
+fixture/demo authorities are not command-line runtime entrypoints.
 
 Verify the package from the repository root:
 

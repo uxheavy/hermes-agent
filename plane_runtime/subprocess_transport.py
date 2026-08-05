@@ -13,7 +13,7 @@ from .g1_contract import (
     G1RunSnapshot,
     bind_snapshot_and_invocation,
 )
-from .invocation_supervisor import G1InvocationSupervisor, G1LocalTestRunner
+from .invocation_supervisor import G1InvocationSupervisor, G1LocalTestRunner, G1RuntimeRunner
 
 
 class RuntimeTransportError(G1ContractError):
@@ -39,14 +39,33 @@ class SubprocessRuntimeTransport:
         timeout_seconds: float = 30.0,
         max_output_bytes: int = 512 * 1024,
         supervisor: G1InvocationSupervisor | None = None,
+        runner: G1RuntimeRunner | None = None,
+        test_only: bool = False,
+        ledger_path: str | os.PathLike[str] | None = None,
     ) -> None:
         del python_executable, cwd, env
         if timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be positive")
-        self._supervisor = supervisor or G1InvocationSupervisor(
-            runner=G1LocalTestRunner(max_output_bytes=max_output_bytes),
-            hard_timeout_seconds=timeout_seconds,
-        )
+        if supervisor is not None and runner is not None:
+            raise ValueError("provide supervisor or runner, not both")
+        if supervisor is not None:
+            self._supervisor = supervisor
+        elif runner is not None:
+            self._supervisor = G1InvocationSupervisor(
+                runner=runner,
+                hard_timeout_seconds=timeout_seconds,
+                ledger_path=ledger_path,
+            )
+        elif not test_only:
+            raise RuntimeTransportError(
+                "a production G1 runner must be installed; test_only is required for the local runner"
+            )
+        else:
+            self._supervisor = G1InvocationSupervisor(
+                runner=G1LocalTestRunner(max_output_bytes=max_output_bytes),
+                hard_timeout_seconds=timeout_seconds,
+                ledger_path=ledger_path,
+            )
 
     def dispatch(
         self,

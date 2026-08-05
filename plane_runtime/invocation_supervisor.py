@@ -7,10 +7,10 @@ the injected :class:`TerminalReconciliationPort`.
 
 The Docker implementation is deliberately strict and conservative.  It uses
 only fixed argv controls and performs bounded Docker JSON inspection before
-and after launch.  This package does not yet contain a trusted production
-entrypoint: Docker evidence and injected runners are explicitly test-only
-until a real kernel/service binding is installed.  A production-shaped
-attestation is rejected rather than treated as proof.
+and after launch.  ``ProductionG1RuntimeRunner`` is the production G1 seam:
+it reuses this Docker policy and binds the child to a host-only credential
+broker.  ``G1LocalTestRunner`` remains explicitly test-only and cannot claim
+OS isolation.
 """
 
 from __future__ import annotations
@@ -23,8 +23,10 @@ import os
 import re
 import secrets
 import selectors
+import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import weakref
@@ -70,6 +72,7 @@ from .g1_contract import (
     build_exit,
     validate_g1_frames,
 )
+from .g1_ledger import G1LedgerError, G1RuntimeLedger
 
 
 # These aliases are used only while validating a freshly produced candidate or
@@ -103,12 +106,18 @@ _RETENTION_POPEN = subprocess.Popen
 _FIXED_ENTRYPOINT = "python3"
 _FIXED_SERVICE_MODULE = "plane_runtime.service"
 _FIXED_SERVICE_ARGS = ("--once",)
+_G1_PRODUCTION_SERVICE_ARGS = ("--once", "--g1-production")
+_G1_CREDENTIAL_BROKER_TARGET = "/run/plane-agent-credential-broker"
 _FIXED_NETWORK = "none"
 _FIXED_USER = "65532:65532"
 _FIXED_TMPFS_TARGET = "/tmp"
 _FIXED_TMPFS_OPTIONS = "rw,noexec,nosuid,nodev"
 _FIXED_PULL_POLICY = "never"
 _FIXED_LOG_DRIVER = "none"
+_DOCKER_EXECUTABLE = next(
+    (candidate for candidate in ("/opt/homebrew/bin/docker", "/usr/local/bin/docker") if os.path.isfile(candidate)),
+    "docker",
+)
 _FIXED_CONTAINER_PREFIX = "plane-invocation"
 _FIXED_PROTOCOL_LABEL = "plane.agent-runtime/protocol=plane.agent-runtime/v1"
 _FIXED_ALLOWED_ENV: tuple[tuple[str, str], ...] = (
@@ -124,7 +133,7 @@ _DOCKER_CLIENT_ENV: Mapping[str, str] = {
     "PATH": "/usr/local/bin:/usr/bin:/bin",
 }
 _ALLOWED_IMAGE_ENV_KEYS = frozenset(key for key, _ in _FIXED_ALLOWED_ENV)
-_SUPPORTED_STORAGE_DRIVERS = frozenset({"overlay2", "btrfs", "zfs", "devicemapper"})
+_SUPPORTED_STORAGE_DRIVERS = frozenset({"overlay2", "overlayfs", "btrfs", "zfs", "devicemapper"})
 _IMAGE_DIGEST = re.compile(r"[a-z0-9][a-z0-9._:/-]*[a-z0-9]@sha256:[0-9a-f]{64}")
 _REGISTRY_PORT = re.compile(r"[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?:[0-9]{1,5}")
 _IMAGE_COMPONENT = re.compile(r"[a-z0-9]+(?:[._-][a-z0-9]+)*")
@@ -362,12 +371,7 @@ class DockerRunnerCapabilities:
 
 @dataclass(frozen=True)
 class EnforcementAttestation:
-    """Bounded runner evidence; the current supervisor accepts test evidence only.
-
-    ``production`` remains a parseable legacy value so hostile or stale
-    adapters fail at the supervisor seam instead of failing during decoding.
-    It is never an accepted classification for a current invocation.
-    """
+    """Bounded evidence from either the production Docker or test seam."""
 
     classification: str
     argv_digest: str
@@ -495,9 +499,9 @@ class InvocationResult:
     def production_completed(self) -> bool:
         """Whether this result is a trusted production completion.
 
-        The L9 foundation has no trusted production entrypoint yet.  Keeping
-        this compatibility property permanently false prevents a caller-owned
-        result or attestation from becoming a product completion claim.
+        Legacy ``InvocationResult`` values are not the G1 result contract.
+        Keep this compatibility property false so an observation cannot become
+        a Plane product completion claim; G1 returns evidence frames only.
         """
 
         return False
@@ -952,6 +956,12 @@ def _argv_digest(argv: Sequence[str]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _docker_command(argv: Sequence[str]) -> tuple[str, ...]:
+    if not argv or argv[0] != "docker":
+        raise ContractError("Docker command is not the fixed client")
+    return (_DOCKER_EXECUTABLE, *tuple(argv[1:]))
+
+
 def build_invocation_env(policy: InvocationPolicy | None = None) -> dict[str, str]:
     """Return the literal child environment; ambient process state is ignored."""
 
@@ -1027,6 +1037,49 @@ def build_invocation_argv(
     _validate_binding(run, invocation)
     name = invocation_container_name(run, invocation)
     binding = _binding_digest(run, invocation)
+    return _build_fixed_docker_argv(
+        name=name,
+        binding=binding,
+        policy=policy,
+        service_args=_FIXED_SERVICE_ARGS,
+    )
+
+
+def _build_fixed_docker_argv(
+    *,
+    name: str,
+    binding: str,
+    policy: InvocationPolicy,
+    service_args: Sequence[str],
+    broker_source: str | None = None,
+) -> tuple[str, ...]:
+    values = _validate_policy(policy)
+    (
+        image,
+        cpu,
+        memory,
+        pids,
+        _wall,
+        _stdout,
+        _stderr,
+        _frame,
+        _request,
+        _frames,
+        tmpfs,
+        storage,
+        stop_timeout,
+        _kill_timeout,
+        _remove_timeout,
+    ) = values
+    if not _CONTAINER_NAME.fullmatch(name) or re.fullmatch(r"[0-9a-f]{64}", binding) is None:
+        raise ContractError("fixed Docker identity is invalid")
+    if tuple(service_args) not in {_FIXED_SERVICE_ARGS, _G1_PRODUCTION_SERVICE_ARGS}:
+        raise ContractError("fixed Docker service mode is invalid")
+    if service_args == _G1_PRODUCTION_SERVICE_ARGS:
+        if broker_source is None or not os.path.isabs(broker_source) or _CONTROL.search(broker_source):
+            raise ContractError("production G1 credential broker path is invalid")
+    elif broker_source is not None:
+        raise ContractError("test Docker service cannot receive a credential broker")
     argv: list[str] = [
         "docker",
         "create",
@@ -1062,10 +1115,31 @@ def build_invocation_argv(
         "--log-driver",
         _FIXED_LOG_DRIVER,
     ]
+    if broker_source is not None:
+        argv.extend(("--mount", f"type=bind,src={broker_source},dst={_G1_CREDENTIAL_BROKER_TARGET},readonly"))
     for key, value in _FIXED_ALLOWED_ENV:
         argv.extend(("--env", f"{key}={value}"))
-    argv.extend(("--entrypoint", _FIXED_ENTRYPOINT, str(image), "-m", _FIXED_SERVICE_MODULE, *_FIXED_SERVICE_ARGS))
+    argv.extend(("--entrypoint", _FIXED_ENTRYPOINT, str(image), "-m", _FIXED_SERVICE_MODULE, *service_args))
     return tuple(argv)
+
+
+def build_g1_docker_argv(
+    request_fingerprint: str,
+    policy: InvocationPolicy,
+    *,
+    credential_broker_source: str,
+) -> tuple[str, ...]:
+    """Build the production G1 command through the shared Docker policy."""
+
+    if re.fullmatch(r"[0-9a-f]{64}", request_fingerprint) is None:
+        raise ContractError("G1 request fingerprint is invalid")
+    return _build_fixed_docker_argv(
+        name=f"{_FIXED_CONTAINER_PREFIX}-{request_fingerprint[:32]}",
+        binding=request_fingerprint,
+        policy=policy,
+        service_args=_G1_PRODUCTION_SERVICE_ARGS,
+        broker_source=credential_broker_source,
+    )
 
 
 def _request_bytes(run: RunSnapshot, invocation: InvocationEnvelope, policy: InvocationPolicy) -> bytes:
@@ -1363,10 +1437,16 @@ def _json_object(raw: bytes, label: str) -> dict[str, object]:
 class SubprocessDockerRunner:
     """Docker CLI adapter with evidence-based preflight and cleanup."""
 
-    def __init__(self, capabilities: DockerRunnerCapabilities | None = None) -> None:
+    def __init__(
+        self,
+        capabilities: DockerRunnerCapabilities | None = None,
+        *,
+        production: bool = False,
+    ) -> None:
         # Kept only for source compatibility with old test adapters.  The
         # supervisor never reads this caller assertion.
         self.capabilities = capabilities
+        self._production = bool(production)
         self._attestation: EnforcementAttestation | None = None
 
     def _run_json(self, command: Sequence[str], *, timeout_seconds: float, label: str) -> dict[str, object]:
@@ -1473,16 +1553,17 @@ class SubprocessDockerRunner:
             storage_limit_bytes=storage_bytes,
         )
 
-    @classmethod
-    def _assert_fixed_argv_shape(cls, argv: Sequence[str]) -> None:
+    def _assert_fixed_argv_shape(self, argv: Sequence[str]) -> None:
         if tuple(argv[:2]) != ("docker", "create"):
             raise ContractError("Docker runner accepts only fixed docker create argv")
         allowed_flags = {
             "--name", "--label", "--pull", "--network", "--read-only",
             "--security-opt", "--cap-drop", "--user", "--cpus", "--memory",
             "--pids-limit", "--stop-timeout", "--tmpfs", "--storage-opt",
-            "--log-driver", "--env", "--entrypoint", "--once", "-m",
+            "--log-driver", "--env", "--entrypoint", "--once", "--g1-production", "-m",
         }
+        if self._production:
+            allowed_flags.add("--mount")
         if any(item.startswith("-") and item not in allowed_flags for item in argv[2:]):
             raise ContractError("Docker argv contains an unsupported flag")
         for flag, expected in (
@@ -1494,7 +1575,7 @@ class SubprocessDockerRunner:
             ("--log-driver", _FIXED_LOG_DRIVER),
             ("--entrypoint", _FIXED_ENTRYPOINT),
         ):
-            if cls._flag_value(argv, flag) != expected:
+            if self._flag_value(argv, flag) != expected:
                 raise ContractError(f"Docker argv {flag} is not fixed")
         for flag in ("--read-only",):
             if list(argv).count(flag) != 1:
@@ -1511,12 +1592,33 @@ class SubprocessDockerRunner:
         actual_env = [argv[index + 1] for index, value in enumerate(argv) if value == "--env"]
         if actual_env != expected_env:
             raise ContractError("Docker argv environment is not the fixed allowlist")
-        cls._policy_from_argv(argv)
+        service_args = tuple(argv[self._service_args_index(argv):])
+        if self._production:
+            if service_args != _G1_PRODUCTION_SERVICE_ARGS or list(argv).count("--mount") != 1:
+                raise ContractError("production Docker argv lacks the fixed G1 broker mount")
+            mount = self._flag_value(argv, "--mount")
+            expected_prefix = f"type=bind,src="
+            expected_suffix = f",dst={_G1_CREDENTIAL_BROKER_TARGET},readonly"
+            if not mount.startswith(expected_prefix) or not mount.endswith(expected_suffix):
+                raise ContractError("production Docker credential mount is not fixed")
+            source = mount[len(expected_prefix) : -len(expected_suffix)]
+            if not source or not os.path.isabs(source) or _CONTROL.search(source):
+                raise ContractError("production Docker credential mount source is invalid")
+        elif service_args != _FIXED_SERVICE_ARGS or "--mount" in argv:
+            raise ContractError("test Docker argv contains a non-test service control")
+        self._policy_from_argv(argv)
+
+    @staticmethod
+    def _service_args_index(argv: Sequence[str]) -> int:
+        for index in range(len(argv) - 1):
+            if tuple(argv[index : index + 2]) == ("-m", _FIXED_SERVICE_MODULE):
+                return index + 2
+        raise ContractError("Docker argv has no fixed service module")
 
     def _preflight(self, argv: Sequence[str], *, timeout_seconds: float) -> None:
         if tuple(argv[:2]) != ("docker", "create"):
             raise ContractError("Docker runner accepts only fixed docker create argv")
-        info = self._run_json(("docker", "info", "--format", "{{json .}}"), timeout_seconds=timeout_seconds, label="daemon")
+        info = self._run_json(_docker_command(("docker", "info", "--format", "{{json .}}")), timeout_seconds=timeout_seconds, label="daemon")
         if info.get("OSType") != "linux" or not isinstance(info.get("Driver"), str):
             raise RuntimeConfigurationError("Docker daemon platform or storage driver is ambiguous")
         if info["Driver"] not in _SUPPORTED_STORAGE_DRIVERS:
@@ -1525,11 +1627,11 @@ class SubprocessDockerRunner:
         if cgroup_version not in {"1", "2"}:
             raise RuntimeConfigurationError("Docker cgroup version is ambiguous")
         security_options = info.get("SecurityOptions")
-        if info.get("Rootless") is not False or not isinstance(security_options, list) or any("rootless" in str(item).lower() for item in security_options):
+        if info.get("Rootless") is True or not isinstance(security_options, list) or any("rootless" in str(item).lower() for item in security_options):
             raise RuntimeConfigurationError("Docker rootless/security mode is ambiguous")
         image = self._image_from_argv(argv)
         image_info = self._run_json(
-            ("docker", "image", "inspect", "--format", "{{json .}}", image),
+            _docker_command(("docker", "image", "inspect", "--format", "{{json .}}", image)),
             timeout_seconds=timeout_seconds,
             label="image",
         )
@@ -1567,7 +1669,11 @@ class SubprocessDockerRunner:
             raise ContractError("Docker argv has no image")
         image = argv[image_index]
         _validate_image_reference(image)
-        if tuple(argv[image_index + 1 :]) != ("-m", _FIXED_SERVICE_MODULE, *_FIXED_SERVICE_ARGS):
+        suffix = tuple(argv[image_index + 1 :])
+        if suffix not in {
+            ("-m", _FIXED_SERVICE_MODULE, *_FIXED_SERVICE_ARGS),
+            ("-m", _FIXED_SERVICE_MODULE, *_G1_PRODUCTION_SERVICE_ARGS),
+        }:
             raise ContractError("Docker argv has an unexpected child command")
         return image
 
@@ -1585,7 +1691,7 @@ class SubprocessDockerRunner:
         self._assert_fixed_argv_shape(argv)
         self._preflight(argv, timeout_seconds=5.0)
         attestation = EnforcementAttestation(
-            classification="test",
+            classification="production" if self._production else "test",
             argv_digest=_argv_digest(argv),
             container_name=name,
             evidence=(
@@ -1593,7 +1699,8 @@ class SubprocessDockerRunner:
                 "image_digest_inspected",
                 "image_config_inspected",
                 "fixed_argv",
-                "production_path_unavailable",
+                "fixed_environment",
+                "production_docker_attested" if self._production else "production_path_unavailable",
             ),
         )
         self._attestation = attestation
@@ -1602,7 +1709,7 @@ class SubprocessDockerRunner:
     def _inspect_container(self, name: str, *, timeout_seconds: float, allow_absent: bool = False) -> dict[str, object] | None:
         try:
             completed = subprocess.run(
-                ("docker", "inspect", "--format", "{{json .}}", name),
+                _docker_command(("docker", "inspect", "--format", "{{json .}}", name)),
                 env=dict(_DOCKER_CLIENT_ENV),
                 cwd="/",
                 stdin=subprocess.DEVNULL,
@@ -1630,7 +1737,7 @@ class SubprocessDockerRunner:
         if config.get("User") != _FIXED_USER:
             raise RuntimeConfigurationError("Docker non-root user enforcement did not match")
         security = host.get("SecurityOpt")
-        if not isinstance(security, list) or "no-new-privileges:true" not in security:
+        if not isinstance(security, list) or not any(item in {"no-new-privileges", "no-new-privileges:true"} for item in security):
             raise RuntimeConfigurationError("Docker no-new-privileges enforcement did not match")
         cap_drop = host.get("CapDrop")
         if not isinstance(cap_drop, list) or "ALL" not in cap_drop:
@@ -1647,23 +1754,35 @@ class SubprocessDockerRunner:
         storage_opt = host.get("StorageOpt")
         if not isinstance(storage_opt, dict) or storage_opt.get("size") != _size(policy.storage_limit_bytes):
             raise RuntimeConfigurationError("Docker storage enforcement did not match")
-        log_config = container.get("LogConfig")
+        log_config = container.get("LogConfig") or host.get("LogConfig")
         if not isinstance(log_config, dict) or log_config.get("Type") != _FIXED_LOG_DRIVER:
             raise RuntimeConfigurationError("Docker logging enforcement did not match")
-        if (
-            container.get("Mounts") not in ([], None)
-            or host.get("Binds") not in ([], None)
-            or host.get("VolumesFrom") not in ([], None)
-            or host.get("Devices") not in ([], None)
-        ):
+        service_args = tuple(argv[SubprocessDockerRunner._service_args_index(argv):])
+        mounts = container.get("Mounts")
+        binds = host.get("Binds")
+        if service_args == _G1_PRODUCTION_SERVICE_ARGS:
+            if not isinstance(mounts, list) or len(mounts) != 1:
+                raise RuntimeConfigurationError("Docker credential broker mount is missing")
+            mount = mounts[0]
+            if not isinstance(mount, dict) or mount.get("Destination") != _G1_CREDENTIAL_BROKER_TARGET or mount.get("RW") is not False:
+                raise RuntimeConfigurationError("Docker credential broker mount is not read-only")
+        elif mounts not in ([], None) or binds not in ([], None):
             raise RuntimeConfigurationError("Docker mounts/devices are not isolated")
+        if host.get("VolumesFrom") not in ([], None) or host.get("Devices") not in ([], None):
+            raise RuntimeConfigurationError("Docker volumes/devices are not isolated")
         for key in ("PidMode", "IpcMode", "UTSMode", "UsernsMode"):
             if host.get(key) in {"host", "/host"}:
                 raise RuntimeConfigurationError("Docker host namespace is not isolated")
-        expected_env = [f"{key}={value}" for key, value in _FIXED_ALLOWED_ENV]
-        if config.get("Env") != expected_env:
+        expected_env = {key: value for key, value in _FIXED_ALLOWED_ENV}
+        actual_env = config.get("Env")
+        if (
+            not isinstance(actual_env, list)
+            or len(actual_env) != len(expected_env)
+            or any(not isinstance(item, str) or "=" not in item for item in actual_env)
+            or {item.split("=", 1)[0]: item.split("=", 1)[1] for item in actual_env} != expected_env
+        ):
             raise RuntimeConfigurationError("Docker environment did not clear image state")
-        if config.get("Entrypoint") != [_FIXED_ENTRYPOINT] or config.get("Cmd") != ["-m", _FIXED_SERVICE_MODULE, *_FIXED_SERVICE_ARGS]:
+        if config.get("Entrypoint") != [_FIXED_ENTRYPOINT] or config.get("Cmd") != ["-m", _FIXED_SERVICE_MODULE, *service_args]:
             raise RuntimeConfigurationError("Docker child command did not match the fixed command")
         if container.get("Name") not in (None, f"/{SubprocessDockerRunner._flag_value(argv, '--name')}"):
             raise RuntimeConfigurationError("Docker container identity did not match")
@@ -1684,7 +1803,7 @@ class SubprocessDockerRunner:
         del input_bytes
         try:
             created = subprocess.run(
-                tuple(argv),
+                _docker_command(argv),
                 env=dict(_DOCKER_CLIENT_ENV),
                 cwd="/",
                 stdin=subprocess.DEVNULL,
@@ -1707,7 +1826,7 @@ class SubprocessDockerRunner:
         self._assert_post_launch(container, argv, raise_policy)
         try:
             started = subprocess.run(
-                ("docker", "start", name),
+                _docker_command(("docker", "start", name)),
                 env=dict(_DOCKER_CLIENT_ENV),
                 cwd="/",
                 stdin=subprocess.DEVNULL,
@@ -1725,7 +1844,7 @@ class SubprocessDockerRunner:
             raise RuntimeConfigurationError("Docker container disappeared during start")
         self._assert_post_launch(running, argv, raise_policy)
         attached = subprocess.Popen(
-            ("docker", "attach", "--sig-proxy=false", name),
+            _docker_command(("docker", "attach", "--sig-proxy=false", name)),
             env=dict(_DOCKER_CLIENT_ENV),
             cwd="/",
             stdin=subprocess.PIPE,
@@ -1757,7 +1876,7 @@ class SubprocessDockerRunner:
             if running:
                 stop_attempted = True
                 try:
-                    self._control(("docker", "stop", "--time", "1", container_name), stop_timeout_seconds)
+                    self._control(_docker_command(("docker", "stop", "--time", "1", container_name)), stop_timeout_seconds)
                 except Exception:
                     try:
                         post_stop = self._inspect_container(container_name, timeout_seconds=stop_timeout_seconds, allow_absent=True)
@@ -1767,12 +1886,12 @@ class SubprocessDockerRunner:
                     if still_running:
                         kill_attempted = True
                         try:
-                            self._control(("docker", "kill", container_name), kill_timeout_seconds)
+                            self._control(_docker_command(("docker", "kill", container_name)), kill_timeout_seconds)
                         except Exception:
                             failures.append("kill_failed")
             remove_attempted = True
             try:
-                self._control(("docker", "rm", "--force", "--volumes", container_name), remove_timeout_seconds)
+                self._control(_docker_command(("docker", "rm", "--force", "--volumes", container_name)), remove_timeout_seconds)
             except Exception:
                 try:
                     if self._inspect_container(container_name, timeout_seconds=remove_timeout_seconds, allow_absent=True) is not None:
@@ -4315,6 +4434,186 @@ class G1LocalTestRunner:
         return CleanupReport(invocation_name, False, False, True, (), reaped)
 
 
+_G1_PRODUCTION_COMMAND = (
+    _FIXED_ENTRYPOINT,
+    "-m",
+    _FIXED_SERVICE_MODULE,
+    *_G1_PRODUCTION_SERVICE_ARGS,
+)
+
+
+class HostCredentialBroker:
+    """Host-only Unix socket broker mounted at one fixed container target."""
+
+    def __init__(self, source: object, *, path: str | None = None) -> None:
+        resolve = getattr(source, "resolve", None)
+        if not callable(resolve):
+            raise RuntimeConfigurationError("production G1 credential source is not callable")
+        self._source = source
+        self._allowed_provider: str | None = None
+        self._temporary_directory = None
+        if path is None:
+            # Docker Desktop shares the checkout with the Linux VM; the
+            # default macOS per-process temp roots are not bind-mount sources.
+            self._temporary_directory = tempfile.TemporaryDirectory(
+                prefix=".plane-g1-broker-",
+                dir=os.path.dirname(os.path.realpath(__file__)),
+            )
+            # The directory is an endpoint mount, not a credential store.  It
+            # must be traversable by the fixed non-root Docker UID while the
+            # socket itself remains the only broker object exposed.
+            os.chmod(self._temporary_directory.name, 0o711)
+            path = os.path.join(self._temporary_directory.name, "broker.sock")
+        if not os.path.isabs(path) or _CONTROL.search(path):
+            raise RuntimeConfigurationError("credential broker path is invalid")
+        self.path = path
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+        self._server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self._server.bind(path)
+        os.chmod(path, 0o666)
+        self._server.listen(8)
+        self._server.settimeout(0.2)
+        self._closed = threading.Event()
+        self._thread = threading.Thread(target=self._serve, name="plane-g1-credential-broker", daemon=True)
+        self._thread.start()
+
+    def _serve(self) -> None:
+        while not self._closed.is_set():
+            try:
+                channel, _address = self._server.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            with channel:
+                channel.settimeout(2.0)
+                raw = bytearray()
+                while len(raw) <= 4096 and not raw.endswith(b"\n"):
+                    chunk = channel.recv(min(1024, 4097 - len(raw)))
+                    if not chunk:
+                        break
+                    raw.extend(chunk)
+                try:
+                    request = json.loads(bytes(raw).rstrip(b"\n"))
+                    if (
+                        not isinstance(request, dict)
+                        or request.get("protocol") != "plane.agent-runtime/credentials/v1"
+                        or not isinstance(request.get("provider"), str)
+                        or (self._allowed_provider is not None and request["provider"] != self._allowed_provider)
+                    ):
+                        raise ValueError("invalid broker request")
+                    credentials = dict(self._source.resolve(request["provider"]))
+                    if any(not isinstance(key, str) or not isinstance(value, str) for key, value in credentials.items()):
+                        raise ValueError("invalid broker credentials")
+                    response = {"protocol": "plane.agent-runtime/credentials/v1", "credentials": credentials}
+                except Exception:
+                    response = {"protocol": "plane.agent-runtime/credentials/v1", "credentials": {}}
+                channel.sendall(json.dumps(response, separators=(",", ":")).encode("utf-8") + b"\n")
+
+    def allow_provider(self, provider: str) -> None:
+        if not isinstance(provider, str) or not provider:
+            raise RuntimeConfigurationError("credential broker provider binding is invalid")
+        self._allowed_provider = provider
+
+    def close(self) -> None:
+        if self._closed.is_set():
+            return
+        self._closed.set()
+        try:
+            self._server.close()
+        except OSError:
+            pass
+        self._thread.join(timeout=1.0)
+        try:
+            os.unlink(self.path)
+        except FileNotFoundError:
+            pass
+        if self._temporary_directory is not None:
+            self._temporary_directory.cleanup()
+
+
+class ProductionG1RuntimeRunner:
+    """G1 runner using the accepted Docker supervisor and host broker."""
+
+    command = _G1_PRODUCTION_COMMAND
+
+    def __init__(
+        self,
+        *,
+        image: str,
+        credential_source: object,
+        policy: InvocationPolicy | None = None,
+        max_output_bytes: int = 512 * 1024,
+    ) -> None:
+        self._broker = HostCredentialBroker(credential_source)
+        self._policy = policy or InvocationPolicy(image=image, stdout_limit_bytes=max_output_bytes)
+        if self._policy.image != image:
+            raise ContractError("production G1 image policy is inconsistent")
+        self._docker = SubprocessDockerRunner(production=True)
+        self._argv_by_name: dict[str, tuple[str, ...]] = {}
+
+    @property
+    def broker_path(self) -> str:
+        return self._broker.path
+
+    @property
+    def broker_mount_path(self) -> str:
+        return os.path.dirname(self._broker.path)
+
+    def attest_invocation(self, command: Sequence[str], *, request_fingerprint: str) -> EnforcementAttestation:
+        if tuple(command) != self.command:
+            raise RuntimeConfigurationError("production G1 command is not fixed")
+        argv = build_g1_docker_argv(
+            request_fingerprint,
+            self._policy,
+            credential_broker_source=self.broker_mount_path,
+        )
+        attestation = self._docker.attest_invocation(argv, client_env=dict(_DOCKER_CLIENT_ENV))
+        if type(attestation) is not _EXACT_ENFORCEMENT_ATTESTATION or not attestation.is_production:
+            raise RuntimeConfigurationError("production G1 Docker attestation was not proven")
+        self._argv_by_name[attestation.container_name] = argv
+        return attestation
+
+    def launch(
+        self,
+        command: Sequence[str],
+        *,
+        input_bytes: bytes,
+        environment: Mapping[str, str],
+        max_output_bytes: int,
+    ) -> G1RuntimeProcess:
+        if tuple(command) != self.command or dict(environment) != build_invocation_env():
+            raise RuntimeConfigurationError("production G1 launch controls are not fixed")
+        try:
+            request = json.loads(input_bytes.decode("utf-8"))
+            provider = request["run"]["runtimePolicy"]["model"]["provider"]
+        except Exception as exc:
+            raise ContractError("production G1 request is invalid") from exc
+        self._broker.allow_provider(str(provider))
+        fingerprint = hashlib.sha256(input_bytes.rstrip(b"\n")).hexdigest()
+        argv = self._argv_by_name.get(f"{_FIXED_CONTAINER_PREFIX}-{fingerprint[:32]}")
+        if argv is None:
+            raise RuntimeConfigurationError("production G1 launch lacks an attested request")
+        process = self._docker.launch(argv, client_env=dict(_DOCKER_CLIENT_ENV), input_bytes=input_bytes)
+        return _G1LocalProcess(process, min(max_output_bytes, self._policy.stdout_limit_bytes))
+
+    def cleanup(self, invocation_name: str) -> CleanupReport:
+        self._argv_by_name.pop(invocation_name, None)
+        report = self._docker.cleanup(
+            invocation_name,
+            stop_timeout_seconds=self._policy.stop_timeout_seconds,
+            kill_timeout_seconds=self._policy.kill_timeout_seconds,
+            remove_timeout_seconds=self._policy.remove_timeout_seconds,
+        )
+        return report
+
+    def close(self) -> None:
+        self._broker.close()
+
+
 def _g1_failure_frames(
     snapshot: G1RunSnapshot,
     invocation: G1InvocationEnvelope,
@@ -4343,6 +4642,8 @@ class G1InvocationSupervisor:
         runner: G1RuntimeRunner | None = None,
         hard_timeout_seconds: float = 30.0,
         clock: Callable[[], float] = time.monotonic,
+        ledger_path: str | os.PathLike[str] | None = None,
+        max_calls: int = 128,
     ) -> None:
         if not isinstance(hard_timeout_seconds, (int, float)) or not math.isfinite(float(hard_timeout_seconds)) or hard_timeout_seconds <= 0:
             raise ContractError("G1 hard timeout must be positive and finite")
@@ -4351,10 +4652,21 @@ class G1InvocationSupervisor:
         self._clock = clock
         self._retention_authority = _RETENTION_AUTHORITY_PRODUCTION_CONSTRUCTOR()
         self._retention_finalizer = weakref.finalize(self, self._retention_authority.close)
-        self._g1_budgets: dict[str, dict[str, int]] = {}
+        self._ledger_temporary_directory = None
+        if ledger_path is None:
+            self._ledger_temporary_directory = tempfile.TemporaryDirectory(prefix="plane-g1-ledger-")
+            ledger_path = os.path.join(self._ledger_temporary_directory.name, "ledger.sqlite3")
+        self._ledger = G1RuntimeLedger(ledger_path, max_calls=max_calls)
+        self._command = tuple(getattr(self.runner, "command", _G1_LOCAL_COMMAND))
 
     def close(self) -> None:
         self._retention_finalizer()
+        if self._ledger_temporary_directory is not None:
+            self._ledger_temporary_directory.cleanup()
+            self._ledger_temporary_directory = None
+        close_runner = getattr(self.runner, "close", None)
+        if callable(close_runner):
+            close_runner()
 
     def __del__(self) -> None:
         try:
@@ -4399,45 +4711,6 @@ class G1InvocationSupervisor:
             return False
         return type(value) is bool and value
 
-    @staticmethod
-    def _usage_from_frames(frames: tuple[str, ...]) -> dict[str, int]:
-        """Read bounded usage observations for the next cumulative dispatch."""
-
-        usage = {"inputTokens": 0, "outputTokens": 0, "durationMs": 0}
-        for raw in frames:
-            try:
-                frame = json.loads(raw)
-            except (TypeError, json.JSONDecodeError) as exc:
-                raise G1ContractError("retained G1 frame is not valid JSON") from exc
-            body = frame.get("body") if isinstance(frame, dict) else None
-            if not isinstance(body, dict) or body.get("kind") != "usage_observed":
-                continue
-            observed = body.get("usage")
-            if not isinstance(observed, dict):
-                raise G1ContractError("G1 usage observation is malformed")
-            for name in usage:
-                amount = observed.get(name)
-                if type(amount) is not int or amount < 0 or amount > 2_147_483_647:
-                    raise G1ContractError("G1 usage observation is out of bounds")
-                usage[name] += amount
-                if usage[name] > 2_147_483_647:
-                    raise G1ContractError("G1 cumulative usage exceeds its bound")
-        return usage
-
-    def _record_g1_budget(
-        self,
-        run_id: str,
-        remaining_budget: Mapping[str, int],
-        frames: tuple[str, ...],
-    ) -> None:
-        usage = self._usage_from_frames(frames)
-        if any(usage[name] > remaining_budget[name] for name in usage):
-            raise G1ContractError("G1 usage exceeded the invocation budget")
-        self._g1_budgets[run_id] = {
-            name: remaining_budget[name] - usage[name]
-            for name in usage
-        }
-
     def run_once(
         self,
         snapshot: G1RunSnapshot,
@@ -4450,15 +4723,25 @@ class G1InvocationSupervisor:
         if not callable(lease_valid):
             raise ContractError("G1 lease validity callback is mandatory")
         fingerprint = self._fingerprint(snapshot, invocation)
-        return self._retention_authority.exclusive(
-            lambda: self._run_once_locked(
-                snapshot,
-                invocation,
-                fingerprint=fingerprint,
-                cancellation=cancellation,
-                lease_valid=lease_valid,
+        try:
+            return self._retention_authority.exclusive(
+                lambda: self._run_once_locked(
+                    snapshot,
+                    invocation,
+                    fingerprint=fingerprint,
+                    cancellation=cancellation,
+                    lease_valid=lease_valid,
+                )
             )
-        )
+        except Exception:
+            # A host crash/fault after the durable claim must not make a later
+            # supervisor guess whether the replaceable child completed.
+            self._ledger.mark_outcome_unknown(
+                run_id=snapshot.run_id,
+                invocation_id=invocation.invocation_id,
+                request_fingerprint=fingerprint,
+            )
+            raise
 
     def _run_once_locked(
         self,
@@ -4470,48 +4753,63 @@ class G1InvocationSupervisor:
         lease_valid: Callable[[], bool],
     ) -> tuple[str, ...]:
         key = (snapshot.run_id, invocation.invocation_id)
-        cached = self._retention_authority.read("g1_result", key)
-        if cached.get("status") == "ok":
-            value = _validate_g1_retained_value("g1_result", cached.get("value"), *key)
-            if value["requestFingerprint"] != fingerprint:
-                raise G1ContractError("changed replay conflicts with the retained invocation")
-            retained_frames = tuple(value["frames"])
-            if snapshot.run_id not in self._g1_budgets:
-                self._record_g1_budget(snapshot.run_id, invocation.remaining_budget, retained_frames)
-            return retained_frames
-        if cached.get("status") != "missing":
-            raise RuntimeConfigurationError("G1 retained result is unavailable")
-        previous_budget = self._g1_budgets.get(snapshot.run_id)
-        if previous_budget is not None and any(
-            invocation.remaining_budget[name] > previous_budget[name]
-            for name in ("inputTokens", "outputTokens", "durationMs")
-        ):
-            raise G1ContractError("cumulative G1 budget increased across invocations")
-        self._g1_budgets[snapshot.run_id] = dict(invocation.remaining_budget)
+        claim = self._ledger.claim(
+            run_id=snapshot.run_id,
+            invocation_id=invocation.invocation_id,
+            request_fingerprint=fingerprint,
+            snapshot_digest=snapshot.digest,
+            total_budget=snapshot.total_budget,
+            remaining_budget=invocation.remaining_budget,
+        )
+        if claim.state == "conflict":
+            raise G1ContractError("changed replay conflicts with the retained invocation")
+        if claim.state == "replay":
+            return claim.frames
+        if claim.state == "outcome_unknown":
+            return _g1_failure_frames(
+                snapshot,
+                invocation,
+                kind="failed",
+                code="runtime_error",
+                message="prior runtime outcome is unknown and requires host reconciliation",
+            )
+        if claim.state == "budget_exhausted":
+            raise G1ContractError("cumulative runtime budget or call ceiling is exhausted")
+        if not claim.owns_dispatch:
+            raise RuntimeConfigurationError("G1 ledger returned an invalid claim")
+
+        started_at = time.monotonic()
+
+        def finish(frames: tuple[str, ...]) -> tuple[str, ...]:
+            duration_ms = max(0, int((time.monotonic() - started_at) * 1000))
+            return self._retain_g1(snapshot, invocation, fingerprint, frames, host_duration_ms=duration_ms)
+
         if self._cancelled(cancellation):
             frames = _g1_failure_frames(snapshot, invocation, kind="cancelled", code="cancelled", message="runtime cancellation was requested")
-            return self._retain_g1(snapshot, invocation, fingerprint, frames)
+            return finish(frames)
         if not self._lease_is_valid(lease_valid):
             frames = _g1_failure_frames(snapshot, invocation, kind="failed", code="lease_expired", message="invocation lease is no longer valid")
-            return self._retain_g1(snapshot, invocation, fingerprint, frames)
+            return finish(frames)
         lease_remaining = self._lease_remaining(invocation)
         remaining_duration = invocation.remaining_budget["durationMs"] / 1000.0
         if lease_remaining <= 0:
             frames = _g1_failure_frames(snapshot, invocation, kind="failed", code="lease_expired", message="invocation lease is no longer valid")
-            return self._retain_g1(snapshot, invocation, fingerprint, frames)
-        if remaining_duration <= 0:
-            frames = _g1_failure_frames(snapshot, invocation, kind="failed", code="budget_exhausted", message="cumulative invocation duration budget is exhausted")
-            return self._retain_g1(snapshot, invocation, fingerprint, frames)
+            return finish(frames)
+        if remaining_duration <= 0 or invocation.remaining_budget["inputTokens"] <= 0 or invocation.remaining_budget["outputTokens"] <= 0:
+            frames = _g1_failure_frames(snapshot, invocation, kind="failed", code="budget_exhausted", message="cumulative runtime budget is exhausted")
+            return finish(frames)
         request = canonical_json_bytes({"run": snapshot.to_dict(), "invocation": invocation.to_dict()}) + b"\n"
         policy = snapshot.raw["runtimePolicy"]
-        max_output = min(512 * 1024, max(int(policy["maxEventPayloadBytes"]), int(policy["maxReceiptBytes"])))
-        attestation = self.runner.attest_invocation(_G1_LOCAL_COMMAND, request_fingerprint=fingerprint)
-        if type(attestation) is not _EXACT_ENFORCEMENT_ATTESTATION or attestation.classification != "test" or attestation.argv_digest != _g1_command_digest(_G1_LOCAL_COMMAND):
-            raise RuntimeConfigurationError("G1 runner attestation is not an accepted test boundary")
+        max_output = min(512 * 1024, max(64 * 1024, int(policy["maxEventPayloadBytes"]) * 128))
+        command = self._command
+        attestation = self.runner.attest_invocation(command, request_fingerprint=fingerprint)
+        expected_classification = "production" if command == _G1_PRODUCTION_COMMAND else "test"
+        if type(attestation) is not _EXACT_ENFORCEMENT_ATTESTATION or attestation.classification != expected_classification or attestation.argv_digest != _g1_command_digest(command):
+            raise RuntimeConfigurationError("G1 runner attestation is not an accepted supervisor boundary")
         name = attestation.container_name
         try:
             process = self.runner.launch(
-                _G1_LOCAL_COMMAND,
+                command,
                 input_bytes=request,
                 environment=build_invocation_env(),
                 max_output_bytes=max_output,
@@ -4522,12 +4820,7 @@ class G1InvocationSupervisor:
             except Exception:
                 cleanup = None
             message = "supervisor cleanup was not proven" if cleanup is None or not cleanup.succeeded else "G1 child could not be launched"
-            return self._retain_g1(
-                snapshot,
-                invocation,
-                fingerprint,
-                _g1_failure_frames(snapshot, invocation, kind="failed", code="runtime_error", message=message),
-            )
+            return finish(_g1_failure_frames(snapshot, invocation, kind="failed", code="runtime_error", message=message))
         deadline = self._clock() + min(self.hard_timeout_seconds, remaining_duration, lease_remaining)
         try:
             capture = process.collect(
@@ -4543,15 +4836,10 @@ class G1InvocationSupervisor:
         except Exception:
             cleanup = None
         if cleanup is None:
-            return self._retain_g1(
-                snapshot,
-                invocation,
-                fingerprint,
-                _g1_failure_frames(snapshot, invocation, kind="failed", code="runtime_error", message="supervisor cleanup was not proven"),
-            )
+            return finish(_g1_failure_frames(snapshot, invocation, kind="failed", code="runtime_error", message="supervisor cleanup was not proven"))
         if not cleanup.succeeded:
             frames = _g1_failure_frames(snapshot, invocation, kind="failed", code="runtime_error", message="supervisor cleanup was not proven")
-            return self._retain_g1(snapshot, invocation, fingerprint, frames)
+            return finish(frames)
         if capture.cancelled:
             frames = _g1_failure_frames(snapshot, invocation, kind="cancelled", code="cancelled", message="runtime cancellation was requested")
         elif capture.lease_expired or not self._lease_is_valid(lease_valid):
@@ -4565,21 +4853,16 @@ class G1InvocationSupervisor:
                 frames_raw = [json.loads(line) for line in capture.stdout.splitlines() if line.strip()]
                 if capture.returncode != 0:
                     raise G1ContractError("G1 child exited before terminal evidence")
-                validate_g1_frames(frames_raw, snapshot.to_dict(), invocation.to_dict())
+                validate_g1_frames(
+                    frames_raw,
+                    snapshot.to_dict(),
+                    invocation.to_dict(),
+                    max_stream_bytes=max_output,
+                )
                 frames = tuple(json.dumps(frame, ensure_ascii=False, sort_keys=True, separators=(",", ":")) for frame in frames_raw)
             except Exception:
                 frames = _g1_failure_frames(snapshot, invocation, kind="failed", code="runtime_error", message="runtime output was malformed or exceeded its contract")
-        try:
-            self._record_g1_budget(snapshot.run_id, invocation.remaining_budget, frames)
-        except G1ContractError:
-            frames = _g1_failure_frames(
-                snapshot,
-                invocation,
-                kind="failed",
-                code="budget_exhausted",
-                message="Hermes usage exceeded the cumulative invocation budget",
-            )
-        return self._retain_g1(snapshot, invocation, fingerprint, frames)
+        return finish(frames)
 
     def _retain_g1(
         self,
@@ -4587,6 +4870,8 @@ class G1InvocationSupervisor:
         invocation: G1InvocationEnvelope,
         fingerprint: str,
         frames: tuple[str, ...],
+        *,
+        host_duration_ms: int,
     ) -> tuple[str, ...]:
         key = (snapshot.run_id, invocation.invocation_id)
         value = {
@@ -4595,6 +4880,17 @@ class G1InvocationSupervisor:
             "requestFingerprint": fingerprint,
             "frames": list(frames),
         }
+        try:
+            self._ledger.finalize(
+                run_id=snapshot.run_id,
+                invocation_id=invocation.invocation_id,
+                request_fingerprint=fingerprint,
+                frames=frames,
+                requested_budget=invocation.remaining_budget,
+                host_duration_ms=host_duration_ms,
+            )
+        except G1LedgerError as exc:
+            raise RuntimeConfigurationError("G1 result was not durably retained") from exc
         response = self._retention_authority.create("g1_result", key, value)
         if response.get("status") == "conflict":
             raise G1ContractError("changed replay conflicts with the retained invocation")
@@ -4612,7 +4908,9 @@ __all__ = [
     "EnforcementAttestation",
     "G1InvocationSupervisor",
     "G1LocalTestRunner",
+    "HostCredentialBroker",
     "G1ProcessCapture",
+    "ProductionG1RuntimeRunner",
     "G1RuntimeRunner",
     "InvocationPolicy",
     "InvocationResult",
@@ -4620,6 +4918,7 @@ __all__ = [
     "ProcessCapture",
     "SubprocessDockerRunner",
     "build_invocation_argv",
+    "build_g1_docker_argv",
     "build_invocation_env",
     "invocation_container_name",
 ]

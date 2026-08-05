@@ -5,6 +5,10 @@ from __future__ import annotations
 import json
 import io
 import os
+import shutil
+import stat
+import subprocess
+import tempfile
 import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -16,10 +20,20 @@ from plane_runtime.g1_contract import (
     G1InvocationEnvelope,
     G1RunSnapshot,
     build_event,
+    build_exit,
     validate_g1_frames,
 )
-from plane_runtime.hermes_adapter import HermesKernelAdapter
-from plane_runtime.invocation_supervisor import G1InvocationSupervisor, G1LocalTestRunner, build_invocation_env
+from plane_runtime.g1_ledger import G1RuntimeLedger
+from plane_runtime.hermes_adapter import HermesKernelAdapter, HermesKernelResult, UnixSocketCredentialSource
+from plane_runtime.invocation_supervisor import (
+    G1InvocationSupervisor,
+    G1LocalTestRunner,
+    HostCredentialBroker,
+    InvocationPolicy,
+    ProductionG1RuntimeRunner,
+    build_g1_docker_argv,
+    build_invocation_env,
+)
 from plane_runtime.service import main as service_main
 from plane_runtime.subprocess_transport import RuntimeTransportError, SubprocessRuntimeTransport
 
@@ -136,6 +150,28 @@ def make_plane_accepted_snapshot() -> dict[str, object]:
 
 
 class G1RuntimeProcessTests(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("docker") or os.path.exists("/opt/homebrew/bin/docker"), "Docker CLI is unavailable")
+    def test_real_existing_image_proves_production_docker_attestation(self) -> None:
+        image = "alpine@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce"
+        docker = shutil.which("docker") or "/opt/homebrew/bin/docker"
+        available = subprocess.run((docker, "image", "inspect", image), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+        if not available:
+            self.skipTest("the existing digest-pinned integration image is unavailable")
+        class Credentials:
+            def resolve(self, provider: str) -> dict[str, str]:
+                del provider
+                return {"api_key": "integration-secret"}
+        runner = ProductionG1RuntimeRunner(image=image, credential_source=Credentials(), max_output_bytes=65536)
+        fingerprint = "a" * 64
+        try:
+            attestation = runner.attest_invocation(runner.command, request_fingerprint=fingerprint)
+            self.assertEqual(attestation.classification, "production")
+            self.assertIn("production_docker_attested", attestation.evidence)
+            self.assertNotIn("integration-secret", repr(attestation))
+        finally:
+            runner.cleanup(attestation.container_name if "attestation" in locals() else f"plane-invocation-{fingerprint[:32]}")
+            runner.close()
+
     def test_accepted_plane_g1_fixture_snapshot_conforms(self) -> None:
         snapshot = G1RunSnapshot.from_dict(make_plane_accepted_snapshot())
         envelope_raw = make_invocation(snapshot.to_dict())
@@ -168,6 +204,36 @@ class G1RuntimeProcessTests(unittest.TestCase):
         ):
             self.assertEqual(service_main(["--once"]), 2)
 
+    def test_production_g1_service_routes_to_hermes_and_host_broker(self) -> None:
+        snapshot = make_snapshot()
+        snapshot["runtimePolicy"] = dict(snapshot["runtimePolicy"])  # type: ignore[arg-type]
+        snapshot["runtimePolicy"]["adapter"] = "hermes"  # type: ignore[index]
+        snapshot["contentDigest"] = _digest(
+            "snapshot", {key: value for key, value in snapshot.items() if key != "contentDigest"}
+        )
+        invocation = make_invocation(snapshot)
+        request = json.dumps({"run": snapshot, "invocation": invocation}) + "\n"
+        with mock.patch("plane_runtime.g1_service.HermesKernelAdapter") as adapter:
+            def dispatch(_snapshot, _invocation, _cancellation, emit_body):
+                emit_body(
+                    {
+                        "kind": "progress_observed",
+                        "payload": {"kind": "inline_text", "contentType": "text/plain", "text": "started"},
+                        "publication": {"action": "observation_only"},
+                    }
+                )
+                return HermesKernelResult(kind="completed")
+
+            adapter.return_value.dispatch.side_effect = dispatch
+            output = io.StringIO()
+            with mock.patch("sys.stdin", io.StringIO(request)), mock.patch("sys.stdout", output):
+                self.assertEqual(service_main(["--once", "--g1-production"]), 0)
+            adapter.assert_called_once()
+            source = adapter.call_args.kwargs["credential_source"]
+            self.assertIsInstance(source, UnixSocketCredentialSource)
+        frames = [json.loads(line) for line in output.getvalue().splitlines()]
+        self.assertEqual(validate_g1_frames(frames, snapshot, invocation)[-1]["kind"], "completed")
+
     def test_exact_g1_snapshot_and_envelope_are_immutable_and_bound(self) -> None:
         snapshot = G1RunSnapshot.from_dict(make_snapshot())
         invocation = G1InvocationEnvelope.from_dict(make_invocation(snapshot.to_dict()))
@@ -180,7 +246,7 @@ class G1RuntimeProcessTests(unittest.TestCase):
     def test_real_forked_service_consumes_g1_and_emits_ordered_idempotent_frames(self) -> None:
         snapshot = make_snapshot()
         invocation = make_invocation(snapshot)
-        transport = SubprocessRuntimeTransport()
+        transport = SubprocessRuntimeTransport(test_only=True)
 
         frames = transport.dispatch(json.dumps(snapshot), json.dumps(invocation), lease_valid=lambda: True)
         parsed = validate_g1_frames([json.loads(frame) for frame in frames], snapshot, invocation)
@@ -195,7 +261,7 @@ class G1RuntimeProcessTests(unittest.TestCase):
     def test_malformed_binding_and_changed_replay_fail_before_spawn(self) -> None:
         snapshot = make_snapshot()
         invocation = make_invocation(snapshot)
-        transport = SubprocessRuntimeTransport()
+        transport = SubprocessRuntimeTransport(test_only=True)
 
         changed = dict(invocation)
         changed["runId"] = "run:other"
@@ -212,7 +278,7 @@ class G1RuntimeProcessTests(unittest.TestCase):
     def test_ordering_and_post_exit_frames_are_rejected(self) -> None:
         snapshot = make_snapshot()
         invocation = make_invocation(snapshot)
-        transport = SubprocessRuntimeTransport()
+        transport = SubprocessRuntimeTransport(test_only=True)
         frames = [json.loads(frame) for frame in transport.dispatch(json.dumps(snapshot), json.dumps(invocation), lease_valid=lambda: True)]
 
         event = next(frame for frame in frames if "trust" in frame)
@@ -245,7 +311,7 @@ class G1RuntimeProcessTests(unittest.TestCase):
         invocation = make_invocation(snapshot)
         frames = [
             json.loads(frame)
-            for frame in SubprocessRuntimeTransport().dispatch(
+            for frame in SubprocessRuntimeTransport(test_only=True).dispatch(
                 json.dumps(snapshot), json.dumps(invocation), lease_valid=lambda: True
             )
         ]
@@ -268,7 +334,7 @@ class G1RuntimeProcessTests(unittest.TestCase):
             "snapshot", {key: value for key, value in snapshot.items() if key != "contentDigest"}
         )
         invocation = make_invocation(snapshot)
-        frames = SubprocessRuntimeTransport().dispatch(
+        frames = SubprocessRuntimeTransport(test_only=True).dispatch(
             json.dumps(snapshot), json.dumps(invocation), lease_valid=lambda: True
         )
         parsed = validate_g1_frames([json.loads(frame) for frame in frames], snapshot, invocation)
@@ -305,28 +371,139 @@ class G1RuntimeProcessTests(unittest.TestCase):
                     },
                 },
             )
+        payload_ref_event = build_event(
+            snapshot=snapshot,
+            invocation=invocation,
+            sequence=0,
+            body={
+                "kind": "progress_observed",
+                "payload": {
+                    "kind": "payload_ref",
+                    "payloadRef": "payload:runtime-test",
+                    "contentType": "text/plain",
+                    "contentDigest": "content:" + "d" * 64,
+                    "sizeBytes": 2,
+                },
+                "publication": {"action": "observation_only"},
+            },
+        )
+        self.assertEqual(payload_ref_event["body"]["payload"]["sizeBytes"], 2)
+
+    def test_plane_byte_policy_scopes_artifact_receipt_and_total_stream_independently(self) -> None:
+        snapshot_raw = make_snapshot()
+        snapshot_raw["runtimePolicy"] = dict(snapshot_raw["runtimePolicy"])  # type: ignore[arg-type]
+        snapshot_raw["runtimePolicy"].update({"maxEventPayloadBytes": 4096, "maxArtifactBytes": 1, "maxReceiptBytes": 1})  # type: ignore[index]
+        snapshot_raw["contentDigest"] = _digest(
+            "snapshot", {key: value for key, value in snapshot_raw.items() if key != "contentDigest"}
+        )
+        snapshot = G1RunSnapshot.from_dict(snapshot_raw)
+        invocation = G1InvocationEnvelope.from_dict(make_invocation(snapshot.to_dict()))
+        body = {
+            "kind": "progress_observed",
+            "payload": {"kind": "inline_text", "contentType": "text/plain", "text": "x" * 1500},
+            "publication": {"action": "observation_only"},
+        }
+        frames = [
+            build_event(snapshot=snapshot, invocation=invocation, sequence=0, body=body),
+            build_event(snapshot=snapshot, invocation=invocation, sequence=1, body=body),
+            build_exit(snapshot=snapshot, invocation=invocation, final_sequence=1, kind="completed"),
+        ]
+        self.assertGreater(sum(len(json.dumps(frame, separators=(",", ":")).encode()) for frame in frames), 4096)
+        self.assertEqual(
+            len(validate_g1_frames(frames, snapshot.to_dict(), invocation.to_dict(), max_stream_bytes=8192)),
+            3,
+        )
+        with self.assertRaises(G1ContractError):
+            validate_g1_frames(frames, snapshot.to_dict(), invocation.to_dict(), max_stream_bytes=4096)
         with self.assertRaises(G1ContractError):
             build_event(
                 snapshot=snapshot,
                 invocation=invocation,
                 sequence=0,
                 body={
-                    "kind": "progress_observed",
-                    "payload": {
-                        "kind": "payload_ref",
-                        "payloadRef": "payload:runtime-test",
-                        "contentType": "text/plain",
+                    "kind": "artifact_observed",
+                    "artifact": {
+                        "artifactRef": "artifact:runtime-test",
                         "contentDigest": "content:" + "d" * 64,
+                        "mediaType": "text/plain",
                         "sizeBytes": 2,
                     },
-                    "publication": {"action": "observation_only"},
+                    "publication": {"action": "proposal", "productKind": "artifact", "productRef": "artifact:runtime-test", "operationAttemptRef": "operation-attempt:runtime-test"},
                 },
             )
+        # A receipt policy is for publication receipt metadata, not RuntimeExit.
+        failure_snapshot_raw = make_snapshot()
+        failure_snapshot_raw["runtimePolicy"] = dict(failure_snapshot_raw["runtimePolicy"])  # type: ignore[arg-type]
+        failure_snapshot_raw["runtimePolicy"]["maxReceiptBytes"] = 1  # type: ignore[index]
+        failure_snapshot_raw["contentDigest"] = _digest("snapshot", {key: value for key, value in failure_snapshot_raw.items() if key != "contentDigest"})
+        failure_snapshot = G1RunSnapshot.from_dict(failure_snapshot_raw)
+        failure_invocation = G1InvocationEnvelope.from_dict(make_invocation(failure_snapshot.to_dict()))
+        exit_frame = build_exit(
+            snapshot=failure_snapshot,
+            invocation=failure_invocation,
+            final_sequence=0,
+            kind="failed",
+            failure={"code": "runtime_error", "message": "bounded failure evidence", "retryable": False},
+        )
+        validate_g1_frames([exit_frame], failure_snapshot.to_dict(), failure_invocation.to_dict())
+
+    def test_restart_stable_ledger_replays_exact_bytes_and_marks_unknown(self) -> None:
+        snapshot = make_snapshot()
+        invocation = make_invocation(snapshot)
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "g1.sqlite3")
+            first = SubprocessRuntimeTransport(test_only=True, ledger_path=path)
+            expected = first.dispatch(json.dumps(snapshot), json.dumps(invocation), lease_valid=lambda: True)
+            first.close()
+            replacement = SubprocessRuntimeTransport(test_only=True, ledger_path=path)
+            self.assertEqual(expected, replacement.dispatch(json.dumps(snapshot), json.dumps(invocation), lease_valid=lambda: True))
+            replacement.close()
+            ledger = G1RuntimeLedger(path)
+            changed = dict(invocation)
+            changed["invocationId"] = "invocation:crashed"
+            changed["remainingBudget"] = {"inputTokens": 90, "outputTokens": 90, "durationMs": 9000}
+            fingerprint = __import__("hashlib").sha256(json.dumps({"run": snapshot, "invocation": changed}, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+            claim = ledger.claim(run_id=snapshot["runId"], invocation_id=changed["invocationId"], request_fingerprint=fingerprint, snapshot_digest=snapshot["contentDigest"], total_budget=snapshot["totalBudget"], remaining_budget=changed["remainingBudget"])
+            self.assertTrue(claim.owns_dispatch)
+            ledger.mark_outcome_unknown(run_id=snapshot["runId"], invocation_id=changed["invocationId"], request_fingerprint=fingerprint)
+            self.assertEqual(ledger.claim(run_id=snapshot["runId"], invocation_id=changed["invocationId"], request_fingerprint=fingerprint, snapshot_digest=snapshot["contentDigest"], total_budget=snapshot["totalBudget"], remaining_budget=changed["remainingBudget"]).state, "outcome_unknown")
+
+    def test_production_runner_requires_fixed_broker_mount_and_production_command(self) -> None:
+        image = "alpine@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce"
+        with tempfile.TemporaryDirectory() as directory:
+            source = os.path.join(directory, "broker.sock")
+            argv = build_g1_docker_argv("a" * 64, InvocationPolicy(image), credential_broker_source=source)
+            self.assertIn("--network", argv)
+            self.assertEqual(argv[argv.index("--network") + 1], "none")
+            self.assertIn("--mount", argv)
+            self.assertIn("--g1-production", argv)
+        with self.assertRaises(Exception):
+            ProductionG1RuntimeRunner(image=image, credential_source=object())
+
+    def test_host_credential_broker_is_narrow_and_non_ambient(self) -> None:
+        secret = "host-only-broker-secret"
+
+        class Credentials:
+            def resolve(self, provider: str) -> dict[str, str]:
+                if provider != "test-provider":
+                    raise RuntimeError("provider denied")
+                return {"api_key": secret, "base_url": "https://example.invalid"}
+
+        broker = HostCredentialBroker(Credentials())
+        try:
+            self.assertEqual(stat.S_IMODE(os.stat(os.path.dirname(broker.path)).st_mode), 0o711)
+            source = UnixSocketCredentialSource(path=broker.path)
+            self.assertEqual(source.resolve("test-provider")["api_key"], secret)
+            self.assertEqual(source.resolve("other-provider"), {})
+            self.assertNotIn(secret, build_invocation_env().values())
+        finally:
+            broker.close()
+        self.assertFalse(os.path.exists(broker.path))
 
     def test_changed_replay_conflicts_before_a_second_child(self) -> None:
         snapshot = make_snapshot()
         invocation = make_invocation(snapshot)
-        transport = SubprocessRuntimeTransport()
+        transport = SubprocessRuntimeTransport(test_only=True)
         first = transport.dispatch(json.dumps(snapshot), json.dumps(invocation), lease_valid=lambda: True)
         changed = make_snapshot()
         changed["assignment"] = dict(changed["assignment"])  # type: ignore[arg-type]
@@ -396,12 +573,12 @@ class G1RuntimeProcessTests(unittest.TestCase):
         snapshot = make_snapshot()
         invocation = make_invocation(snapshot)
         with self.assertRaises(RuntimeTransportError):
-            SubprocessRuntimeTransport().dispatch(json.dumps(snapshot), json.dumps(invocation))
+            SubprocessRuntimeTransport(test_only=True).dispatch(json.dumps(snapshot), json.dumps(invocation))
 
     def test_cancellation_and_lease_death_emit_bounded_terminal_evidence(self) -> None:
         snapshot = make_snapshot()
         invocation = make_invocation(snapshot)
-        transport = SubprocessRuntimeTransport()
+        transport = SubprocessRuntimeTransport(test_only=True)
 
         cancelled = threading.Event()
         cancelled.set()
@@ -427,7 +604,7 @@ class G1RuntimeProcessTests(unittest.TestCase):
         old = os.environ.get("HERMES_RUNTIME_API_KEY")
         os.environ["HERMES_RUNTIME_API_KEY"] = secret
         try:
-            frames = SubprocessRuntimeTransport().dispatch(json.dumps(snapshot), json.dumps(invocation), lease_valid=lambda: True)
+            frames = SubprocessRuntimeTransport(test_only=True).dispatch(json.dumps(snapshot), json.dumps(invocation), lease_valid=lambda: True)
         finally:
             if old is None:
                 os.environ.pop("HERMES_RUNTIME_API_KEY", None)
@@ -473,6 +650,8 @@ class G1RuntimeProcessTests(unittest.TestCase):
         self.assertLessEqual(len(result.output_text.encode("utf-8")), 4096)
         self.assertEqual(captured["kwargs"]["enabled_toolsets"], ["safe"])  # type: ignore[index]
         self.assertEqual(captured["kwargs"]["api_key"], "top-secret-value")  # type: ignore[index]
+        self.assertEqual(captured["kwargs"]["max_tokens"], 100)  # type: ignore[index]
+        self.assertEqual(captured["kwargs"]["max_iterations"], 90)  # type: ignore[index]
         self.assertNotIn("top-secret-value", json.dumps(bodies))
 
     def test_hermes_adapter_fails_closed_when_measured_usage_exceeds_budget(self) -> None:
@@ -518,7 +697,7 @@ class G1RuntimeProcessTests(unittest.TestCase):
         second = make_invocation(snapshot)
         second["invocationId"] = "invocation:budget-second"
         second["remainingBudget"] = {"inputTokens": 91, "outputTokens": 90, "durationMs": 9000}
-        transport = SubprocessRuntimeTransport()
+        transport = SubprocessRuntimeTransport(test_only=True)
         transport.dispatch(json.dumps(snapshot), json.dumps(first), lease_valid=lambda: True)
         with self.assertRaises(G1ContractError):
             transport.dispatch(json.dumps(snapshot), json.dumps(second), lease_valid=lambda: True)
@@ -527,14 +706,14 @@ class G1RuntimeProcessTests(unittest.TestCase):
         snapshot = make_snapshot()
         invocation = make_invocation(snapshot)
         invocation["remainingBudget"] = {"inputTokens": 0, "outputTokens": 100, "durationMs": 10000}
-        frames = SubprocessRuntimeTransport().dispatch(json.dumps(snapshot), json.dumps(invocation), lease_valid=lambda: True)
+        frames = SubprocessRuntimeTransport(test_only=True).dispatch(json.dumps(snapshot), json.dumps(invocation), lease_valid=lambda: True)
         exit_frame = validate_g1_frames([json.loads(frame) for frame in frames], snapshot, invocation)[-1]
         self.assertEqual(exit_frame["failure"]["code"], "budget_exhausted")
 
     def test_timeout_terminates_and_reaps_the_invocation_child(self) -> None:
         snapshot = make_snapshot()
         invocation = make_invocation(snapshot)
-        frames = SubprocessRuntimeTransport(timeout_seconds=0.001).dispatch(
+        frames = SubprocessRuntimeTransport(timeout_seconds=0.001, test_only=True).dispatch(
             json.dumps(snapshot), json.dumps(invocation), lease_valid=lambda: True
         )
         exit_frame = validate_g1_frames([json.loads(frame) for frame in frames], snapshot, invocation)[-1]

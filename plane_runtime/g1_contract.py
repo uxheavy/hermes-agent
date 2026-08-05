@@ -182,9 +182,6 @@ def _bounded_budget(value: Any, name: str = "budget") -> dict[str, int]:
 def _bounded_payload(
     value: Any,
     name: str = "payload",
-    *,
-    max_payload_bytes: int = MAX_TEXT_BYTES,
-    max_artifact_bytes: int = 1_048_576,
 ) -> dict[str, Any]:
     data = _object(value, name)
     kind = data.get("kind")
@@ -193,7 +190,7 @@ def _bounded_payload(
         _required(data, {"kind", "contentType", "text"}, name)
         if data["contentType"] != "text/plain":
             raise G1ContractError(f"{name}.contentType must be text/plain")
-        _text(data["text"], f"{name}.text", maximum=min(MAX_TEXT_BYTES, max_payload_bytes))
+        _text(data["text"], f"{name}.text")
         return data
     if kind == "payload_ref":
         _reject_unknown(data, {"kind", "payloadRef", "contentType", "contentDigest", "sizeBytes"}, name)
@@ -202,8 +199,6 @@ def _bounded_payload(
         _token(data["contentType"], f"{name}.contentType")
         _content_ref(data["contentDigest"], f"{name}.contentDigest")
         size_bytes = _bounded_byte_count(data["sizeBytes"], f"{name}.sizeBytes")
-        if size_bytes > max_artifact_bytes:
-            raise G1ContractError(f"{name}.sizeBytes exceeds the selected runtime policy")
         return data
     raise G1ContractError(f"{name}.kind is not a supported bounded payload")
 
@@ -547,7 +542,6 @@ def _validate_event(
     raw: Any,
     *,
     max_event_bytes: int = MAX_EVENT_BYTES,
-    max_payload_bytes: int = MAX_TEXT_BYTES,
     max_artifact_bytes: int = 1_048_576,
 ) -> dict[str, Any]:
     data = _object(raw, "RuntimeEvent")
@@ -570,8 +564,6 @@ def _validate_event(
         _bounded_payload(
             body["payload"],
             "RuntimeEvent.body.payload",
-            max_payload_bytes=max_payload_bytes,
-            max_artifact_bytes=max_artifact_bytes,
         )
         product_kind = {"conversation_publication_observed": "conversation", "outcome_submission_observed": "outcome_submission"}.get(kind)
         _publication(
@@ -669,7 +661,6 @@ def validate_g1_frame(frame: Mapping[str, Any], snapshot: Mapping[str, Any], inv
         _validate_event(
             frame,
             max_event_bytes=event_bytes,
-            max_payload_bytes=min(MAX_TEXT_BYTES, event_bytes),
             max_artifact_bytes=artifact_bytes,
         )
         if "trust" in frame
@@ -695,22 +686,34 @@ def validate_g1_frame(frame: Mapping[str, Any], snapshot: Mapping[str, Any], inv
     return parsed
 
 
-def validate_g1_frames(frames: Sequence[Mapping[str, Any]], snapshot: Mapping[str, Any], invocation: Mapping[str, Any]) -> tuple[dict[str, Any], ...]:
+def validate_g1_frames(
+    frames: Sequence[Mapping[str, Any]],
+    snapshot: Mapping[str, Any],
+    invocation: Mapping[str, Any],
+    *,
+    max_stream_bytes: int = 512 * 1024,
+) -> tuple[dict[str, Any], ...]:
     """Validate one complete direct JSON-lines response from the service."""
 
     snapshot_value = G1RunSnapshot.from_dict(snapshot)
     invocation_value = G1InvocationEnvelope.from_dict(invocation)
     bind_snapshot_and_invocation(snapshot_value, invocation_value)
-    _event_bytes, _artifact_bytes, receipt_bytes = _policy_bounds(snapshot_value.raw)
+    event_bytes, _artifact_bytes, _receipt_bytes = _policy_bounds(snapshot_value.raw)
+    if isinstance(max_stream_bytes, bool) or not isinstance(max_stream_bytes, int) or max_stream_bytes < event_bytes:
+        raise G1ContractError("max_stream_bytes is outside the runtime evidence bound")
     result: list[dict[str, Any]] = []
     seen_event_ids: set[str] = set()
     seen_idempotency_keys: set[str] = set()
     exit_seen = False
     expected_sequence = 0
+    stream_bytes = 0
     for frame in frames:
         if exit_seen:
             raise G1ContractError("runtime emitted a frame after RuntimeExit")
         parsed = validate_g1_frame(frame, snapshot_value.raw, invocation_value.raw)
+        stream_bytes += len(_canonical(parsed))
+        if stream_bytes > max_stream_bytes:
+            raise G1ContractError("runtime evidence stream exceeds the configured retained bound")
         if "trust" in parsed:
             if parsed["eventId"] in seen_event_ids:
                 raise G1ContractError("runtime emitted a duplicate eventId")
@@ -722,8 +725,6 @@ def validate_g1_frames(frames: Sequence[Mapping[str, Any]], snapshot: Mapping[st
                 raise G1ContractError("runtime event sequence is out of order or gapped")
             expected_sequence += 1
         else:
-            if len(_canonical(parsed)) > receipt_bytes:
-                raise G1ContractError("RuntimeExit exceeds the selected runtime policy")
             expected_final_sequence = expected_sequence - 1 if expected_sequence else 0
             if parsed["finalSequence"] != expected_final_sequence:
                 raise G1ContractError("RuntimeExit.finalSequence does not match accepted event sequence")
@@ -772,7 +773,6 @@ def build_event(
     return _validate_event(
         frame,
         max_event_bytes=event_bytes,
-        max_payload_bytes=min(MAX_TEXT_BYTES, event_bytes),
         max_artifact_bytes=artifact_bytes,
     )
 

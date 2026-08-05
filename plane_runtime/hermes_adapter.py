@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import re
+import json
+import socket
 import time
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Protocol, Sequence
@@ -37,6 +39,60 @@ class EnvironmentCredentialSource:
     def resolve(self, provider: str) -> Mapping[str, str]:
         del provider
         return {}
+
+
+@dataclass(frozen=True)
+class UnixSocketCredentialSource:
+    """Read one provider credential from the host-only broker socket.
+
+    The socket path is fixed and non-secret.  The credential value is returned
+    only to this adapter and is never part of the G1 request or child
+    environment.  A missing, malformed, or over-sized broker response fails
+    closed.
+    """
+
+    path: str = "/run/plane-agent-credential-broker/broker.sock"
+    timeout_seconds: float = 2.0
+
+    def resolve(self, provider: str) -> Mapping[str, str]:
+        request = json.dumps({"protocol": "plane.agent-runtime/credentials/v1", "provider": provider}, separators=(",", ":")).encode("utf-8") + b"\n"
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as channel:
+            channel.settimeout(self.timeout_seconds)
+            channel.connect(self.path)
+            channel.sendall(request)
+            response = bytearray()
+            while len(response) <= 16 * 1024:
+                chunk = channel.recv(min(4096, 16 * 1024 + 1 - len(response)))
+                if not chunk:
+                    break
+                response.extend(chunk)
+                if response.endswith(b"\n"):
+                    break
+        if not response.endswith(b"\n"):
+            raise G1ContractError("credential broker response is incomplete")
+        value = json.loads(response[:-1])
+        if not isinstance(value, dict) or value.get("protocol") != "plane.agent-runtime/credentials/v1":
+            raise G1ContractError("credential broker response is invalid")
+        credentials = value.get("credentials")
+        if not isinstance(credentials, dict) or any(not isinstance(k, str) or not isinstance(v, str) for k, v in credentials.items()):
+            raise G1ContractError("credential broker credentials are invalid")
+        return credentials
+
+
+class HermesAuthStoreCredentialSource:
+    """Resolve the active Hermes credential in the trusted host process."""
+
+    def resolve(self, provider: str) -> Mapping[str, str]:
+        from agent.credential_pool import load_pool
+
+        pool = load_pool(provider)
+        entry = pool.current() or next(iter(pool.entries()), None)
+        if entry is None or not entry.runtime_api_key:
+            return {}
+        credentials: dict[str, str] = {"api_key": entry.runtime_api_key}
+        if entry.runtime_base_url:
+            credentials["base_url"] = entry.runtime_base_url
+        return credentials
 
 
 @dataclass(frozen=True)
@@ -189,6 +245,10 @@ class HermesKernelAdapter:
         agent_kwargs: dict[str, Any] = {
             "provider": snapshot.model_provider,
             "model": snapshot.model_name,
+            # This is the model-dispatch output ceiling.  IterationBudget is
+            # only a loop safeguard; it is not the token-budget authority.
+            "max_tokens": max(1, int(invocation.remaining_budget["outputTokens"])),
+            "max_iterations": min(90, max(1, int(invocation.remaining_budget["outputTokens"]))),
             "session_id": invocation.invocation_id,
             "enabled_toolsets": list(self._enabled_toolsets),
             "quiet_mode": True,
@@ -354,6 +414,8 @@ class DeterministicKernelAdapter:
 __all__ = [
     "DeterministicKernelAdapter",
     "EnvironmentCredentialSource",
+    "HermesAuthStoreCredentialSource",
+    "UnixSocketCredentialSource",
     "HermesCheckpointSource",
     "HermesCredentialSource",
     "HermesKernelAdapter",

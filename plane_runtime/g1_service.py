@@ -16,7 +16,7 @@ from .g1_contract import (
     build_exit,
     validate_g1_frames,
 )
-from .hermes_adapter import DeterministicKernelAdapter, HermesKernelAdapter, HermesKernelResult
+from .hermes_adapter import DeterministicKernelAdapter, HermesKernelAdapter, HermesKernelResult, UnixSocketCredentialSource
 
 
 def _runtime_suffix(invocation_id: str) -> str:
@@ -84,7 +84,7 @@ def _terminal_failure(
     )
 
 
-def serve_once_g1(request_line: str, output: TextIO) -> int:
+def serve_once_g1(request_line: str, output: TextIO, *, production: bool = False) -> int:
     """Consume exactly one G1 request and write direct event/exit frames.
 
     The child owns no Plane state.  It validates the immutable inputs, invokes
@@ -114,10 +114,14 @@ def serve_once_g1(request_line: str, output: TextIO) -> int:
             result = _failure_result("lease_expired", "invocation lease is no longer valid")
         elif any(value == 0 for value in invocation.remaining_budget.values()):
             result = _failure_result("budget_exhausted", "cumulative invocation budget is exhausted")
-        elif snapshot.adapter_name == "deterministic-test-adapter":
+        elif snapshot.adapter_name == "deterministic-test-adapter" and not production:
             result = DeterministicKernelAdapter().dispatch(snapshot, invocation, lambda: False, emit_body)
+        elif snapshot.adapter_name == "deterministic-test-adapter" and production:
+            result = _failure_result("runtime_error", "deterministic adapter is test-only")
         else:
-            result = HermesKernelAdapter().dispatch(snapshot, invocation, lambda: False, emit_body)
+            result = HermesKernelAdapter(credential_source=UnixSocketCredentialSource()).dispatch(
+                snapshot, invocation, lambda: False, emit_body
+            )
     except Exception:
         result = _failure_result("runtime_error", "Hermes runtime execution failed", retryable=True)
 
