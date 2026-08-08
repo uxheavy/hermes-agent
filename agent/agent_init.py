@@ -69,6 +69,14 @@ def _ra():
     return run_agent
 
 
+def _validate_http_client_factory(
+    http_client_factory: Optional[Callable[[], Any]],
+) -> None:
+    """Reject invalid trusted HTTP-client construction hooks early."""
+    if http_client_factory is not None and not callable(http_client_factory):
+        raise TypeError("http_client_factory must be callable or None")
+
+
 def _moa_reference_output_allowed(agent: Any) -> bool:
     """Keep MoA display events off only the machine-readable ``-Q`` surface."""
     return not (
@@ -517,6 +525,7 @@ def init_agent(
     checkpoint_max_file_size_mb: int = 10,
     pass_session_id: bool = False,
     requested_provider: str = None,
+    http_client_factory: Optional[Callable[[], Any]] = None,
 ):
     """
     Initialize the AI Agent.
@@ -566,7 +575,11 @@ def init_agent(
         load_soul_identity (bool): If True, still use ~/.hermes/SOUL.md as the primary
             identity even when skip_context_files=True. Project context files from the cwd
             remain skipped.
+        http_client_factory (Callable[[], Any]): Optional trusted construction hook for
+            OpenAI-compatible clients. It must return a fresh HTTP client per call;
+            the SDK client owns and closes the returned client.
     """
+    _validate_http_client_factory(http_client_factory)
     _install_safe_stdio()
 
     agent.model = model
@@ -609,6 +622,13 @@ def init_agent(
         if isinstance(requested_provider, str) and requested_provider.strip()
         else agent.provider
     )
+    # This dependency is intentionally kept outside ``_client_kwargs`` and
+    # ``_primary_runtime``.  It is an invocation-owned construction hook, not
+    # provider configuration: every OpenAI-compatible SDK client asks it for
+    # a fresh HTTP client, and the SDK then owns/closes that HTTP client with
+    # the SDK instance.  Keeping it private also prevents it from entering
+    # session snapshots, trajectories, hooks, or model-facing messages.
+    agent._http_client_factory = http_client_factory
     agent._credential_pool = credential_pool
     agent.acp_command = acp_command or command
     agent.acp_args = list(acp_args or args or [])

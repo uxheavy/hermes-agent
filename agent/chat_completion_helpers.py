@@ -1961,6 +1961,36 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             }
             if _fb_timeout is not None:
                 agent._client_kwargs["timeout"] = _fb_timeout
+
+            # The resolver above is also used by auxiliary callers and
+            # therefore constructs its own SDK client.  When an embedding has
+            # supplied the primary agent's HTTP-client factory, rebuild this
+            # OpenAI-compatible fallback through the same agent seam before
+            # exposing it to the conversation loop.  Native Messages,
+            # Bedrock, MoA, and ACP modes do not enter this branch or do not
+            # use an OpenAI-compatible HTTP client and remain unchanged.
+            http_client_factory = getattr(agent, "__dict__", {}).get(
+                "_http_client_factory"
+            )
+            if (
+                http_client_factory is not None
+                and fb_api_mode in {"chat_completions", "codex_responses"}
+                and fb_provider not in {"copilot-acp", "moa"}
+            ):
+                resolved_client = fb_client
+                try:
+                    fb_client = agent._create_openai_client(
+                        dict(agent._client_kwargs),
+                        reason="fallback",
+                        shared=True,
+                    )
+                finally:
+                    try:
+                        resolved_client.close()
+                    except Exception:
+                        pass
+                agent.client = fb_client
+            if _fb_timeout is not None:
                 # Rebuild the shared OpenAI client so the configured
                 # timeout takes effect on the very next fallback request,
                 # not only after a later credential-rotation rebuild.

@@ -2000,6 +2000,16 @@ def anthropic_prompt_cache_policy(
 
 
 def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: bool) -> Any:
+    """Build a primary OpenAI-compatible client.
+
+    ``agent._http_client_factory`` is an optional trusted embedding seam.  If
+    present, it must return a fresh HTTP client for each invocation.  The
+    returned client is passed only to the SDK instance created by this call;
+    that SDK instance owns its lifecycle and closes the HTTP client when it is
+    closed.  The factory is deliberately not copied into ``client_kwargs`` or
+    any runtime snapshot, so it cannot leak into provider configuration,
+    trajectories, hooks, or model input.
+    """
     from agent.auxiliary_client import _validate_base_url, _validate_proxy_env_urls
     from agent.ssl_verify import resolve_httpx_verify
     # Treat client_kwargs as read-only. Callers pass agent._client_kwargs (or shallow
@@ -2027,6 +2037,20 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
             agent._client_log_context(),
         )
         return client
+    if "http_client" not in client_kwargs:
+        http_client_factory = getattr(agent, "__dict__", {}).get(
+            "_http_client_factory"
+        )
+        if http_client_factory is not None:
+            # Do not catch factory errors: a trusted embedding that cannot
+            # create its invocation-bound client must fail this construction,
+            # not silently fall back to an unrestricted SDK transport.
+            http_client = http_client_factory()
+            if http_client is None:
+                raise TypeError(
+                    "http_client_factory must return a non-None HTTP client"
+                )
+            client_kwargs["http_client"] = http_client
     if agent.provider == "gemini":
         from agent.gemini_native_adapter import GeminiNativeClient, is_native_gemini_base_url
 

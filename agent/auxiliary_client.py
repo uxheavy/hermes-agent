@@ -2713,11 +2713,15 @@ def set_runtime_main(
     api_key: Any = "",
     api_mode: str = "",
     auth_mode: str = "",
+    http_client_factory: Optional[Callable[[], Any]] = None,
 ) -> contextvars.Token:
     """Record the current context's live main runtime for auxiliary routing.
 
     Context-local state prevents concurrent gateway sessions from overwriting
     one another while retaining compatibility mirrors for legacy readers.
+    ``http_client_factory`` is an in-process-only dependency carried for
+    delegated agent construction; it is deliberately excluded from the
+    compatibility mirrors and sanitized auxiliary-runtime snapshots.
     """
     global _RUNTIME_MAIN_PROVIDER, _RUNTIME_MAIN_MODEL
     global _RUNTIME_MAIN_BASE_URL, _RUNTIME_MAIN_API_KEY, _RUNTIME_MAIN_API_MODE
@@ -2735,6 +2739,8 @@ def set_runtime_main(
         "api_mode": (api_mode or "").strip(),
         "auth_mode": (auth_mode or "").strip().lower(),
     }
+    if callable(http_client_factory):
+        runtime["http_client_factory"] = http_client_factory
     # Publish authoritative context before updating locked compatibility
     # mirrors; concurrent sessions never read those mirrors at runtime.
     token = _RUNTIME_MAIN_CONTEXT.set(runtime)
