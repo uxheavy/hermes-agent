@@ -149,7 +149,8 @@ The single production entrypoint is:
 
 ```bash
 python3 -m plane_runtime.g1_runtime_image.bootstrap --once --g1-production \
-  [--plane-host-socket <absolute-path>]
+  [--plane-host-socket <absolute-path>] \
+  [--provider-relay-socket <absolute-path>]
 ```
 
 Its stdin is exactly three canonical JSON-lines frames followed by EOF, in
@@ -168,6 +169,18 @@ not read from the runtime request, environment, model prompt, tool result,
 transcript, event, or generated code. The client opens a fresh local `AF_UNIX`
 stream for each callback and closes it after the one canonical JSON-lines
 response, so the endpoint and connection are invocation-scoped.
+
+Provider-relay mode additionally requires the separately forwarded absolute
+`--provider-relay-socket` and an exact private credential-control map containing
+only `host=api.x.ai`, `path=/v1/chat/completions`, `provider`, `relayToken`, and
+`invocationSocket` (which must match the argument). The child consumes those
+controls before creating `InlineCredentialSource`; Hermes receives only the
+dummy API key `plane-provider-relay`, logical base URL
+`http://plane-provider-relay.invalid/v1`, and `api_mode=chat_completions`.
+Each injected client uses a fresh `httpx.HTTPTransport(uds=..., retries=0)` and
+SDK-owned `httpx.Client`; missing, invalid, or mismatched relay controls fail
+closed. The relay token is never placed in the runtime request, model input,
+trajectory, hook state, environment, or child command.
 
 The trusted parent requests in-process cancellation by sending `SIGUSR1` to
 the bootstrap process. The bootstrap forwards it to the child, whose bounded

@@ -742,6 +742,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--g1-bootstrap-child", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--model-call-allowance", type=int, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--plane-host-socket", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--provider-relay-socket", default=None, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     # Production is authoritative only through the trusted bootstrap.  The
     # marker is private parent-to-child wiring, not a second public entrypoint.
@@ -752,7 +753,11 @@ def main(argv: list[str] | None = None) -> int:
         host_port = None
         try:
             from .g1_service import serve_once_g1
-            from .hermes_adapter import InlineCredentialSource
+            from .hermes_adapter import (
+                InlineCredentialSource,
+                prepare_provider_relay_credentials,
+                validate_absolute_unix_socket_path,
+            )
 
             with _BootstrapCancellation() as cancellation:
                 frames = read_g1_bootstrap_frames(sys.stdin)
@@ -764,16 +769,30 @@ def main(argv: list[str] | None = None) -> int:
                     if args.plane_host_socket is not None
                     else None
                 )
-                source = InlineCredentialSource(frames.credentials, snapshot.model_provider)
+                provider_relay_socket = validate_absolute_unix_socket_path(
+                    args.provider_relay_socket
+                )
+                source_credentials, http_client_factory = prepare_provider_relay_credentials(
+                    frames.credentials,
+                    expected_provider=snapshot.model_provider,
+                    provider_relay_socket=provider_relay_socket,
+                )
+                service_kwargs: dict[str, object] = {
+                    "production": True,
+                    "diagnostics": sys.stderr,
+                    "model_call_allowance": frames.model_call_allowance,
+                    "host_port": host_port,
+                    "credential_source": InlineCredentialSource(
+                        source_credentials, snapshot.model_provider
+                    ),
+                    "cancellation": cancellation,
+                }
+                if http_client_factory is not None:
+                    service_kwargs["http_client_factory"] = http_client_factory
                 return serve_once_g1(
                     request_line,
                     sys.stdout,
-                    production=True,
-                    diagnostics=sys.stderr,
-                    model_call_allowance=frames.model_call_allowance,
-                    host_port=host_port,
-                    credential_source=source,
-                    cancellation=cancellation,
+                    **service_kwargs,
                 )
         except Exception:
             return 2

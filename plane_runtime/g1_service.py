@@ -115,12 +115,15 @@ def serve_once_g1(
     model_call_allowance: int | None = None,
     host_port: PlaneHostPort | None = None,
     credential_source: HermesCredentialSource | None = None,
+    http_client_factory: Callable[[], Any] | None = None,
     cancellation: Callable[[], bool] | None = None,
 ) -> int:
     """Consume exactly one G1 request and write direct event/exit frames.
 
     The child owns no Plane state.  It validates the immutable inputs, invokes
     one Hermes adapter, and returns observations plus runtime evidence only.
+    ``http_client_factory`` is an optional trusted, invocation-scoped
+    dependency and is passed through only when configured.
     """
 
     request = json.loads(request_line)
@@ -158,10 +161,13 @@ def serve_once_g1(
         elif snapshot.adapter_name == "deterministic-test-adapter" and production:
             result = _failure_result("runtime_error", "deterministic adapter is test-only")
         else:
-            result = HermesKernelAdapter(
-                credential_source=credential_source,
-                host_port=host_port,
-            ).dispatch(
+            adapter_kwargs: dict[str, Any] = {
+                "credential_source": credential_source,
+                "host_port": host_port,
+            }
+            if http_client_factory is not None:
+                adapter_kwargs["http_client_factory"] = http_client_factory
+            result = HermesKernelAdapter(**adapter_kwargs).dispatch(
                 snapshot,
                 invocation,
                 cancellation or NeverCancelled(),

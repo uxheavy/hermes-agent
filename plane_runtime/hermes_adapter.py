@@ -9,8 +9,9 @@ import re
 import socket
 import threading
 import time
-from dataclasses import dataclass
-from typing import Any, Callable, Mapping, Protocol, Sequence
+import uuid
+from dataclasses import dataclass, field
+from typing import Any, Callable, Mapping, MutableMapping, Protocol, Sequence
 
 from .g1_contract import (
     G1ContractError,
@@ -31,11 +32,130 @@ _CREDENTIAL_PROTOCOL = "plane.agent-runtime/credentials/v1"
 _MAX_CREDENTIALS = 16
 _MAX_CREDENTIAL_KEY_BYTES = 128
 _MAX_CREDENTIAL_VALUE_BYTES = 16 * 1024
+_MAX_UNIX_SOCKET_PATH_BYTES = 103
+PROVIDER_RELAY_BASE_URL = "http://plane-provider-relay.invalid/v1"
+_PROVIDER_RELAY_HOST = "api.x.ai"
+_PROVIDER_RELAY_PATH = "/v1/chat/completions"
+_PROVIDER_RELAY_FIELDS = frozenset(
+    {"host", "path", "provider", "relayToken", "invocationSocket"}
+)
+_PROVIDER_RELAY_DUMMY_API_KEY = "plane-provider-relay"
 _CODE_MODE_RUNTIME_POLICY_FIELDS = (
     "maxCodeModeInputBytes",
     "maxCodeModeOutputBytes",
     "maxCodeModeCalls",
 )
+
+
+def validate_absolute_unix_socket_path(value: object) -> str | None:
+    """Validate the bounded absolute socket path shared by trusted bootstrap paths."""
+
+    if value is None:
+        return None
+    if (
+        not isinstance(value, str)
+        or not value.startswith("/")
+        or any(ord(char) < 0x20 or ord(char) == 0x7F for char in value)
+        or len(value.encode("utf-8")) > _MAX_UNIX_SOCKET_PATH_BYTES
+    ):
+        raise ValueError("provider relay socket configuration is invalid")
+    return value
+
+
+@dataclass(frozen=True)
+class _ProviderRelayConfig:
+    provider: str
+    relay_token: str = field(repr=False)
+    invocation_socket: str = field(repr=False)
+
+    def http_client_factory(self) -> Callable[[], Any]:
+        """Build fresh SDK-owned HTTP clients bound to this invocation relay."""
+
+        def create_client() -> Any:
+            import httpx
+
+            client_request_id = str(uuid.uuid4())
+
+            def apply_relay_headers(request: Any) -> None:
+                # OpenAI builds request-level headers from ``api_key``.  Apply
+                # the relay credential at the HTTPX request boundary so the
+                # agent can retain a fixed dummy API key without replacing the
+                # relay authorization with a provider credential.
+                request.headers["Authorization"] = f"Bearer {self.relay_token}"
+                request.headers["X-Plane-Relay-Provider"] = self.provider
+                request.headers["X-Request-ID"] = str(uuid.uuid4())
+
+            transport = httpx.HTTPTransport(uds=self.invocation_socket, retries=0)
+            return httpx.Client(
+                transport=transport,
+                base_url=PROVIDER_RELAY_BASE_URL,
+                headers={
+                    "Authorization": f"Bearer {self.relay_token}",
+                    "X-Plane-Relay-Provider": self.provider,
+                    "X-Request-ID": client_request_id,
+                },
+                follow_redirects=False,
+                timeout=None,
+                event_hooks={"request": [apply_relay_headers]},
+            )
+
+        return create_client
+
+
+def prepare_provider_relay_credentials(
+    credentials: MutableMapping[str, str],
+    *,
+    expected_provider: str,
+    provider_relay_socket: str | None,
+) -> tuple[Mapping[str, str], Callable[[], Any] | None]:
+    """Consume relay controls and return dummy Hermes credentials plus a factory.
+
+    A normal credential map is returned unchanged for compatibility.  A relay
+    map must contain exactly the private control fields, and its socket must
+    match the separately forwarded trusted bootstrap argument.  Relay
+    controls are removed before the resulting source can be observed by
+    ``InlineCredentialSource`` or ``AIAgent``.
+    """
+
+    provider_relay_socket = validate_absolute_unix_socket_path(provider_relay_socket)
+    relay_keys = set(credentials) & _PROVIDER_RELAY_FIELDS
+    if not relay_keys:
+        if provider_relay_socket is not None:
+            raise ValueError("provider relay metadata is required")
+        return credentials, None
+    if set(credentials) != _PROVIDER_RELAY_FIELDS:
+        raise ValueError("provider relay metadata is invalid")
+    if provider_relay_socket is None:
+        raise ValueError("provider relay socket is required for relay metadata")
+
+    host = credentials.get("host")
+    path = credentials.get("path")
+    provider = credentials.get("provider")
+    relay_token = credentials.get("relayToken")
+    invocation_socket = credentials.get("invocationSocket")
+    if (
+        host != _PROVIDER_RELAY_HOST
+        or path != _PROVIDER_RELAY_PATH
+        or provider != expected_provider
+        or not isinstance(relay_token, str)
+        or not relay_token
+        or len(relay_token.encode("utf-8")) > _MAX_CREDENTIAL_VALUE_BYTES
+        or any(ord(char) < 0x20 or ord(char) == 0x7F for char in relay_token)
+        or not isinstance(invocation_socket, str)
+        or validate_absolute_unix_socket_path(invocation_socket) != provider_relay_socket
+    ):
+        raise ValueError("provider relay metadata is invalid")
+
+    credentials.clear()
+    config = _ProviderRelayConfig(provider, relay_token, provider_relay_socket)
+    return (
+        {
+            "api_key": _PROVIDER_RELAY_DUMMY_API_KEY,
+            "base_url": PROVIDER_RELAY_BASE_URL,
+            "api_mode": "chat_completions",
+        },
+        config.http_client_factory(),
+    )
 
 
 def _code_mode_is_available(snapshot: G1RunSnapshot) -> bool:
@@ -285,7 +405,10 @@ class HermesKernelAdapter:
     This is deliberately the only Plane-runtime module that imports Hermes'
     agent class.  The factory and host sources are dependency seams for local
     verification; production uses the lazy default factory and trusted host
-    credential source.
+    credential source.  ``http_client_factory`` is an optional invocation-
+    scoped callable that returns a fresh SDK-owned HTTP client for each
+    OpenAI-compatible client construction; it remains private to the live
+    agent and is never part of provider configuration or runtime evidence.
     """
 
     def __init__(
@@ -296,12 +419,16 @@ class HermesKernelAdapter:
         checkpoint_source: HermesCheckpointSource | None = None,
         enabled_toolsets: Sequence[str] = (),
         host_port: PlaneHostPort | None = None,
+        http_client_factory: Callable[[], Any] | None = None,
     ) -> None:
+        if http_client_factory is not None and not callable(http_client_factory):
+            raise TypeError("http_client_factory must be callable or None")
         self._agent_factory = agent_factory or self._default_agent_factory
         self._credential_source = credential_source or EnvironmentCredentialSource()
         self._checkpoint_source = checkpoint_source
         self._enabled_toolsets = tuple(enabled_toolsets)
         self._host_port = host_port
+        self._http_client_factory = http_client_factory
         if host_port is not None:
             # Dynamic and invocation-gated: never part of Hermes' default schema.
             install_plane_tools()
@@ -483,6 +610,8 @@ class HermesKernelAdapter:
             agent_kwargs["api_mode"] = credentials["api_mode"]
         if prefill_messages is not None:
             agent_kwargs["prefill_messages"] = [dict(message) for message in prefill_messages]
+        if self._http_client_factory is not None:
+            agent_kwargs["http_client_factory"] = self._http_client_factory
 
         started_at = time.monotonic()
         agent: Any | None = None
@@ -710,6 +839,9 @@ __all__ = [
     "HermesKernelAdapter",
     "HermesKernelResult",
     "NeverCancelled",
+    "PROVIDER_RELAY_BASE_URL",
     "bound_runtime_text",
+    "prepare_provider_relay_credentials",
     "redact_runtime_text",
+    "validate_absolute_unix_socket_path",
 ]

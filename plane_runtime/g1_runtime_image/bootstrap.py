@@ -19,6 +19,7 @@ import threading
 from typing import Any
 
 from ..g1_bootstrap_contract import G1BootstrapFrames, read_g1_bootstrap_frames
+from ..hermes_adapter import validate_absolute_unix_socket_path
 
 _MODEL_USAGE_PROTOCOL = "plane.agent-runtime/internal-usage/v1"
 _MAX_DIAGNOSTIC_BYTES = 16 * 1024
@@ -35,6 +36,10 @@ def _plane_host_socket(value: object) -> str | None:
     ):
         raise ValueError("Plane host socket configuration is invalid")
     return value
+
+
+def _provider_relay_socket(value: object) -> str | None:
+    return validate_absolute_unix_socket_path(value)
 
 
 def _read_child_diagnostics(stream: Any, result: bytearray, overflow: list[bool]) -> None:
@@ -72,8 +77,10 @@ def _forward_valid_model_usage(raw: bytes, overflow: bool) -> None:
 def _run(
     frames: G1BootstrapFrames,
     plane_host_socket: str | None = None,
+    provider_relay_socket: str | None = None,
 ) -> int:
     plane_host_socket = _plane_host_socket(plane_host_socket)
+    provider_relay_socket = _provider_relay_socket(provider_relay_socket)
     child: subprocess.Popen[bytes] | None = None
     diagnostics = bytearray()
     overflow = [False]
@@ -104,6 +111,8 @@ def _run(
         ]
         if plane_host_socket is not None:
             child_command.extend(("--plane-host-socket", plane_host_socket))
+        if provider_relay_socket is not None:
+            child_command.extend(("--provider-relay-socket", provider_relay_socket))
         child = subprocess.Popen(
             tuple(child_command),
             stdin=subprocess.PIPE,
@@ -145,13 +154,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--g1-production", action="store_true")
     parser.add_argument("--plane-host-socket", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--provider-relay-socket", default=None, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     if not args.once or not args.g1_production:
         return 2
     frames: G1BootstrapFrames | None = None
     try:
         frames = read_g1_bootstrap_frames(sys.stdin)
-        return _run(frames, _plane_host_socket(args.plane_host_socket))
+        return _run(
+            frames,
+            _plane_host_socket(args.plane_host_socket),
+            _provider_relay_socket(args.provider_relay_socket),
+        )
     except Exception:
         if frames is not None:
             frames.clear()
