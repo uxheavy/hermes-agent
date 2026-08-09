@@ -19,17 +19,20 @@ from plane_runtime.hermes_adapter import (
     InlineCredentialSource,
     PROVIDER_RELAY_BASE_URL,
     prepare_provider_relay_credentials,
+    provider_relay_base_url,
 )
 from plane_runtime.service import main as service_main
 
 from tests.plane_runtime.test_g1_runtime_process import make_invocation, make_snapshot, _digest
 
 
-def _hermes_request() -> tuple[dict[str, object], dict[str, object], bytes]:
+def _hermes_request(
+    *, provider: str = "xai", model: str = "grok-test"
+) -> tuple[dict[str, object], dict[str, object], bytes]:
     snapshot = make_snapshot()
     snapshot["runtimePolicy"] = dict(snapshot["runtimePolicy"])  # type: ignore[arg-type]
     snapshot["runtimePolicy"]["adapter"] = "hermes"  # type: ignore[index]
-    snapshot["runtimePolicy"]["model"] = {"provider": "xai", "model": "grok-test"}  # type: ignore[index]
+    snapshot["runtimePolicy"]["model"] = {"provider": provider, "model": model}  # type: ignore[index]
     snapshot["contentDigest"] = _digest(
         "snapshot", {key: value for key, value in snapshot.items() if key != "contentDigest"}
     )
@@ -42,11 +45,22 @@ def _hermes_request() -> tuple[dict[str, object], dict[str, object], bytes]:
     return snapshot, invocation, request
 
 
-def _relay_credentials(socket_path: str, token: str = "relay-secret") -> dict[str, str]:
+def _relay_credentials(
+    socket_path: str,
+    token: str = "relay-secret",
+    *,
+    provider: str = "xai",
+) -> dict[str, str]:
+    if provider == "openai-codex":
+        host = "chatgpt.com"
+        path = "/backend-api/codex/responses"
+    else:
+        host = "api.x.ai"
+        path = "/v1/chat/completions"
     return {
-        "host": "api.x.ai",
-        "path": "/v1/chat/completions",
-        "provider": "xai",
+        "host": host,
+        "path": path,
+        "provider": provider,
         "relayToken": token,
         "invocationSocket": socket_path,
     }
@@ -111,6 +125,175 @@ def test_provider_relay_metadata_is_consumed_and_client_factory_is_exact() -> No
     assert request.headers["X-Plane-Relay-Provider"] == "xai"
     assert request.headers["X-Request-ID"]
     assert request.headers["X-Request-ID"] != "plane-provider-relay"
+
+
+def test_openai_codex_relay_metadata_derives_native_endpoint_and_mode() -> None:
+    socket_path = "/tmp/provider-relay.sock"
+    credentials = _relay_credentials(socket_path, provider="openai-codex")
+
+    agent_credentials, factory = prepare_provider_relay_credentials(
+        credentials,
+        expected_provider="openai-codex",
+        provider_relay_socket=socket_path,
+    )
+
+    assert credentials == {}
+    assert agent_credentials == {
+        "api_key": "plane-provider-relay",
+        "base_url": "http://plane-provider-relay.invalid/backend-api/codex",
+        "api_mode": "codex_responses",
+    }
+    assert provider_relay_base_url("openai-codex") == agent_credentials["base_url"]
+    assert factory is not None
+
+    with mock.patch("httpx.HTTPTransport") as transport, mock.patch(
+        "httpx.Client", return_value=object()
+    ) as client:
+        factory()
+
+    transport.assert_called_once_with(uds=socket_path, retries=0)
+    assert client.call_args.kwargs["base_url"] == agent_credentials["base_url"]
+    assert client.call_args.kwargs["headers"]["X-Plane-Relay-Provider"] == "openai-codex"
+
+    import httpx
+
+    request = httpx.Request(
+        "POST", agent_credentials["base_url"] + "/responses"
+    )
+    request.headers["Authorization"] = "Bearer plane-provider-relay"
+    client.call_args.kwargs["event_hooks"]["request"][0](request)
+    assert request.url.path == "/backend-api/codex/responses"
+    assert request.headers["Authorization"] == "Bearer relay-secret"
+    assert request.headers["X-Plane-Relay-Provider"] == "openai-codex"
+
+
+def test_openai_codex_relay_rejects_mismatched_provider_and_path() -> None:
+    socket_path = "/tmp/provider-relay.sock"
+    credentials = _relay_credentials(socket_path, provider="openai-codex")
+
+    mismatched_provider = credentials.copy()
+    mismatched_provider["provider"] = "xai"
+    with pytest.raises(ValueError, match="metadata"):
+        prepare_provider_relay_credentials(
+            mismatched_provider,
+            expected_provider="openai-codex",
+            provider_relay_socket=socket_path,
+        )
+
+    invalid_path = credentials.copy()
+    invalid_path["path"] = "/backend-api/codex/chat/completions"
+    with pytest.raises(ValueError, match="metadata"):
+        prepare_provider_relay_credentials(
+            invalid_path,
+            expected_provider="openai-codex",
+            provider_relay_socket=socket_path,
+        )
+
+
+def test_production_service_passes_only_dummy_openai_codex_credentials() -> None:
+    snapshot, _invocation, request = _hermes_request(provider="openai-codex", model="gpt-5.5")
+    socket_path = "/tmp/provider-relay.sock"
+    frames = G1BootstrapFrames(
+        1,
+        _relay_credentials(socket_path, provider="openai-codex"),
+        request,
+    )
+    payload = bytes(frames.child_bytes())
+    frames.clear()
+    output = io.StringIO()
+
+    with mock.patch("plane_runtime.g1_service.HermesKernelAdapter") as adapter:
+        def dispatch_result(_snapshot, _invocation, _cancellation, emit_body, **_kwargs):
+            emit_body(
+                {
+                    "kind": "progress_observed",
+                    "payload": {
+                        "kind": "inline_text",
+                        "contentType": "text/plain",
+                        "text": "started",
+                    },
+                    "publication": {"action": "observation_only"},
+                }
+            )
+            return HermesKernelResult(kind="completed")
+
+        adapter.return_value.dispatch.side_effect = dispatch_result
+        with mock.patch("sys.stdin", _BinaryStdin(payload)), mock.patch("sys.stdout", output):
+            assert service_main(
+                [
+                    "--once",
+                    "--g1-production",
+                    "--g1-bootstrap-child",
+                    "--provider-relay-socket",
+                    socket_path,
+                ]
+            ) == 0
+
+    adapter_kwargs = adapter.call_args.kwargs
+    source = adapter_kwargs["credential_source"]
+    assert isinstance(source, InlineCredentialSource)
+    assert source.expected_provider == "openai-codex"
+    assert source.credentials == {
+        "api_key": "plane-provider-relay",
+        "base_url": "http://plane-provider-relay.invalid/backend-api/codex",
+        "api_mode": "codex_responses",
+    }
+    assert "relay-secret" not in output.getvalue()
+    assert "chatgpt.com" not in output.getvalue()
+    assert snapshot["runtimePolicy"]["model"]["provider"] == "openai-codex"  # type: ignore[index]
+
+
+def test_default_adapter_factory_passes_openai_codex_identity_and_transport() -> None:
+    snapshot, _invocation, _request = _hermes_request(
+        provider="openai-codex", model="gpt-5.5"
+    )
+    snapshot_model = G1RunSnapshot.from_dict(snapshot)
+    invocation_model = G1InvocationEnvelope.from_dict(make_invocation(snapshot_model.to_dict()))
+    captured: dict[str, object] = {}
+    factory = lambda: object()
+
+    class FakeAgent:
+        session_api_calls = 1
+
+        def run_conversation(self, message: str, *, system_message: str) -> dict[str, str]:
+            del message, system_message
+            return {"final_response": "done"}
+
+    def constructor(**kwargs: object) -> FakeAgent:
+        captured.update(kwargs)
+        return FakeAgent()
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = constructor  # type: ignore[attr-defined]
+    relay_credentials = _relay_credentials(
+        "/tmp/provider-relay.sock", provider="openai-codex"
+    )
+    agent_credentials, _relay_factory = prepare_provider_relay_credentials(
+        relay_credentials,
+        expected_provider="openai-codex",
+        provider_relay_socket="/tmp/provider-relay.sock",
+    )
+    with mock.patch.dict(sys.modules, {"run_agent": fake_run_agent}):
+        result = HermesKernelAdapter(
+            credential_source=InlineCredentialSource(
+                agent_credentials, "openai-codex"
+            ),
+            http_client_factory=factory,
+        ).dispatch(
+            snapshot_model,
+            invocation_model,
+            lambda: False,
+            lambda _body: None,
+            model_call_allowance=1,
+        )
+
+    assert result.kind == "completed"
+    assert captured["provider"] == "openai-codex"
+    assert captured["model"] == "gpt-5.5"
+    assert captured["base_url"] == "http://plane-provider-relay.invalid/backend-api/codex"
+    assert captured["api_mode"] == "codex_responses"
+    assert captured["api_key"] == "plane-provider-relay"
+    assert captured["http_client_factory"] is factory
 
 
 def test_provider_relay_rejects_missing_or_invalid_socket() -> None:

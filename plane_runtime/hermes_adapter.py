@@ -11,6 +11,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import Any, Callable, Mapping, MutableMapping, Protocol, Sequence
 
 from .g1_contract import (
@@ -33,9 +34,7 @@ _MAX_CREDENTIALS = 16
 _MAX_CREDENTIAL_KEY_BYTES = 128
 _MAX_CREDENTIAL_VALUE_BYTES = 16 * 1024
 _MAX_UNIX_SOCKET_PATH_BYTES = 103
-PROVIDER_RELAY_BASE_URL = "http://plane-provider-relay.invalid/v1"
-_PROVIDER_RELAY_HOST = "api.x.ai"
-_PROVIDER_RELAY_PATH = "/v1/chat/completions"
+_PROVIDER_RELAY_ORIGIN = "http://plane-provider-relay.invalid"
 _PROVIDER_RELAY_FIELDS = frozenset(
     {"host", "path", "provider", "relayToken", "invocationSocket"}
 )
@@ -63,10 +62,74 @@ def validate_absolute_unix_socket_path(value: object) -> str | None:
 
 
 @dataclass(frozen=True)
+class _ProviderRelaySpec:
+    """Bounded provider contract enforced before the child gets an SDK client."""
+
+    host: str
+    path: str
+    api_mode: str
+
+    @property
+    def logical_base_path(self) -> str:
+        base_path, separator, _leaf = self.path.rpartition("/")
+        if not separator or not base_path.startswith("/"):
+            raise RuntimeError("provider relay registry contains an invalid path")
+        return base_path
+
+    @property
+    def logical_base_url(self) -> str:
+        return _PROVIDER_RELAY_ORIGIN + self.logical_base_path
+
+
+# The relay is the trusted egress authority.  These entries describe only the
+# exact upstream target and the Hermes transport needed for that target; they
+# are not user-controlled endpoint configuration.  The logical base URL is
+# derived from ``path`` so the Responses/chat-completions suffix is appended by
+# the existing Hermes client in the normal way.
+_PROVIDER_RELAY_SPECS: Mapping[str, _ProviderRelaySpec] = MappingProxyType(
+    {
+        "openai-codex": _ProviderRelaySpec(
+            host="chatgpt.com",
+            path="/backend-api/codex/responses",
+            api_mode="codex_responses",
+        ),
+        "xai": _ProviderRelaySpec(
+            host="api.x.ai",
+            path="/v1/chat/completions",
+            api_mode="chat_completions",
+        ),
+        "xai-oauth": _ProviderRelaySpec(
+            host="api.x.ai",
+            path="/v1/chat/completions",
+            api_mode="chat_completions",
+        ),
+    }
+)
+
+
+def _provider_relay_spec(provider: object) -> _ProviderRelaySpec:
+    if not isinstance(provider, str) or provider not in _PROVIDER_RELAY_SPECS:
+        raise ValueError("provider relay metadata is invalid")
+    return _PROVIDER_RELAY_SPECS[provider]
+
+
+def provider_relay_base_url(provider: str) -> str:
+    """Return the logical relay base URL for one supported provider."""
+
+    return _provider_relay_spec(provider).logical_base_url
+
+
+# Compatibility for existing xAI adapter callers.  Routing is registry-owned;
+# this alias is not consulted by relay validation or client construction.
+PROVIDER_RELAY_BASE_URL = provider_relay_base_url("xai")
+
+
+@dataclass(frozen=True)
 class _ProviderRelayConfig:
     provider: str
     relay_token: str = field(repr=False)
     invocation_socket: str = field(repr=False)
+    base_url: str
 
     def http_client_factory(self) -> Callable[[], Any]:
         """Build fresh SDK-owned HTTP clients bound to this invocation relay."""
@@ -88,7 +151,7 @@ class _ProviderRelayConfig:
             transport = httpx.HTTPTransport(uds=self.invocation_socket, retries=0)
             return httpx.Client(
                 transport=transport,
-                base_url=PROVIDER_RELAY_BASE_URL,
+                base_url=self.base_url,
                 headers={
                     "Authorization": f"Bearer {self.relay_token}",
                     "X-Plane-Relay-Provider": self.provider,
@@ -128,14 +191,15 @@ def prepare_provider_relay_credentials(
     if provider_relay_socket is None:
         raise ValueError("provider relay socket is required for relay metadata")
 
+    spec = _provider_relay_spec(expected_provider)
     host = credentials.get("host")
     path = credentials.get("path")
     provider = credentials.get("provider")
     relay_token = credentials.get("relayToken")
     invocation_socket = credentials.get("invocationSocket")
     if (
-        host != _PROVIDER_RELAY_HOST
-        or path != _PROVIDER_RELAY_PATH
+        host != spec.host
+        or path != spec.path
         or provider != expected_provider
         or not isinstance(relay_token, str)
         or not relay_token
@@ -147,12 +211,17 @@ def prepare_provider_relay_credentials(
         raise ValueError("provider relay metadata is invalid")
 
     credentials.clear()
-    config = _ProviderRelayConfig(provider, relay_token, provider_relay_socket)
+    config = _ProviderRelayConfig(
+        provider,
+        relay_token,
+        provider_relay_socket,
+        spec.logical_base_url,
+    )
     return (
         {
             "api_key": _PROVIDER_RELAY_DUMMY_API_KEY,
-            "base_url": PROVIDER_RELAY_BASE_URL,
-            "api_mode": "chat_completions",
+            "base_url": spec.logical_base_url,
+            "api_mode": spec.api_mode,
         },
         config.http_client_factory(),
     )
@@ -842,6 +911,7 @@ __all__ = [
     "PROVIDER_RELAY_BASE_URL",
     "bound_runtime_text",
     "prepare_provider_relay_credentials",
+    "provider_relay_base_url",
     "redact_runtime_text",
     "validate_absolute_unix_socket_path",
 ]
