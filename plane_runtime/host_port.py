@@ -579,6 +579,7 @@ class PlaneHostBinding:
     records: list[HostCallRecord] = field(default_factory=list)
     described_operation_refs: set[str] = field(default_factory=set, init=False, repr=False)
     _fatal_error: str | None = field(default=None, init=False, repr=False)
+    _fatal_error_after_terminal: bool = field(default=False, init=False, repr=False)
     _terminal_action_reason: str | None = field(default=None, init=False, repr=False)
     _terminal_action_result: HostCallResult | None = field(default=None, init=False, repr=False)
     _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
@@ -606,6 +607,13 @@ class PlaneHostBinding:
         return self._fatal_error
 
     @property
+    def fatal_error_after_terminal(self) -> bool:
+        """Whether the first fatal host result arrived after terminal state."""
+
+        with self._lock:
+            return self._fatal_error_after_terminal
+
+    @property
     def publication_count(self) -> int:
         return sum(1 for item in self.records if item.request.action == "publish")
 
@@ -618,6 +626,7 @@ class PlaneHostBinding:
     def _fail(self, message: str) -> None:
         if self._fatal_error is None:
             self._fatal_error = message[:2048]
+            self._fatal_error_after_terminal = self._terminal_action_reason is not None
 
     def _schema_is_disclosed(self, operation_ref: str) -> bool:
         return operation_ref in self.eager_operation_refs or operation_ref in self.described_operation_refs

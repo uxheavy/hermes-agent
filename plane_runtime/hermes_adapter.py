@@ -882,7 +882,11 @@ class HermesKernelAdapter:
                 failure_message="runtime cancellation was requested",
                 retryable=False,
             )
-        if host_binding is not None and host_binding.fatal_error is not None:
+        if (
+            host_binding is not None
+            and host_binding.fatal_error is not None
+            and not host_binding.fatal_error_after_terminal
+        ):
             return HermesKernelResult(
                 kind="failed",
                 failure_code="runtime_error",

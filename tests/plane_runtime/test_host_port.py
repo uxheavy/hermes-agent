@@ -824,6 +824,62 @@ class HostPortTests(unittest.TestCase):
             ["progress_observed", "outcome_submission_observed"],
         )
 
+    def test_pre_terminal_host_failure_remains_fatal_after_later_terminal(self) -> None:
+        calls: list[dict] = []
+
+        def rpc(request: dict) -> dict:
+            calls.append(request)
+            if request["action"] == "read":
+                return _result(
+                    request,
+                    status="unavailable",
+                    errorCode="OPERATION_UNAVAILABLE",
+                    errorMessage="required operation is unavailable",
+                )
+            return _result(
+                request,
+                output={"published": True},
+                publication={
+                    "action": "applied",
+                    "productKind": "outcome_submission",
+                    "productRef": "outcome-submission:test",
+                    "operationAttemptRef": "operation-attempt:attempt-1",
+                    "operationRef": "operation:conversation-publish",
+                    "applicationServiceRef": "application-service:conversation",
+                    "gatewayReceiptRef": "gateway-receipt:receipt-1",
+                    "receiptRef": "receipt:receipt-1",
+                    "auditReceiptRef": "audit-receipt:audit-1",
+                    "productEventRef": "product-event:event-1",
+                },
+            )
+
+        binding = PlaneHostBinding(
+            port=CallablePlaneHostPort(rpc),
+            run_id="run:test",
+            invocation_id="invocation:test",
+            correlation_id="correlation:test",
+            cancellation=lambda: False,
+            emit_body=lambda _body: None,
+        )
+        failed = binding.call(
+            action="read",
+            operation_ref="operation:read@1",
+            input={},
+            source="model",
+        )
+        binding.publish(
+            kind="outcome",
+            operation_ref="operation:conversation-publish@1",
+            resource_ref="outcome-submission:test",
+            content="bounded outcome",
+        )
+
+        self.assertEqual(failed.status, "unavailable")
+        self.assertEqual(binding.terminal_action_reason(), "product_outcome_published")
+        self.assertFalse(binding.fatal_error_after_terminal)
+        self.assertIsNotNone(binding.fatal_error)
+        self.assertEqual([request["action"] for request in calls], ["read", "publish"])
+
     def test_replayed_applied_outcome_on_fresh_binding_does_not_signal(self) -> None:
         bodies: list[dict] = []
 
@@ -1455,6 +1511,183 @@ class HostPortTests(unittest.TestCase):
             1,
         )
         self.assertEqual(sum(body["kind"] == "usage_observed" for body in bodies), 1)
+        self.assertFalse(any(body["kind"] == "transcript_evidence_observed" for body in bodies))
+        self.assertNotIn("Hermes invocation completed.", json.dumps(bodies))
+
+    def test_post_terminal_host_failure_does_not_overturn_applied_outcome(self) -> None:
+        from tests.plane_runtime.test_g1_runtime_process import (
+            G1InvocationEnvelope,
+            G1RunSnapshot,
+            _digest,
+            make_invocation,
+            make_snapshot,
+        )
+        from plane_runtime.hermes_adapter import HermesKernelAdapter
+        from run_agent import AIAgent
+
+        snapshot_raw = make_snapshot()
+        snapshot_raw["runtimePolicy"] = dict(snapshot_raw["runtimePolicy"])  # type: ignore[index]
+        snapshot_raw["runtimePolicy"]["adapter"] = "hermes"  # type: ignore[index]
+        snapshot_raw["runtimePolicy"]["model"] = {  # type: ignore[index]
+            "provider": "openai",
+            "model": "deterministic-local",
+        }
+        snapshot_raw["contentDigest"] = _digest(  # type: ignore[assignment]
+            "snapshot",
+            {key: value for key, value in snapshot_raw.items() if key != "contentDigest"},
+        )
+        snapshot = G1RunSnapshot.from_dict(snapshot_raw)
+        invocation = G1InvocationEnvelope.from_dict(make_invocation(snapshot.to_dict()))
+
+        class Completions:
+            calls = 0
+
+            @staticmethod
+            def tool_call(name: str, arguments: dict[str, object], call_id: str) -> SimpleNamespace:
+                return SimpleNamespace(
+                    id=call_id,
+                    function=SimpleNamespace(
+                        name=name,
+                        arguments=json.dumps(arguments),
+                    ),
+                    extra_content=None,
+                )
+
+            def create(self, **_kwargs: object):
+                self.calls += 1
+                if self.calls != 1:
+                    raise AssertionError("terminal publication must stop before provider call N+1")
+                tool_calls = [
+                    self.tool_call(
+                        "tool_call",
+                        {
+                            "name": "plane_publish",
+                            "arguments": {
+                                "kind": "outcome",
+                                "operationRef": "operation:conversation-publish",
+                                "resourceRef": "outcome-submission:test",
+                                "content": "bounded outcome",
+                            },
+                        },
+                        "call-outcome",
+                    ),
+                    self.tool_call(
+                        "tool_call",
+                        {
+                            "name": "plane_operation",
+                            "arguments": {
+                                "action": "read",
+                                "operationRef": "operation:work-item-read",
+                                "input": {"workItemRef": "work-item:test"},
+                            },
+                        },
+                        "call-late-read",
+                    ),
+                ]
+                return SimpleNamespace(
+                    choices=[
+                        SimpleNamespace(
+                            finish_reason="tool_calls",
+                            message=SimpleNamespace(
+                                content=None,
+                                tool_calls=tool_calls,
+                                reasoning=None,
+                                reasoning_content=None,
+                                refusal=None,
+                            ),
+                        )
+                    ],
+                    usage=SimpleNamespace(
+                        prompt_tokens=1,
+                        completion_tokens=1,
+                        total_tokens=2,
+                    ),
+                )
+
+        class Client:
+            def __init__(self) -> None:
+                self.completions = Completions()
+                self.chat = SimpleNamespace(completions=self.completions)
+
+        class Credentials:
+            def resolve(self, provider: str) -> dict[str, str]:
+                del provider
+                return {
+                    "api_key": "model-only-secret",
+                    "base_url": "http://127.0.0.1",
+                    "api_mode": "chat_completions",
+                }
+
+        client = Client()
+
+        def agent_factory(**kwargs: object) -> AIAgent:
+            agent = AIAgent(**kwargs)
+            agent._create_request_openai_client = lambda **_: client  # type: ignore[method-assign]
+            return agent
+
+        requests: list[dict] = []
+
+        def rpc(request: dict) -> dict:
+            requests.append(request)
+            if request["action"] == "publish":
+                return _result(
+                    request,
+                    output={"published": True},
+                    publication={
+                        "action": "applied",
+                        "productKind": "outcome_submission",
+                        "productRef": "outcome-submission:test",
+                        "operationAttemptRef": "operation-attempt:attempt-1",
+                        "operationRef": "operation:conversation-publish",
+                        "applicationServiceRef": "application-service:conversation",
+                        "gatewayReceiptRef": "gateway-receipt:receipt-1",
+                        "receiptRef": "receipt:receipt-1",
+                        "auditReceiptRef": "audit-receipt:audit-1",
+                        "productEventRef": "product-event:event-1",
+                    },
+                )
+            return _result(
+                request,
+                status="unavailable",
+                output={"available": False},
+                errorCode="OPERATION_UNAVAILABLE",
+                errorMessage="required operation is unavailable",
+            )
+
+        bodies: list[dict] = []
+        with mock.patch.dict(os.environ, {"HERMES_HOME": _TEST_HERMES_HOME.name}):
+            import run_agent
+
+            run_agent._hermes_home = Path(_TEST_HERMES_HOME.name)
+            result = HermesKernelAdapter(
+                agent_factory=agent_factory,
+                credential_source=Credentials(),
+                host_port=CallablePlaneHostPort(rpc),
+            ).dispatch(
+                snapshot,
+                invocation,
+                lambda: False,
+                bodies.append,
+                model_call_allowance=2,
+            )
+
+        self.assertEqual(result.kind, "completed")
+        self.assertEqual(result.output_text, "")
+        self.assertEqual(result.model_calls, 1)
+        self.assertEqual(client.completions.calls, 1)
+        self.assertEqual([request["action"] for request in requests], ["publish", "read"])
+        self.assertEqual(
+            [
+                body["payload"]["text"]
+                for body in bodies
+                if body["kind"] == "progress_observed"
+                and body["payload"]["text"].startswith("Plane host ")
+            ],
+            [
+                "Plane host model publish operation:conversation-publish -> ok",
+                "Plane host model read operation:work-item-read -> unavailable",
+            ],
+        )
         self.assertFalse(any(body["kind"] == "transcript_evidence_observed" for body in bodies))
         self.assertNotIn("Hermes invocation completed.", json.dumps(bodies))
 
