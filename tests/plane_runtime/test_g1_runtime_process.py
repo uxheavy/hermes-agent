@@ -77,7 +77,38 @@ def make_snapshot() -> dict[str, object]:
         "context": [],
         "toolCatalog": {
             "catalogDigest": "content:" + "c" * 64,
-            "eagerOperations": [],
+            "eagerOperations": [
+                {
+                    "operationRef": "operation:work_item.read",
+                    "schemaDigest": "content:" + "d" * 64,
+                    "inputSchema": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": ["project_id", "issue_id"],
+                        "properties": {
+                            "project_id": {"type": "string"},
+                            "issue_id": {"type": "string"},
+                        },
+                    },
+                    "disclosure": "eager",
+                },
+                *[
+                    {
+                        "operationRef": operation_ref,
+                        "schemaDigest": "content:" + "e" * 64,
+                        "inputSchema": {"type": "object"},
+                        "disclosure": "eager",
+                    }
+                    for operation_ref in (
+                        "operation:work-item-get",
+                        "operation:compose",
+                        "operation:work-item-update",
+                        "operation:read",
+                        "operation:work-item-read",
+                        "operation:conversation-publish",
+                    )
+                ],
+            ],
         },
         "runtimePolicy": {
             "model": {"provider": "test-provider", "model": "test-model"},
@@ -148,6 +179,16 @@ def make_plane_accepted_snapshot() -> dict[str, object]:
             {
                 "operationRef": "operation:search_workspace",
                 "schemaDigest": "content:" + "d" * 64,
+                "inputSchema": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["query"],
+                    "properties": {
+                        "query": {"type": "string", "maxLength": 255},
+                        "limit": {"type": "integer", "minimum": 1, "maximum": 50},
+                        "cursor": {"type": "string", "maxLength": 32},
+                    },
+                },
                 "disclosure": "eager",
             }
         ],
@@ -319,7 +360,7 @@ class G1RuntimeProcessTests(unittest.TestCase):
                             "name": "plane_operation",
                             "arguments": {
                                 "action": "read",
-                                "operationRef": "operation:work-item-get@1",
+                                "operationRef": "operation:work-item-get",
                                 "input": {"workItemRef": "work-item:test"},
                             },
                         }
@@ -333,7 +374,7 @@ class G1RuntimeProcessTests(unittest.TestCase):
                             "name": "plane_operation",
                             "arguments": {
                                 "action": "code",
-                                "operationRef": "operation:compose@1",
+                                "operationRef": "operation:compose",
                                 "input": {"workItemRef": "work-item:forged"},
                             },
                         }
@@ -343,7 +384,7 @@ class G1RuntimeProcessTests(unittest.TestCase):
                         arguments = {
                             "code": (
                                 "from hermes_tools import plane_operation\n"
-                                "print(plane_operation('code', 'operation:compose@1', "
+                                "print(plane_operation('code', 'operation:compose', "
                                 "{'workItemRef': 'work-item:test'}))"
                             )
                         }
@@ -1211,6 +1252,65 @@ class G1RuntimeProcessTests(unittest.TestCase):
         self.assertEqual(captured["kwargs"]["iteration_budget"].max_total, 3)  # type: ignore[index]
         self.assertEqual(result.model_calls, 2)
         self.assertNotIn("top-secret-value", json.dumps(bodies))
+
+    def test_hermes_adapter_prompt_contains_assignment_and_eager_operation_schema(self) -> None:
+        snapshot_raw = make_snapshot()
+        snapshot_raw["assignment"] = {
+            **snapshot_raw["assignment"],  # type: ignore[typeddict-item]
+            "targetRef": "target:issue-42",
+            "objective": "Read the assigned work item.",
+            "acceptanceCriteria": ["Return the work item fields."],
+        }
+        snapshot_raw["toolCatalog"] = {
+            "catalogDigest": "content:" + "c" * 64,
+            "eagerOperations": [
+                {
+                    "operationRef": "operation:work_item.read",
+                    "schemaDigest": "content:" + "d" * 64,
+                    "inputSchema": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": ["project_id", "issue_id"],
+                        "properties": {
+                            "project_id": {"type": "string"},
+                            "issue_id": {"type": "string"},
+                        },
+                    },
+                    "disclosure": "eager",
+                }
+            ],
+        }
+        snapshot_raw["contentDigest"] = _digest(
+            "snapshot",
+            {key: value for key, value in snapshot_raw.items() if key != "contentDigest"},
+        )
+        snapshot = G1RunSnapshot.from_dict(snapshot_raw)
+        invocation = G1InvocationEnvelope.from_dict(make_invocation(snapshot_raw))
+        captured: dict[str, object] = {}
+
+        class FakeAgent:
+            session_api_calls = 1
+
+            def run_conversation(self, message: str, *, system_message: str) -> dict[str, str]:
+                captured["message"] = message
+                captured["system_message"] = system_message
+                return {"final_response": "bounded"}
+
+        class Credentials:
+            def resolve(self, provider: str) -> dict[str, str]:
+                del provider
+                return {"api_key": "trusted-host-secret"}
+
+        HermesKernelAdapter(
+            agent_factory=lambda **kwargs: FakeAgent(),
+            credential_source=Credentials(),
+        ).dispatch(snapshot, invocation, lambda: False, lambda body: None, model_call_allowance=1)
+
+        prompt = str(captured["system_message"])
+        self.assertIn("target:issue-42", prompt)
+        self.assertIn("Return the work item fields.", prompt)
+        self.assertIn('"project_id"', prompt)
+        self.assertIn('"issue_id"', prompt)
 
     def test_hermes_adapter_interrupts_running_agent_from_trusted_cancellation(self) -> None:
         snapshot_raw = make_snapshot()

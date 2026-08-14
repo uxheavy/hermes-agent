@@ -28,6 +28,7 @@ from .host_port import (
     bind_plane_host,
     install_plane_tools,
 )
+from .presentation import PresentationBoundsError, build_model_guidance
 
 
 _CREDENTIAL_PROTOCOL = "plane.agent-runtime/credentials/v1"
@@ -583,6 +584,16 @@ class HermesKernelAdapter:
 
         event_limit = int(snapshot.raw["runtimePolicy"]["maxEventPayloadBytes"])
         try:
+            prompt = build_model_guidance(snapshot)
+        except PresentationBoundsError:
+            return HermesKernelResult(
+                kind="failed",
+                failure_code="runtime_error",
+                failure_message="Plane invocation guidance exceeds its prompt bound",
+                failure_cause="static_configuration_failure",
+                retryable=False,
+            )
+        try:
             credentials = dict(self._credential_source.resolve(snapshot.model_provider))
         except Exception:
             return HermesKernelResult(
@@ -700,6 +711,10 @@ class HermesKernelAdapter:
                 correlation_id=invocation.correlation_id,
                 cancellation=cancellation,
                 emit_body=emit_body,
+                eager_operation_refs=frozenset(
+                    str(operation["operationRef"])
+                    for operation in snapshot.eager_operations
+                ),
             )
             if self._host_port is not None
             else None
@@ -713,12 +728,6 @@ class HermesKernelAdapter:
             setattr(agent, "_plane_runtime_terminal_budget_failure", True)
             cancellation_monitor = _CancellationMonitor(cancellation, agent)
             cancellation_monitor.start()
-            prompt = (
-                f"{snapshot.behavioral_prompt}\n\n"
-                f"Assignment objective: {snapshot.objective}\n"
-                "Context references are Plane-owned and immutable: "
-                + ", ".join(str(item["contextRef"]) for item in snapshot.raw["context"])
-            )
             if host_binding is None:
                 with contextlib.redirect_stdout(io.StringIO()):
                     result = agent.run_conversation(snapshot.objective, system_message=prompt)

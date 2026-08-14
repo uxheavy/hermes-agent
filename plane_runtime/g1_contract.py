@@ -21,19 +21,24 @@ MAX_REFERENCE_BYTES = 128
 MAX_TEXT_BYTES = 4_096
 MAX_PROMPT_BYTES = 32_768
 MAX_TOKEN_BYTES = 256
-MAX_SNAPSHOT_BYTES = 128 * 1024
+MAX_SNAPSHOT_BYTES = 1_048_576
 MAX_INVOCATION_BYTES = 16 * 1024
 MAX_EVENT_BYTES = 16 * 1024
 MAX_INTEGER = 2_147_483_647
+MAX_EAGER_OPERATIONS = 64
+MAX_EAGER_INPUT_SCHEMA_BYTES = 16 * 1024
+MAX_EAGER_PRESENTATION_BYTES = 512 * 1024
+MAX_EAGER_SCHEMA_PROPERTIES = 4096
 
 # Frozen bytes from the paired Plane G1 runtime contract manifest.
 G1_CONTRACT_DIGESTS = {
-    "runSnapshot": "e538fe79ede53e6bb2e307600dbefea507e30b996c002c3dab32d543ca0e36a2",
+    "runSnapshot": "308101c6a2c9f56e7deb5c6a07c8bc74b59831b92cbbb5b07c5a7eefc21f4947",
     "invocationEnvelope": "b7a15d74406f1624cdb7cd95b42edfd1ffee596abe57e4f00ed60e2e23ded995",
     "runtimeEvent": "78da5ce9d112b6545ea471e5fcae25ff5dfeb2e5db74a8d5796d0ee026823a27",
     "runtimeExit": "86b5acaa14271b1c5f0f0fadc30f48bc5cd24ac8db0ff03ba8a91d02bceecf65",
     "runtimeDurableState": "444c944ec8a5054f33c8662470529a1f4565d42ff06138438beceeef7967a0da",
 }
+G1_MANIFEST_DIGEST = "714f63844ad84370e0ec467dac19fef3f79b3c47a3c4bae8493437f283913bc0"
 
 _ROLES = {"worker", "delegator", "gardener", "chief_of_staff", "hr", "evaluator", "custom"}
 _TRIGGERS = {"initial", "human_input", "recoverable_restart", "continuation"}
@@ -220,6 +225,50 @@ def _content_ref(value: Any, name: str) -> str:
     return value
 
 
+def validate_eager_input_schema(value: Any, name: str = "inputSchema") -> dict[str, Any]:
+    """Validate and preserve one bounded canonical JSON Schema object."""
+
+    data = _object(value, name)
+    if len(data) > MAX_EAGER_SCHEMA_PROPERTIES:
+        raise G1ContractError(
+            f"{name} must be a bounded canonical JSON Schema object"
+        )
+
+    def validate_json_value(item: Any, path: str) -> Any:
+        if item is None or isinstance(item, (bool, int, str)):
+            return item
+        if isinstance(item, float):
+            if not math.isfinite(item):
+                raise G1ContractError(
+                    f"{name} must be a bounded canonical JSON Schema object"
+                )
+            return item
+        if isinstance(item, Mapping):
+            if any(not isinstance(key, str) for key in item):
+                raise G1ContractError(
+                    f"{name} must be a bounded canonical JSON Schema object"
+                )
+            return {key: validate_json_value(value, f"{path}.{key}") for key, value in item.items()}
+        if isinstance(item, list):
+            return [validate_json_value(child, f"{path}[]") for child in item]
+        raise G1ContractError(
+            f"{name} must be a bounded canonical JSON Schema object"
+        )
+
+    try:
+        validated = validate_json_value(data, name)
+        encoded = _canonical(validated)
+    except RecursionError as exc:
+        raise G1ContractError(
+            f"{name} must be a bounded canonical JSON Schema object"
+        ) from exc
+    if len(encoded) > MAX_EAGER_INPUT_SCHEMA_BYTES:
+        raise G1ContractError(
+            f"{name} must be a bounded canonical JSON Schema object"
+        )
+    return validated
+
+
 def _snapshot_ref(value: Any, name: str) -> str:
     value = _text(value, name, maximum=73)
     if len(value) != 73 or not value.startswith("snapshot:"):
@@ -288,16 +337,32 @@ def _validate_snapshot(raw: Any) -> dict[str, Any]:
     _required(catalog, {"catalogDigest", "eagerOperations"}, "toolCatalog")
     _content_ref(catalog["catalogDigest"], "toolCatalog.catalogDigest")
     operations = catalog["eagerOperations"]
-    if not isinstance(operations, list) or len(operations) > 64:
-        raise G1ContractError("toolCatalog.eagerOperations must contain at most 64 items")
+    if not isinstance(operations, list) or len(operations) > MAX_EAGER_OPERATIONS:
+        raise G1ContractError(
+            f"toolCatalog.eagerOperations must contain at most {MAX_EAGER_OPERATIONS} items"
+        )
     for index, item in enumerate(operations):
         operation = _object(item, f"toolCatalog.eagerOperations[{index}]")
-        _reject_unknown(operation, {"operationRef", "schemaDigest", "disclosure"}, f"toolCatalog.eagerOperations[{index}]")
-        _required(operation, {"operationRef", "schemaDigest", "disclosure"}, f"toolCatalog.eagerOperations[{index}]")
-        _ref(operation["operationRef"], "operationRef", "operation")
-        _content_ref(operation["schemaDigest"], "schemaDigest")
-        if operation["disclosure"] not in {"eager", "progressive"}:
-            raise G1ContractError("toolCatalog operation disclosure is unsupported")
+        operation_name = f"toolCatalog.eagerOperations[{index}]"
+        _reject_unknown(
+            operation,
+            {"operationRef", "schemaDigest", "inputSchema", "disclosure"},
+            operation_name,
+        )
+        _required(
+            operation,
+            {"operationRef", "schemaDigest", "inputSchema", "disclosure"},
+            operation_name,
+        )
+        _ref(operation["operationRef"], f"{operation_name}.operationRef", "operation")
+        _content_ref(operation["schemaDigest"], f"{operation_name}.schemaDigest")
+        validate_eager_input_schema(operation["inputSchema"], f"{operation_name}.inputSchema")
+        if operation["disclosure"] != "eager":
+            raise G1ContractError(f"{operation_name}.disclosure must be eager")
+    if len(_canonical(catalog)) > MAX_EAGER_PRESENTATION_BYTES:
+        raise G1ContractError(
+            f"toolCatalog exceeds {MAX_EAGER_PRESENTATION_BYTES} canonical JSON bytes"
+        )
 
     policy = _object(data["runtimePolicy"], "RunSnapshot.runtimePolicy")
     _reject_unknown(
@@ -433,8 +498,24 @@ class G1RunSnapshot:
         return str(self.raw["assignment"]["objective"])
 
     @property
+    def target_ref(self) -> str:
+        return str(self.raw["assignment"]["targetRef"])
+
+    @property
+    def acceptance_criteria(self) -> tuple[str, ...]:
+        return tuple(str(item) for item in self.raw["assignment"]["acceptanceCriteria"])
+
+    @property
     def behavioral_prompt(self) -> str:
         return str(self.raw["profile"]["behavioralPrompt"])
+
+    @property
+    def context_refs(self) -> tuple[str, ...]:
+        return tuple(str(item["contextRef"]) for item in self.raw["context"])
+
+    @property
+    def eager_operations(self) -> tuple[Mapping[str, Any], ...]:
+        return tuple(self.raw["toolCatalog"]["eagerOperations"])
 
     @property
     def model_provider(self) -> str:
@@ -841,6 +922,7 @@ def build_exit(
 
 __all__ = [
     "G1_CONTRACT_DIGESTS",
+    "G1_MANIFEST_DIGEST",
     "G1ContractError",
     "G1InvocationEnvelope",
     "G1RunSnapshot",
@@ -851,6 +933,7 @@ __all__ = [
     "build_exit",
     "content_digest",
     "snapshot_digest",
+    "validate_eager_input_schema",
     "validate_g1_frame",
     "validate_g1_frames",
 ]

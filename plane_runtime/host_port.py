@@ -28,12 +28,16 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Callable, Iterator, Literal, Mapping, Protocol
 
+from .g1_contract import G1ContractError, validate_eager_input_schema
+
 
 HOST_PROTOCOL = "plane.agent-runtime/v1"
 PLANE_RUNTIME_TOOLSET = "plane_runtime"
 PLANE_OPERATION_TOOL = "plane_operation"
 PLANE_PUBLISH_TOOL = "plane_publish"
 PLANE_DISCOVERY_OPERATION = "plane.operations.discover@1"
+PLANE_CATALOG_SEARCH_OPERATION = "operation:catalog.search"
+PLANE_CATALOG_DESCRIBE_OPERATION = "operation:catalog.describe"
 
 MAX_HOST_REQUEST_BYTES = 16 * 1024
 MAX_HOST_RESULT_BYTES = 16 * 1024
@@ -83,6 +87,10 @@ class PlaneHostCancelled(PlaneHostError):
 
 class PlaneHostBoundsError(PlaneHostError):
     """A host callback exceeded the invocation-local bound."""
+
+
+class PlaneHostSchemaNotDisclosed(PlaneHostError):
+    """An operation needs progressive schema disclosure before invocation."""
 
 
 def _canonical(value: Any, name: str) -> bytes:
@@ -566,8 +574,10 @@ class PlaneHostBinding:
     correlation_id: str
     cancellation: Callable[[], bool]
     emit_body: Callable[[Mapping[str, Any]], None] | None = None
+    eager_operation_refs: frozenset[str] = field(default_factory=frozenset)
     max_calls: int = MAX_HOST_CALLS
     records: list[HostCallRecord] = field(default_factory=list)
+    described_operation_refs: set[str] = field(default_factory=set, init=False, repr=False)
     _fatal_error: str | None = field(default=None, init=False, repr=False)
     _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
 
@@ -582,6 +592,12 @@ class PlaneHostBinding:
             or self.max_calls <= 0
         ):
             raise ValueError("Plane host max_calls must be a positive integer")
+        if any(
+            not isinstance(operation_ref, str)
+            or not operation_ref.startswith("operation:")
+            for operation_ref in self.eager_operation_refs
+        ):
+            raise ValueError("Plane host eager operation refs must be operation references")
 
     @property
     def fatal_error(self) -> str | None:
@@ -594,6 +610,59 @@ class PlaneHostBinding:
     def _fail(self, message: str) -> None:
         if self._fatal_error is None:
             self._fatal_error = message[:2048]
+
+    def _schema_is_disclosed(self, operation_ref: str) -> bool:
+        return operation_ref in self.eager_operation_refs or operation_ref in self.described_operation_refs
+
+    def _require_schema_disclosure(self, *, action: str, operation_ref: str) -> None:
+        if action == "discover":
+            return
+        if operation_ref in {
+            PLANE_CATALOG_SEARCH_OPERATION,
+            PLANE_CATALOG_DESCRIBE_OPERATION,
+        }:
+            return
+        if not self._schema_is_disclosed(operation_ref):
+            raise PlaneHostSchemaNotDisclosed(
+                "SCHEMA_NOT_DISCLOSED: use discovery, operation:catalog.search, "
+                "then operation:catalog.describe for this operation before invocation"
+            )
+
+    def _record_catalog_description(self, request: HostCallRequest, result: HostCallResult) -> None:
+        if request.operation_ref != PLANE_CATALOG_DESCRIBE_OPERATION:
+            return
+        if result.status not in {"ok", "replayed"}:
+            return
+        try:
+            output = _object(result.output, "catalog.describe.output")
+            operation = _object(output.get("operation"), "catalog.describe.output.operation")
+            operation_ref = operation.get("operationRef")
+            operation_id = operation.get("operationId")
+            if isinstance(operation_ref, str):
+                described_ref = operation_ref
+            elif isinstance(operation_id, str):
+                described_ref = f"operation:{operation_id}"
+            else:
+                raise G1ContractError("catalog.describe result has no operation identity")
+            if not described_ref.startswith("operation:"):
+                raise G1ContractError("catalog.describe result has an invalid operation identity")
+            if isinstance(operation_id, str) and described_ref != f"operation:{operation_id}":
+                raise G1ContractError("catalog.describe result operation identity does not match")
+            requested_id = request.input.get("operation_id")
+            if not isinstance(requested_id, str) or not requested_id:
+                raise G1ContractError("catalog.describe request has no operation identity")
+            requested_ref = (
+                requested_id
+                if requested_id.startswith("operation:")
+                else f"operation:{requested_id}"
+            )
+            if described_ref != requested_ref:
+                raise G1ContractError("catalog.describe result does not match the requested operation")
+            validate_eager_input_schema(operation.get("inputSchema"), "catalog.describe.inputSchema")
+        except (G1ContractError, PlaneHostError, TypeError) as exc:
+            self._fail("catalog.describe result was malformed or mismatched")
+            raise PlaneHostUnavailable("catalog.describe result was malformed or mismatched") from exc
+        self.described_operation_refs.add(described_ref)
 
     def _is_cancelled(self) -> bool:
         try:
@@ -618,6 +687,7 @@ class PlaneHostBinding:
             if self._is_cancelled():
                 self._fail("Plane host callback cancelled")
                 raise PlaneHostCancelled("Plane host callback cancelled")
+            self._require_schema_disclosure(action=action, operation_ref=operation_ref)
             if len(self.records) >= self.max_calls:
                 self._fail("Plane host call budget exhausted")
                 raise PlaneHostBoundsError("Plane host call budget exhausted")
@@ -644,6 +714,7 @@ class PlaneHostBinding:
                 self._fail("Plane host callback failed")
                 raise PlaneHostUnavailable("Plane host callback failed") from exc
             self.records.append(HostCallRecord(request, result))
+            self._record_catalog_description(request, result)
             self._emit_call_observation(request, result)
             if _host_result_disposition(result) == "poison_invocation":
                 self._fail(result.error_message or "Plane host rejected the callback")
@@ -872,6 +943,8 @@ def _handle_plane_operation(args: Mapping[str, Any], **_: Any) -> str:
         return result.model_payload()
     except PlaneHostCancelled as exc:
         return _error_payload(str(exc), code="cancelled")
+    except PlaneHostSchemaNotDisclosed as exc:
+        return _error_payload(str(exc), code="SCHEMA_NOT_DISCLOSED")
     except PlaneHostError as exc:
         return _error_payload(str(exc))
 
@@ -901,6 +974,8 @@ def _handle_plane_publish(args: Mapping[str, Any], **_: Any) -> str:
         return result.model_payload()
     except PlaneHostCancelled as exc:
         return _error_payload(str(exc), code="cancelled")
+    except PlaneHostSchemaNotDisclosed as exc:
+        return _error_payload(str(exc), code="SCHEMA_NOT_DISCLOSED")
     except PlaneHostError as exc:
         return _error_payload(str(exc))
 
@@ -982,6 +1057,7 @@ __all__ = [
     "PlaneHostBoundsError",
     "PlaneHostCancelled",
     "PlaneHostError",
+    "PlaneHostSchemaNotDisclosed",
     "PlaneHostPort",
     "PlaneHostUnavailable",
     "bind_plane_host",

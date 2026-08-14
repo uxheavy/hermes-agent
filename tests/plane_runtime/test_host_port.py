@@ -29,6 +29,25 @@ from plane_runtime.host_port import (
 )
 from tools.registry import registry
 
+_RuntimePlaneHostBinding = PlaneHostBinding
+_TEST_EAGER_OPERATION_REFS = frozenset(
+    {
+        "operation:work-item-get@1",
+        "operation:read@1",
+        "operation:read@2",
+        "operation:mutate@1",
+        "operation:work-item-update@1",
+        "operation:conversation-publish@1",
+        "operation:compose@1",
+    }
+)
+
+
+class PlaneHostBinding(_RuntimePlaneHostBinding):
+    def __init__(self, *args, **kwargs):
+        kwargs.setdefault("eager_operation_refs", _TEST_EAGER_OPERATION_REFS)
+        super().__init__(*args, **kwargs)
+
 
 # Hermes' logging monitor may still emit after an AIAgent returns. Keep this
 # hermetic home alive for the process instead of deleting it mid-test.
@@ -161,7 +180,7 @@ class HostPortTests(unittest.TestCase):
                                     "name": "plane_operation",
                                     "arguments": {
                                         "action": "read",
-                                        "operationRef": "operation:work-item-get@1",
+                                        "operationRef": "operation:work-item-get",
                                         "input": {"workItemRef": "work-item:test"},
                                     },
                                 }
@@ -859,7 +878,7 @@ class HostPortTests(unittest.TestCase):
                                 "name": "plane_operation",
                                 "arguments": {
                                     "action": "read",
-                                    "operationRef": "operation:work-item-get@1",
+                                    "operationRef": "operation:work-item-get",
                                     "input": {"workItemRef": "work-item:test"},
                                 },
                             },
@@ -874,7 +893,7 @@ class HostPortTests(unittest.TestCase):
                                 "code": (
                                     "from hermes_tools import plane_operation\n"
                                     "print(plane_operation('code', "
-                                    "'operation:compose@1', {'workItemRef': 'work-item:test'}))"
+                                    "'operation:compose', {'workItemRef': 'work-item:test'}))"
                                 )
                             },
                             "call-code",
@@ -888,7 +907,7 @@ class HostPortTests(unittest.TestCase):
                                 "name": "plane_operation",
                                 "arguments": {
                                     "action": "mutate",
-                                    "operationRef": "operation:work-item-update@1",
+                                    "operationRef": "operation:work-item-update",
                                     "input": {
                                         "workItemRef": "work-item:test",
                                         "title": "updated",
@@ -906,7 +925,7 @@ class HostPortTests(unittest.TestCase):
                                 "name": "plane_publish",
                                 "arguments": {
                                     "kind": "conversation",
-                                    "operationRef": "operation:conversation-publish@1",
+                                    "operationRef": "operation:conversation-publish",
                                     "resourceRef": "conversation:test",
                                     "content": "publish only through this explicit action",
                                 },
@@ -970,7 +989,7 @@ class HostPortTests(unittest.TestCase):
                     "productKind": "conversation",
                     "productRef": "conversation:test",
                     "operationAttemptRef": "operation-attempt:attempt-1",
-                    "operationRef": "operation:conversation-publish@1",
+                    "operationRef": "operation:conversation-publish",
                     "applicationServiceRef": "application-service:conversation",
                     "gatewayReceiptRef": "gateway-receipt:receipt-1",
                     "receiptRef": "receipt:receipt-1",
@@ -1345,7 +1364,7 @@ class HostPortTests(unittest.TestCase):
                                         "name": "plane_operation",
                                         "arguments": {
                                             "action": "read",
-                                            "operationRef": "operation:read@1",
+                                            "operationRef": "operation:read",
                                             "input": {},
                                         },
                                     }
