@@ -571,6 +571,41 @@ class HostPortTests(unittest.TestCase):
         self.assertEqual(unknown_result.status, "unavailable")
         self.assertIsNotNone(unknown.fatal_error)
 
+    def test_nonrecoverable_host_results_poison_the_invocation(self) -> None:
+        cases = (
+            ("denied", "CALLBACK_BINDING_INVALID"),
+            ("invalid", "UNKNOWN_VALIDATION_FAILURE"),
+            ("conflict", "IDEMPOTENCY_CONFLICT"),
+            ("unavailable", "OUTCOME_UNKNOWN"),
+        )
+
+        for status, error_code in cases:
+            with self.subTest(status=status, error_code=error_code):
+                binding = PlaneHostBinding(
+                    port=CallablePlaneHostPort(
+                        lambda request, status=status, error_code=error_code: _result(
+                            request,
+                            status=status,
+                            errorCode=error_code,
+                            errorMessage="bounded host failure",
+                        )
+                    ),
+                    run_id="run:test",
+                    invocation_id="invocation:test",
+                    correlation_id="correlation:test",
+                    cancellation=lambda: False,
+                )
+
+                result = binding.call(
+                    action="read",
+                    operation_ref="operation:read@1",
+                    input={},
+                    source="model",
+                )
+
+                self.assertEqual(result.status, status)
+                self.assertIsNotNone(binding.fatal_error)
+
     def test_changed_replay_binding_and_noncanonical_response_fail_closed(self) -> None:
         def changed_response(request: dict) -> dict:
             response = _result(request)
@@ -995,6 +1030,162 @@ class HostPortTests(unittest.TestCase):
         self.assertEqual(
             [body["kind"] for body in bodies if "publication" in body and body["publication"].get("action") != "observation_only"],
             ["conversation_publication_observed"],
+        )
+        self.assertEqual(
+            [body["payload"]["text"] for body in bodies if body["kind"] == "transcript_evidence_observed"],
+            ["ordinary final evidence"],
+        )
+
+    def test_real_hermes_adapter_recovers_from_validation_result(self) -> None:
+        from tests.plane_runtime.test_g1_runtime_process import (
+            G1InvocationEnvelope,
+            G1RunSnapshot,
+            _digest,
+            make_invocation,
+            make_snapshot,
+        )
+        from plane_runtime.hermes_adapter import HermesKernelAdapter
+        from run_agent import AIAgent
+
+        snapshot_raw = make_snapshot()
+        snapshot_raw["runtimePolicy"] = dict(snapshot_raw["runtimePolicy"])  # type: ignore[index]
+        snapshot_raw["runtimePolicy"]["adapter"] = "hermes"  # type: ignore[index]
+        snapshot_raw["runtimePolicy"]["model"] = {  # type: ignore[index]
+            "provider": "openai",
+            "model": "deterministic-local",
+        }
+        snapshot_raw["contentDigest"] = _digest(  # type: ignore[assignment]
+            "snapshot",
+            {key: value for key, value in snapshot_raw.items() if key != "contentDigest"},
+        )
+        snapshot = G1RunSnapshot.from_dict(snapshot_raw)
+        invocation = G1InvocationEnvelope.from_dict(make_invocation(snapshot.to_dict()))
+
+        class Completions:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            @staticmethod
+            def tool_call(arguments: dict[str, object], call_id: str):
+                return SimpleNamespace(
+                    id=call_id,
+                    function=SimpleNamespace(
+                        name="tool_call",
+                        arguments=json.dumps(
+                            {"name": "plane_operation", "arguments": arguments}
+                        ),
+                    ),
+                    extra_content=None,
+                )
+
+            def create(self, **_kwargs: object):
+                self.calls += 1
+                if self.calls == 1:
+                    tool_calls = [
+                        self.tool_call(
+                            {
+                                "action": "read",
+                                "operationRef": "operation:work_item.read",
+                                "input": {"issue_ref": "issue:test"},
+                            },
+                            "call-invalid-read",
+                        )
+                    ]
+                elif self.calls == 2:
+                    tool_calls = [
+                        self.tool_call(
+                            {
+                                "action": "read",
+                                "operationRef": "operation:work_item.read",
+                                "input": {
+                                    "project_id": "00000000-0000-0000-0000-000000000001",
+                                    "issue_id": "00000000-0000-0000-0000-000000000002",
+                                },
+                            },
+                            "call-valid-read",
+                        )
+                    ]
+                else:
+                    tool_calls = []
+                if tool_calls:
+                    message = SimpleNamespace(
+                        content=None,
+                        tool_calls=tool_calls,
+                        reasoning=None,
+                        reasoning_content=None,
+                        refusal=None,
+                    )
+                    finish_reason = "tool_calls"
+                else:
+                    message = SimpleNamespace(
+                        content="ordinary final evidence",
+                        tool_calls=None,
+                        reasoning=None,
+                        reasoning_content=None,
+                        refusal=None,
+                    )
+                    finish_reason = "stop"
+                return SimpleNamespace(
+                    choices=[SimpleNamespace(finish_reason=finish_reason, message=message)],
+                    usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+                )
+
+        completions = Completions()
+
+        class Client:
+            chat = SimpleNamespace(completions=completions)
+
+        class Credentials:
+            def resolve(self, provider: str) -> dict[str, str]:
+                del provider
+                return {"api_key": "model-only-secret", "base_url": "http://127.0.0.1"}
+
+        def agent_factory(**kwargs: object) -> AIAgent:
+            agent = AIAgent(**kwargs)
+            agent._create_request_openai_client = lambda **_: Client()  # type: ignore[method-assign]
+            return agent
+
+        requests: list[dict] = []
+
+        def rpc(request: dict) -> dict:
+            requests.append(request)
+            if len(requests) == 1:
+                return _result(
+                    request,
+                    status="invalid",
+                    output={"error": "bounded validation result"},
+                    errorCode="VALIDATION_ERROR",
+                    errorMessage="project_id and issue_id are required",
+                )
+            return _result(request, output={"work_item": {"id": request["input"]["issue_id"]}})
+
+        bodies: list[dict] = []
+        with mock.patch.dict(os.environ, {"HERMES_HOME": _TEST_HERMES_HOME.name}):
+            import run_agent
+
+            run_agent._hermes_home = Path(_TEST_HERMES_HOME.name)
+            result = HermesKernelAdapter(
+                agent_factory=agent_factory,
+                credential_source=Credentials(),
+                host_port=CallablePlaneHostPort(rpc),
+            ).dispatch(
+                snapshot,
+                invocation,
+                lambda: False,
+                bodies.append,
+                model_call_allowance=3,
+            )
+
+        self.assertEqual(result.kind, "completed")
+        self.assertEqual(completions.calls, 3)
+        self.assertEqual(len(requests), 2)
+        self.assertEqual(requests[0]["input"], {"issue_ref": "issue:test"})
+        self.assertEqual(
+            requests[1]["input"],
+            {
+                "project_id": "00000000-0000-0000-0000-000000000001",
+                "issue_id": "00000000-0000-0000-0000-000000000002",
+            },
         )
         self.assertEqual(
             [body["payload"]["text"] for body in bodies if body["kind"] == "transcript_evidence_observed"],
