@@ -816,6 +816,49 @@ class HostPortTests(unittest.TestCase):
             ["progress_observed", "outcome_submission_observed", "progress_observed"],
         )
 
+    def test_replayed_applied_outcome_on_fresh_binding_does_not_signal(self) -> None:
+        bodies: list[dict] = []
+
+        def rpc(request: dict) -> dict:
+            return _result(
+                request,
+                status="replayed",
+                output={"published": True},
+                publication={
+                    "action": "applied",
+                    "productKind": "outcome_submission",
+                    "productRef": "outcome-submission:test",
+                    "operationAttemptRef": "operation-attempt:attempt-1",
+                    "operationRef": "operation:conversation-publish@1",
+                    "applicationServiceRef": "application-service:conversation",
+                    "gatewayReceiptRef": "gateway-receipt:receipt-1",
+                    "receiptRef": "receipt:receipt-1",
+                    "auditReceiptRef": "audit-receipt:audit-1",
+                    "productEventRef": "product-event:event-1",
+                },
+            )
+
+        binding = PlaneHostBinding(
+            port=CallablePlaneHostPort(rpc),
+            run_id="run:test",
+            invocation_id="invocation:test",
+            correlation_id="correlation:test",
+            cancellation=lambda: False,
+            emit_body=bodies.append,
+        )
+        binding.publish(
+            kind="outcome",
+            operation_ref="operation:conversation-publish@1",
+            resource_ref="outcome-submission:test",
+            content="replayed outcome",
+        )
+
+        self.assertIsNone(binding.terminal_action_reason())
+        self.assertEqual(
+            [body["kind"] for body in bodies],
+            ["progress_observed", "outcome_submission_observed"],
+        )
+
     def test_nonterminal_publications_and_plain_calls_do_not_signal(self) -> None:
         def conversation_rpc(request: dict) -> dict:
             return _result(

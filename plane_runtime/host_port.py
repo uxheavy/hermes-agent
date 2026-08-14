@@ -774,11 +774,16 @@ class PlaneHostBinding:
             raise PlaneHostUnavailable("explicit publication receipt was invalid") from exc
         if self.emit_body is not None:
             with self._lock:
-                terminal_outcome = (
+                applied_outcome = (
                     kind == "outcome" and publication["action"] == "applied"
                 )
-                if terminal_outcome and self._terminal_action_reason is not None:
+                if applied_outcome and self._terminal_action_reason is not None:
                     return result
+                terminal_outcome = (
+                    applied_outcome
+                    and result.status == "ok"
+                    and result.replayed is False
+                )
                 try:
                     self.emit_body(
                         {
