@@ -64,6 +64,7 @@ class FailoverReason(enum.Enum):
     multimodal_tool_content_unsupported = "multimodal_tool_content_unsupported"  # Provider rejected list-type content in tool messages (e.g. Xiaomi MiMo) — downgrade to text and retry
 
     # Provider-specific
+    outcome_unknown = "outcome_unknown"  # Upstream may have accepted the request; never replay
     thinking_signature = "thinking_signature"  # Anthropic thinking block sig invalid
     long_context_tier = "long_context_tier"    # Anthropic "extra usage" tier gate
     oauth_long_context_beta_forbidden = "oauth_long_context_beta_forbidden"  # Anthropic OAuth subscription rejects 1M context beta — disable beta and retry
@@ -92,6 +93,7 @@ class ClassifiedError:
     should_compress: bool = False
     should_rotate_credential: bool = False
     should_fallback: bool = False
+    terminal: bool = False
 
     @property
     def is_auth(self) -> bool:
@@ -689,6 +691,19 @@ def classify_api_error(
         }
         defaults.update(overrides)
         return ClassifiedError(**defaults)
+
+    # A narrow provider adapter may mark an error when the upstream request
+    # could have been accepted. This generic signal prevents credential
+    # rotation and fallback without importing provider-specific code into the
+    # retry loop.
+    if _is_terminal_provider_error(error):
+        return _result(
+            FailoverReason.outcome_unknown,
+            retryable=False,
+            should_rotate_credential=False,
+            should_fallback=False,
+            terminal=True,
+        )
 
     # Plane's relay uses a bounded, invocation-local model-call allowance.
     # Replaying this request cannot make progress and would violate that
@@ -1659,6 +1674,24 @@ def _extract_status_code(error: Exception) -> Optional[int]:
             break
         current = cause
     return None
+
+
+def _is_terminal_provider_error(error: Exception) -> bool:
+    """Find a typed no-replay marker through SDK exception wrapping."""
+
+    current = error
+    for _ in range(5):
+        if (
+            getattr(current, "terminal_failure", False) is True
+            and getattr(current, "retryable", None) is False
+            and getattr(current, "upstream_initiated", False) is True
+        ):
+            return True
+        cause = getattr(current, "__cause__", None) or getattr(current, "__context__", None)
+        if cause is None or cause is current:
+            break
+        current = cause
+    return False
 
 
 def _extract_error_body(error: Exception) -> dict:

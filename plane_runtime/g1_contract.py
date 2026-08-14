@@ -69,6 +69,7 @@ _FAILURE_CODES = {
     "lease_expired",
     "invalid_continuation",
     "budget_exhausted",
+    "outcome_unknown",
     "cancelled",
 }
 RUNTIME_FAILURE_CAUSES = frozenset(

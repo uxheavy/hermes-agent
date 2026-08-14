@@ -41,11 +41,59 @@ _PROVIDER_RELAY_FIELDS = frozenset(
     {"host", "path", "provider", "relayToken", "invocationSocket"}
 )
 _PROVIDER_RELAY_DUMMY_API_KEY = "plane-provider-relay"
+_MAX_PROVIDER_ERROR_BODY_BYTES = 4096
 _CODE_MODE_RUNTIME_POLICY_FIELDS = (
     "maxCodeModeInputBytes",
     "maxCodeModeOutputBytes",
     "maxCodeModeCalls",
 )
+_OUTCOME_UNKNOWN_RUNTIME_MESSAGE = (
+    "Provider outcome is unknown; Plane reconciliation is required before retrying."
+)
+
+
+class ProviderOutcomeUnknownError(RuntimeError):
+    """A provider request may have reached upstream and must not be replayed."""
+
+    code = "outcome_unknown"
+    retryable = False
+    upstream_initiated = True
+    terminal_failure = True
+
+    def __init__(self, *, status_code: int) -> None:
+        self.status_code = status_code
+        super().__init__("provider outcome is unknown; reconcile before retrying")
+
+
+def _raise_on_provider_outcome_unknown(response: Any) -> None:
+    """Decode the relay's bounded ambiguity marker at the HTTP boundary."""
+
+    if response.status_code < 400:
+        return
+    content_length = response.headers.get("content-length")
+    try:
+        content_length = int(content_length) if content_length is not None else -1
+        if content_length < 0 or content_length > _MAX_PROVIDER_ERROR_BODY_BYTES:
+            return
+    except (TypeError, ValueError):
+        return
+    try:
+        body = response.read()
+    except Exception:
+        return
+    if len(body) > _MAX_PROVIDER_ERROR_BODY_BYTES:
+        return
+    try:
+        payload = json.loads(body)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return
+    if (
+        isinstance(payload, dict)
+        and payload.get("error") == "outcome_unknown"
+        and payload.get("retryable") is False
+        and payload.get("upstreamInitiated") is True
+    ):
+        raise ProviderOutcomeUnknownError(status_code=int(response.status_code))
 
 
 def validate_absolute_unix_socket_path(value: object) -> str | None:
@@ -161,7 +209,10 @@ class _ProviderRelayConfig:
                 },
                 follow_redirects=False,
                 timeout=None,
-                event_hooks={"request": [apply_relay_headers]},
+                event_hooks={
+                    "request": [apply_relay_headers],
+                    "response": [_raise_on_provider_outcome_unknown],
+                },
             )
 
         return create_client
@@ -755,6 +806,19 @@ class HermesKernelAdapter:
                     retryable=False,
                     model_calls=self._observed_model_calls(agent, None),
                 )
+            if (
+                getattr(exc, "terminal_failure", False) is True
+                and getattr(exc, "code", None) == "outcome_unknown"
+                and getattr(exc, "retryable", None) is False
+                and getattr(exc, "upstream_initiated", False) is True
+            ):
+                return HermesKernelResult(
+                    kind="failed",
+                    failure_code="outcome_unknown",
+                    failure_message=_OUTCOME_UNKNOWN_RUNTIME_MESSAGE,
+                    retryable=False,
+                    model_calls=self._observed_model_calls(agent, None),
+                )
             message = bound_runtime_text(redact_runtime_text(str(exc), credential_values), event_limit)
             return HermesKernelResult(
                 kind="failed",
@@ -830,6 +894,15 @@ class HermesKernelAdapter:
                 model_calls=model_calls,
             )
         if result.get("failed") is True:
+            if result.get("failure_reason") == "outcome_unknown":
+                return HermesKernelResult(
+                    kind="failed",
+                    failure_code="outcome_unknown",
+                    failure_message=_OUTCOME_UNKNOWN_RUNTIME_MESSAGE,
+                    retryable=False,
+                    usage=usage,
+                    model_calls=model_calls,
+                )
             if result.get("failure_reason") == "budget_exhausted":
                 return HermesKernelResult(
                     kind="failed",

@@ -3675,10 +3675,15 @@ def run_conversation(
                     num_messages=len(api_messages) if api_messages else 0,
                 )
                 logger.debug(
-                    "Error classified: reason=%s status=%s retryable=%s compress=%s rotate=%s fallback=%s",
+                    "Error classified: reason=%s status=%s retryable=%s terminal=%s compress=%s rotate=%s fallback=%s",
                     classified.reason.value, classified.status_code,
-                    classified.retryable, classified.should_compress,
+                    classified.retryable, classified.terminal, classified.should_compress,
                     classified.should_rotate_credential, classified.should_fallback,
+                )
+                safe_error_message = (
+                    "provider outcome is unknown; reconcile before retrying"
+                    if classified.terminal
+                    else str(api_error)
                 )
                 agent._invoke_api_request_error_hook(
                     task_id=effective_task_id,
@@ -3686,9 +3691,9 @@ def run_conversation(
                     api_request_id=api_request_id,
                     api_call_count=api_call_count,
                     api_start_time=api_start_time,
-                    api_kwargs=api_kwargs,
+                    api_kwargs=None if classified.terminal else api_kwargs,
                     error_type=type(api_error).__name__,
-                    error_message=str(api_error),
+                    error_message=safe_error_message,
                     status_code=status_code,
                     retry_count=retry_count,
                     max_retries=max_retries,
@@ -3713,12 +3718,15 @@ def run_conversation(
                         )
                         continue
 
-                recovered_with_pool, _retry.has_retried_429 = agent._recover_with_credential_pool(
-                    status_code=status_code,
-                    has_retried_429=_retry.has_retried_429,
-                    classified_reason=classified.reason,
-                    error_context=error_context,
-                )
+                if classified.terminal:
+                    recovered_with_pool = False
+                else:
+                    recovered_with_pool, _retry.has_retried_429 = agent._recover_with_credential_pool(
+                        status_code=status_code,
+                        has_retried_429=_retry.has_retried_429,
+                        classified_reason=classified.reason,
+                        error_context=error_context,
+                    )
                 if recovered_with_pool:
                     continue
 
@@ -4864,6 +4872,7 @@ def run_conversation(
                     )
                 ) and not is_context_length_error
                 is_budget_exhausted = classified.reason == FailoverReason.budget_exhausted
+                is_terminal_failure = classified.terminal
 
                 if is_client_error:
                     # Try fallback before aborting — a different provider may
@@ -4872,21 +4881,29 @@ def run_conversation(
                     # exists; otherwise "trying fallback..." is a lie and the
                     # session looks like it's recovering when it's about to
                     # abort silently (#35314, #17446).
-                    if agent._has_pending_fallback() and not is_budget_exhausted:
+                    if (
+                        not is_terminal_failure
+                        and agent._has_pending_fallback()
+                        and not is_budget_exhausted
+                    ):
                         if classified.reason == FailoverReason.content_policy_blocked:
                             agent._buffer_status("⚠️ Provider safety filter blocked this request — trying fallback...")
                         elif classified.reason == FailoverReason.ssl_cert_verification:
                             agent._buffer_status("⚠️ TLS certificate verification failed — trying fallback...")
                         else:
                             agent._buffer_status(f"⚠️ Non-retryable error (HTTP {status_code}) — trying fallback...")
-                    if not is_budget_exhausted and agent._try_activate_fallback():
+                    if (
+                        not is_terminal_failure
+                        and not is_budget_exhausted
+                        and agent._try_activate_fallback()
+                    ):
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt)
                         retry_count = 0
                         compression_attempts = 0
                         _retry.primary_recovery_attempted = False
                         continue
-                    if api_kwargs is not None:
+                    if api_kwargs is not None and not is_terminal_failure:
                         agent._dump_api_request_debug(
                             api_kwargs, reason="non_retryable_client_error", error=api_error,
                         )
@@ -4899,8 +4916,16 @@ def run_conversation(
                     # returned ``error`` field and downstream consumers deliver
                     # it verbatim (e.g. a cron failure notification dumped a
                     # ~60KB Cloudflare challenge page as 31 Discord messages).
-                    _nonretryable_summary = agent._summarize_api_error(api_error)
-                    if classified.reason == FailoverReason.content_policy_blocked:
+                    _nonretryable_summary = (
+                        "Provider outcome is unknown; reconcile the invocation before retrying."
+                        if is_terminal_failure
+                        else agent._summarize_api_error(api_error)
+                    )
+                    if is_terminal_failure:
+                        agent._emit_status(
+                            "❌ Provider outcome is unknown; reconcile the invocation before retrying."
+                        )
+                    elif classified.reason == FailoverReason.content_policy_blocked:
                         agent._emit_status(
                             f"❌ Provider safety filter blocked this request: "
                             f"{_nonretryable_summary}"
@@ -4915,7 +4940,16 @@ def run_conversation(
                             f"❌ Non-retryable error (HTTP {status_code}): "
                             f"{_nonretryable_summary}"
                         )
-                    agent._vprint(f"{agent.log_prefix}❌ Non-retryable client error (HTTP {status_code}). Aborting.", force=True)
+                    if is_terminal_failure:
+                        agent._vprint(
+                            f"{agent.log_prefix}❌ Provider outcome is unknown. Aborting without retry or fallback.",
+                            force=True,
+                        )
+                    else:
+                        agent._vprint(
+                            f"{agent.log_prefix}❌ Non-retryable client error (HTTP {status_code}). Aborting.",
+                            force=True,
+                        )
                     agent._vprint(f"{agent.log_prefix}   🔌 Provider: {_provider}  Model: {_model}", force=True)
                     agent._vprint(f"{agent.log_prefix}   🌐 Endpoint: {_base}", force=True)
                     # Actionable guidance for common auth errors
@@ -5020,7 +5054,13 @@ def run_conversation(
                             f"{agent.log_prefix}        for localhost, or add the server's cert to your trust store.",
                             force=True,
                         )
-                    logger.error(f"{agent.log_prefix}Non-retryable client error: {api_error}")
+                    if is_terminal_failure:
+                        logger.error(
+                            "%sProvider outcome is unknown; invocation stopped before replay",
+                            agent.log_prefix,
+                        )
+                    else:
+                        logger.error(f"{agent.log_prefix}Non-retryable client error: {api_error}")
                     # Skip session persistence when the error is likely
                     # context-overflow related (status 400 + large session).
                     # Persisting the failed user message would make the
@@ -5080,8 +5120,8 @@ def run_conversation(
                         "failed": True,
                         "error": _nonretryable_summary,
                     }
-                    if is_budget_exhausted:
-                        result["failure_reason"] = FailoverReason.budget_exhausted.value
+                    if is_budget_exhausted or is_terminal_failure:
+                        result["failure_reason"] = classified.reason.value
                     return result
 
                 if retry_count >= max_retries:

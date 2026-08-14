@@ -75,9 +75,10 @@ def _relay_credentials(
 class _LocalCodexRelay:
     """One-request provider-free HTTP/SSE relay on an AF_UNIX socket."""
 
-    def __init__(self) -> None:
+    def __init__(self, response: bytes | None = None) -> None:
         self._directory = tempfile.TemporaryDirectory(prefix="plane-codex-relay-")
         self.path = os.path.join(self._directory.name, "relay.sock")
+        self._response = response
         self.requests: list[tuple[str, bytes]] = []
         self._server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self._server.bind(self.path)
@@ -125,7 +126,7 @@ class _LocalCodexRelay:
                 while len(body) < content_length:
                     body += channel.recv(4096)
                 self.requests.append((headers[0].decode("ascii"), body[:content_length]))
-                channel.sendall(_codex_sse_response())
+                channel.sendall(self._response or _codex_sse_response())
 
 
 def _codex_sse_response() -> bytes:
@@ -166,6 +167,28 @@ def _codex_sse_response() -> bytes:
         b"Cache-Control: no-cache\r\n"
         b"Connection: close\r\n"
         b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body
+    )
+
+
+def _outcome_unknown_response(*, status_code: int = 502) -> bytes:
+    body = json.dumps(
+        {
+            "error": "outcome_unknown",
+            "retryable": False,
+            "upstreamInitiated": True,
+        },
+        separators=(",", ":"),
+    ).encode()
+    return (
+        b"HTTP/1.1 "
+        + str(status_code).encode()
+        + b" Bad Gateway\r\n"
+        b"Content-Type: application/json\r\n"
+        b"Connection: close\r\n"
+        b"Content-Length: "
+        + str(len(body)).encode()
+        + b"\r\n\r\n"
+        + body
     )
 
 
@@ -219,6 +242,7 @@ def test_provider_relay_metadata_is_consumed_and_client_factory_is_exact() -> No
     }
     assert client.call_args_list[0].kwargs["headers"]["X-Request-ID"]
     assert client.call_args_list[1].kwargs["headers"]["X-Request-ID"] != client.call_args_list[0].kwargs["headers"]["X-Request-ID"]
+    assert len(client.call_args_list[0].kwargs["event_hooks"]["response"]) == 1
     import httpx
 
     request = httpx.Request("POST", PROVIDER_RELAY_BASE_URL + "/chat/completions")
@@ -350,6 +374,67 @@ def test_openai_codex_service_adapter_uses_native_sse_over_bounded_uds_relay() -
     payload = json.loads(request_body)
     assert payload["model"] == "gpt-5.6-luna"
     assert "relay-secret" not in request_body.decode()
+
+
+def test_openai_codex_outcome_unknown_stops_without_replay_or_fallback() -> None:
+    snapshot, invocation, _request = _hermes_request(
+        provider="openai-codex", model="gpt-5.6-luna"
+    )
+    request_line = json.dumps(
+        {"invocation": invocation, "run": snapshot},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+    with _LocalCodexRelay(response=_outcome_unknown_response()) as relay:
+        source_credentials, factory = prepare_provider_relay_credentials(
+            _relay_credentials(relay.path, provider="openai-codex"),
+            expected_provider="openai-codex",
+            provider_relay_socket=relay.path,
+        )
+        output = io.StringIO()
+        diagnostics = io.StringIO()
+        with tempfile.TemporaryDirectory(prefix="hermes-plane-relay-home-") as home:
+            with mock.patch.dict(os.environ, {"HERMES_HOME": home}), mock.patch(
+                "agent.agent_init.fetch_model_metadata", return_value=None
+            ), mock.patch(
+                "agent.context_compressor.get_model_context_length", return_value=272000
+            ):
+                import run_agent
+
+                previous_home = run_agent._hermes_home
+                run_agent._hermes_home = Path(home)
+                try:
+                    with mock.patch.object(
+                        run_agent.AIAgent, "_try_activate_fallback", return_value=False
+                    ) as activate_fallback:
+                        status = serve_once_g1(
+                            request_line,
+                            output,
+                            production=True,
+                            diagnostics=diagnostics,
+                            model_call_allowance=12,
+                            credential_source=InlineCredentialSource(
+                                source_credentials, "openai-codex"
+                            ),
+                            http_client_factory=factory,
+                        )
+                finally:
+                    run_agent._hermes_home = previous_home
+
+    assert status == 0
+    frames = [json.loads(line) for line in output.getvalue().splitlines()]
+    assert frames[-1]["kind"] == "failed"
+    assert frames[-1]["failure"] == {
+        "code": "outcome_unknown",
+        "message": "Provider outcome is unknown; Plane reconciliation is required before retrying.",
+        "retryable": False,
+    }
+    assert len(relay.requests) == 1
+    activate_fallback.assert_not_called()
+    assert '"modelCalls":' in diagnostics.getvalue()
+    assert "relay-secret" not in output.getvalue()
+    assert "Return a deterministic runtime outcome." not in output.getvalue()
 
 
 def test_production_service_passes_only_dummy_openai_codex_credentials() -> None:
