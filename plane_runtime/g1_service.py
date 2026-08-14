@@ -65,11 +65,18 @@ def _lease_is_alive(invocation: G1InvocationEnvelope) -> bool:
     return datetime.now(timezone.utc) < parsed.astimezone(timezone.utc)
 
 
-def _failure_result(code: str, message: str, *, retryable: bool = False) -> HermesKernelResult:
+def _failure_result(
+    code: str,
+    message: str,
+    *,
+    retryable: bool = False,
+    failure_cause: str | None = None,
+) -> HermesKernelResult:
     return HermesKernelResult(
         kind="failed",
         failure_code=code,
         failure_message=message,
+        failure_cause=failure_cause,
         retryable=retryable,
     )
 
@@ -97,6 +104,8 @@ def _terminal_failure(
         "message": result.failure_message or "Hermes runtime did not complete",
         "retryable": bool(result.retryable),
     }
+    if result.failure_cause is not None:
+        failure["cause"] = result.failure_cause
     return build_exit(
         snapshot=snapshot,
         invocation=invocation,
@@ -150,16 +159,25 @@ def serve_once_g1(
         elif any(value == 0 for value in invocation.remaining_budget.values()):
             result = _failure_result("budget_exhausted", "cumulative invocation budget is exhausted")
         elif production and (model_call_allowance is None or isinstance(model_call_allowance, bool) or not isinstance(model_call_allowance, int) or model_call_allowance < 0):
-            result = _failure_result("runtime_error", "trusted model-call allowance is required")
+            result = _failure_result(
+                "runtime_error",
+                "trusted model-call allowance is required",
+                failure_cause="static_configuration_failure",
+            )
         elif production and credential_source is None:
             result = _failure_result(
                 "runtime_error",
                 "trusted bootstrap credential handoff is required",
+                failure_cause="static_configuration_failure",
             )
         elif snapshot.adapter_name == "deterministic-test-adapter" and not production:
             result = DeterministicKernelAdapter().dispatch(snapshot, invocation, NeverCancelled(), emit_body)
         elif snapshot.adapter_name == "deterministic-test-adapter" and production:
-            result = _failure_result("runtime_error", "deterministic adapter is test-only")
+            result = _failure_result(
+                "runtime_error",
+                "deterministic adapter is test-only",
+                failure_cause="static_configuration_failure",
+            )
         else:
             adapter_kwargs: dict[str, Any] = {
                 "credential_source": credential_source,

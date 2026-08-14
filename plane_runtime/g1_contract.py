@@ -26,12 +26,12 @@ MAX_INVOCATION_BYTES = 16 * 1024
 MAX_EVENT_BYTES = 16 * 1024
 MAX_INTEGER = 2_147_483_647
 
-# Frozen bytes from Plane's accepted G1 manifest at commit 44edd3a6e94b.
+# Frozen bytes from the paired Plane G1 runtime contract manifest.
 G1_CONTRACT_DIGESTS = {
     "runSnapshot": "e538fe79ede53e6bb2e307600dbefea507e30b996c002c3dab32d543ca0e36a2",
     "invocationEnvelope": "b7a15d74406f1624cdb7cd95b42edfd1ffee596abe57e4f00ed60e2e23ded995",
-    "runtimeEvent": "fcbf67ce71fa90dd9661a8f2a739b8119c59357c8bf01afabf4fe92a13de9425",
-    "runtimeExit": "055792eb1bf4931dafe19de456b15037522f0b5e8f6a0d2fedfe0e0d1d1d1c05",
+    "runtimeEvent": "78da5ce9d112b6545ea471e5fcae25ff5dfeb2e5db74a8d5796d0ee026823a27",
+    "runtimeExit": "86b5acaa14271b1c5f0f0fadc30f48bc5cd24ac8db0ff03ba8a91d02bceecf65",
     "runtimeDurableState": "444c944ec8a5054f33c8662470529a1f4565d42ff06138438beceeef7967a0da",
 }
 
@@ -66,6 +66,14 @@ _FAILURE_CODES = {
     "budget_exhausted",
     "cancelled",
 }
+RUNTIME_FAILURE_CAUSES = frozenset(
+    {
+        "host_operation_failure",
+        "cancellation_monitor_failure",
+        "invalid_usage_accounting",
+        "static_configuration_failure",
+    }
+)
 
 
 class G1ContractError(ValueError):
@@ -549,10 +557,14 @@ def _publication(
 
 def _validate_failure(value: Any, name: str = "failure") -> dict[str, Any]:
     data = _object(value, name)
-    _reject_unknown(data, {"code", "message", "retryable"}, name)
+    _reject_unknown(data, {"code", "message", "retryable", "cause"}, name)
     _required(data, {"code", "message", "retryable"}, name)
     if data["code"] not in _FAILURE_CODES or not isinstance(data["retryable"], bool):
         raise G1ContractError(f"{name} is invalid")
+    if "cause" in data and (
+        data["code"] != "runtime_error" or data["cause"] not in RUNTIME_FAILURE_CAUSES
+    ):
+        raise G1ContractError(f"{name}.cause is invalid")
     _text(data["message"], f"{name}.message")
     return data
 
@@ -833,6 +845,7 @@ __all__ = [
     "G1InvocationEnvelope",
     "G1RunSnapshot",
     "PROTOCOL",
+    "RUNTIME_FAILURE_CAUSES",
     "bind_snapshot_and_invocation",
     "build_event",
     "build_exit",

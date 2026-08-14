@@ -20,6 +20,7 @@ from .g1_contract import (
     G1RunSnapshot,
     MAX_PROMPT_BYTES,
     MAX_TEXT_BYTES,
+    RUNTIME_FAILURE_CAUSES,
 )
 from .host_port import (
     PlaneHostBinding,
@@ -388,6 +389,7 @@ class HermesKernelResult:
     retryable: bool = True
     usage: Mapping[str, int] | None = None
     model_calls: int | None = None
+    failure_cause: str | None = None
 
 
 class NeverCancelled:
@@ -525,6 +527,7 @@ class HermesKernelAdapter:
                 kind="failed",
                 failure_code="runtime_error",
                 failure_message="trusted cancellation probe failed",
+                failure_cause="cancellation_monitor_failure",
                 retryable=False,
             )
         if not isinstance(initially_cancelled, bool):
@@ -532,6 +535,7 @@ class HermesKernelAdapter:
                 kind="failed",
                 failure_code="runtime_error",
                 failure_message="trusted cancellation probe returned an invalid value",
+                failure_cause="cancellation_monitor_failure",
                 retryable=False,
             )
         if initially_cancelled:
@@ -565,6 +569,7 @@ class HermesKernelAdapter:
                 kind="failed",
                 failure_code="runtime_error",
                 failure_message="trusted model-call allowance is required",
+                failure_cause="static_configuration_failure",
                 retryable=False,
             )
         if model_call_allowance == 0:
@@ -591,6 +596,7 @@ class HermesKernelAdapter:
                 kind="failed",
                 failure_code="runtime_error",
                 failure_message="trusted host credential source is required",
+                failure_cause="static_configuration_failure",
                 retryable=False,
             )
         credential_values = tuple(credentials.values())
@@ -669,6 +675,7 @@ class HermesKernelAdapter:
                 kind="failed",
                 failure_code="runtime_error",
                 failure_message="Hermes iteration budget could not be constructed",
+                failure_cause="static_configuration_failure",
                 retryable=False,
             )
         if credentials.get("api_key"):
@@ -735,6 +742,7 @@ class HermesKernelAdapter:
                     kind="failed",
                     failure_code="runtime_error",
                     failure_message="trusted cancellation could not interrupt Hermes",
+                    failure_cause="cancellation_monitor_failure",
                     retryable=False,
                     model_calls=self._observed_model_calls(agent, None),
                 )
@@ -754,6 +762,7 @@ class HermesKernelAdapter:
                 kind="failed",
                 failure_code="runtime_error",
                 failure_message="trusted cancellation probe failed",
+                failure_cause="cancellation_monitor_failure",
                 retryable=False,
                 model_calls=self._observed_model_calls(agent, result),
             )
@@ -768,7 +777,8 @@ class HermesKernelAdapter:
             return HermesKernelResult(
                 kind="failed",
                 failure_code="runtime_error",
-                failure_message=bound_runtime_text(host_binding.fatal_error, event_limit),
+                failure_message="Plane host operation failed",
+                failure_cause="host_operation_failure",
                 retryable=False,
                 model_calls=self._observed_model_calls(agent, result),
             )
@@ -783,6 +793,7 @@ class HermesKernelAdapter:
                 kind="failed",
                 failure_code="runtime_error",
                 failure_message="Hermes usage accounting was invalid",
+                failure_cause="invalid_usage_accounting",
                 retryable=False,
                 model_calls=self._observed_model_calls(agent, result),
             )
@@ -923,6 +934,7 @@ __all__ = [
     "HermesKernelResult",
     "NeverCancelled",
     "PROVIDER_RELAY_BASE_URL",
+    "RUNTIME_FAILURE_CAUSES",
     "bound_runtime_text",
     "prepare_provider_relay_credentials",
     "provider_relay_base_url",

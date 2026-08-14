@@ -32,6 +32,8 @@ from plane_runtime.g1_bootstrap_contract import G1BootstrapFrames
 from plane_runtime.g1_ledger import G1RuntimeLedger
 from plane_runtime.g1_runtime_image import bootstrap
 from plane_runtime.hermes_adapter import HermesKernelAdapter, HermesKernelResult, InlineCredentialSource, UnixSocketCredentialSource
+from plane_runtime.host_port import CallablePlaneHostPort, current_plane_host
+from plane_runtime.g1_service import _terminal_failure
 from plane_runtime.invocation_supervisor import (
     G1InvocationSupervisor,
     G1LocalTestRunner,
@@ -1352,6 +1354,128 @@ class G1RuntimeProcessTests(unittest.TestCase):
         )
         self.assertEqual(result.failure_code, "budget_exhausted")
         self.assertFalse(constructed)
+
+    def test_non_retryable_runtime_failures_emit_finite_causes_through_runtime_exit(self) -> None:
+        snapshot_raw = make_snapshot()
+        snapshot_raw["runtimePolicy"] = dict(snapshot_raw["runtimePolicy"])  # type: ignore[arg-type]
+        snapshot_raw["runtimePolicy"]["adapter"] = "hermes"  # type: ignore[index]
+        snapshot_raw["contentDigest"] = _digest(
+            "snapshot", {key: value for key, value in snapshot_raw.items() if key != "contentDigest"}
+        )
+        snapshot = G1RunSnapshot.from_dict(snapshot_raw)
+        invocation = G1InvocationEnvelope.from_dict(make_invocation(snapshot.to_dict()))
+
+        class Credentials:
+            def resolve(self, provider: str) -> dict[str, str]:
+                del provider
+                return {"api_key": "trusted-host-secret"}
+
+        def run_adapter(**kwargs: object) -> HermesKernelResult:
+            return HermesKernelAdapter(
+                agent_factory=kwargs.pop("agent_factory", None),  # type: ignore[arg-type]
+                credential_source=Credentials(),
+                host_port=kwargs.pop("host_port", None),  # type: ignore[arg-type]
+            ).dispatch(
+                snapshot,
+                invocation,
+                kwargs.pop("cancellation", lambda: False),  # type: ignore[arg-type]
+                lambda body: None,
+                model_call_allowance=kwargs.pop("model_call_allowance", 1),
+            )
+
+        cancellation_result = run_adapter(cancellation=lambda: (_ for _ in ()).throw(RuntimeError("secret probe")))
+
+        class CancellationAgent:
+            session_input_tokens = 0
+            session_output_tokens = 0
+            session_api_calls = 1
+
+            def run_conversation(self, message: str, *, system_message: str) -> dict[str, str]:
+                del message, system_message
+                time.sleep(0.12)
+                return {"final_response": "bounded"}
+
+        cancellation_calls = 0
+
+        def failing_monitor_probe() -> bool:
+            nonlocal cancellation_calls
+            cancellation_calls += 1
+            if cancellation_calls == 1:
+                return False
+            raise RuntimeError("secret monitor failure")
+
+        monitor_result = run_adapter(
+            agent_factory=lambda **kwargs: CancellationAgent(),
+            cancellation=failing_monitor_probe,
+        )
+
+        class UsageAgent:
+            session_input_tokens = "secret-invalid-usage"
+            session_output_tokens = 0
+            session_api_calls = 1
+
+            def run_conversation(self, message: str, *, system_message: str) -> dict[str, str]:
+                del message, system_message
+                return {"final_response": "bounded"}
+
+        usage_result = run_adapter(agent_factory=lambda **kwargs: UsageAgent())
+
+        def host_rpc(request: dict[str, object]) -> dict[str, object]:
+            return {
+                "protocol": "plane.agent-runtime/v1",
+                "requestRef": request["requestRef"],
+                "correlationId": request["correlationId"],
+                "idempotencyKey": request["idempotencyKey"],
+                "status": "conflict",
+                "replayed": False,
+                "output": None,
+                "errorCode": "IDEMPOTENCY_CONFLICT",
+                "errorMessage": "secret host error message",
+            }
+
+        class HostAgent:
+            session_input_tokens = 0
+            session_output_tokens = 0
+            session_api_calls = 1
+
+            def run_conversation(self, message: str, *, system_message: str) -> dict[str, str]:
+                del message, system_message
+                binding = current_plane_host()
+                assert binding is not None
+                binding.call(
+                    action="read",
+                    operation_ref="operation:work-item-read",
+                    input={},
+                    source="model",
+                )
+                return {"final_response": "bounded"}
+
+        host_result = run_adapter(
+            agent_factory=lambda **kwargs: HostAgent(),
+            host_port=CallablePlaneHostPort(host_rpc),
+        )
+
+        static_result = run_adapter(model_call_allowance=None)
+        cases = (
+            ("cancellation_monitor_failure", cancellation_result),
+            ("cancellation_monitor_failure", monitor_result),
+            ("invalid_usage_accounting", usage_result),
+            ("host_operation_failure", host_result),
+            ("static_configuration_failure", static_result),
+        )
+        for cause, result in cases:
+            self.assertEqual(result.failure_code, "runtime_error")
+            self.assertFalse(result.retryable)
+            self.assertEqual(result.failure_cause, cause)
+            exit_frame = _terminal_failure(snapshot, invocation, result, 0)
+            self.assertEqual(exit_frame["failure"]["cause"], cause)
+            self.assertNotIn("secret", json.dumps(exit_frame))
+
+        budget_result = HermesKernelAdapter(agent_factory=lambda **kwargs: object()).dispatch(
+            snapshot, invocation, lambda: False, lambda body: None, model_call_allowance=0
+        )
+        self.assertEqual(budget_result.failure_code, "budget_exhausted")
+        self.assertIsNone(budget_result.failure_cause)
 
     def test_approved_checkpoint_is_loaded_once_and_prefilled_before_hermes(self) -> None:
         snapshot = G1RunSnapshot.from_dict(make_snapshot())
