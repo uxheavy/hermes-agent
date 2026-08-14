@@ -699,6 +699,11 @@ class HermesKernelAdapter:
         )
         try:
             agent = self._agent_factory(**agent_kwargs)
+            # Plane's provider allowance is a hard invocation boundary. The
+            # interactive Hermes summary fallback would spend an additional
+            # provider call after that boundary, so return a finite budget
+            # failure instead.
+            setattr(agent, "_plane_runtime_terminal_budget_failure", True)
             cancellation_monitor = _CancellationMonitor(cancellation, agent)
             cancellation_monitor.start()
             prompt = (
@@ -805,6 +810,15 @@ class HermesKernelAdapter:
                 model_calls=model_calls,
             )
         if result.get("failed") is True:
+            if result.get("failure_reason") == "budget_exhausted":
+                return HermesKernelResult(
+                    kind="failed",
+                    failure_code="budget_exhausted",
+                    failure_message="model-call allowance is exhausted",
+                    retryable=False,
+                    usage=usage,
+                    model_calls=model_calls,
+                )
             return HermesKernelResult(
                 kind="failed",
                 failure_code="runtime_error",

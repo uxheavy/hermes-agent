@@ -52,7 +52,7 @@ class TestFailoverReason:
 
     def test_enum_members_exist(self):
         expected = {
-            "auth", "auth_permanent", "billing", "rate_limit",
+            "auth", "auth_permanent", "billing", "budget_exhausted", "rate_limit",
             "upstream_rate_limit",
             "overloaded", "server_error", "timeout",
             "ssl_cert_verification",
@@ -92,6 +92,19 @@ class TestClassifiedError:
         assert e.should_fallback is False
         assert e.status_code is None
         assert e.message == ""
+
+
+def test_invocation_model_call_budget_is_finite_and_not_retryable():
+    result = classify_api_error(
+        MockAPIError("forbidden", status_code=403, body={"error": "budget_exhausted"}),
+        provider="openai-codex",
+        model="gpt-5.6-luna",
+    )
+
+    assert result.reason == FailoverReason.budget_exhausted
+    assert result.retryable is False
+    assert result.should_rotate_credential is False
+    assert result.should_fallback is False
 
 
 # ── Test: Status code extraction ───────────────────────────────────────
@@ -1047,6 +1060,5 @@ class TestExpandedOverflowPatterns:
         )
         result = classify_api_error(e, provider="openrouter", model="m")
         assert result.reason == FailoverReason.context_overflow
-
 
 

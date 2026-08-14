@@ -30,6 +30,7 @@ class FailoverReason(enum.Enum):
 
     # Billing / quota
     billing = "billing"                  # 402 or confirmed credit exhaustion — rotate immediately
+    budget_exhausted = "budget_exhausted"  # Invocation-local hard model-call cap — never retry
     rate_limit = "rate_limit"            # 429 or quota-based throttling — backoff then rotate
     # Upstream model rate-limited (aggregator 429) — fallback to a different
     # model, NOT credential rotation. The user's key is healthy.
@@ -688,6 +689,21 @@ def classify_api_error(
         }
         defaults.update(overrides)
         return ClassifiedError(**defaults)
+
+    # Plane's relay uses a bounded, invocation-local model-call allowance.
+    # Replaying this request cannot make progress and would violate that
+    # allowance, so this must win over generic HTTP 403/auth handling.
+    if (
+        error_code.casefold() == "budget_exhausted"
+        or "model-call budget is exhausted" in error_msg
+        or "model call budget is exhausted" in error_msg
+    ):
+        return _result(
+            FailoverReason.budget_exhausted,
+            retryable=False,
+            should_rotate_credential=False,
+            should_fallback=False,
+        )
 
     # ── 1. Provider-specific patterns (highest priority) ────────────
 
@@ -1690,6 +1706,8 @@ def _extract_error_code(body: dict) -> str:
         return ""
 
     error_obj = body.get("error", {})
+    if isinstance(error_obj, str) and error_obj.strip():
+        return error_obj.strip()
     if isinstance(error_obj, dict):
         code = error_obj.get("code") or error_obj.get("type") or ""
         if isinstance(code, str) and code.strip() and code.strip() != "400":

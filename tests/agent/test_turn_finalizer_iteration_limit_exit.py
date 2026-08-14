@@ -196,6 +196,20 @@ def test_pending_response_records_kanban_timeout(monkeypatch):
     )
 
 
+def test_plane_runtime_budget_failure_does_not_request_summary(monkeypatch):
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    agent = _LimitAgent()
+    agent._plane_runtime_terminal_budget_failure = True
+
+    result = _finalize(agent, final_response=None, exit_reason="unknown")
+
+    assert agent._handle_max_iterations_called is False
+    assert result["failed"] is True
+    assert result["completed"] is False
+    assert result["failure_reason"] == "budget_exhausted"
+    assert result["error"] == "model-call allowance is exhausted"
+
+
 def test_published_pending_candidate_is_not_duplicated_by_finalizer(monkeypatch):
     """When budget exhaustion preserves a verification candidate that is
     already the tail assistant message, the finalizer must NOT append a
@@ -233,5 +247,4 @@ def test_published_pending_candidate_is_not_duplicated_by_finalizer(monkeypatch)
     assert agent.persisted_messages is not None
     persisted_roles = [m["role"] for m in agent.persisted_messages]
     assert persisted_roles == ["user", "assistant"]
-
 

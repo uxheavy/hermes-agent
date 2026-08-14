@@ -4863,6 +4863,7 @@ def run_conversation(
                         }
                     )
                 ) and not is_context_length_error
+                is_budget_exhausted = classified.reason == FailoverReason.budget_exhausted
 
                 if is_client_error:
                     # Try fallback before aborting — a different provider may
@@ -4871,14 +4872,14 @@ def run_conversation(
                     # exists; otherwise "trying fallback..." is a lie and the
                     # session looks like it's recovering when it's about to
                     # abort silently (#35314, #17446).
-                    if agent._has_pending_fallback():
+                    if agent._has_pending_fallback() and not is_budget_exhausted:
                         if classified.reason == FailoverReason.content_policy_blocked:
                             agent._buffer_status("⚠️ Provider safety filter blocked this request — trying fallback...")
                         elif classified.reason == FailoverReason.ssl_cert_verification:
                             agent._buffer_status("⚠️ TLS certificate verification failed — trying fallback...")
                         else:
                             agent._buffer_status(f"⚠️ Non-retryable error (HTTP {status_code}) — trying fallback...")
-                    if agent._try_activate_fallback():
+                    if not is_budget_exhausted and agent._try_activate_fallback():
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt)
                         retry_count = 0
@@ -5071,7 +5072,7 @@ def run_conversation(
                             "failure_reason": classified.reason.value,
                             "billing_block": _ce_block,
                         }
-                    return {
+                    result = {
                         "final_response": _nonretryable_summary,
                         "messages": messages,
                         "api_calls": api_call_count,
@@ -5079,6 +5080,9 @@ def run_conversation(
                         "failed": True,
                         "error": _nonretryable_summary,
                     }
+                    if is_budget_exhausted:
+                        result["failure_reason"] = FailoverReason.budget_exhausted.value
+                    return result
 
                 if retry_count >= max_retries:
                     # Before falling back, try rebuilding the primary

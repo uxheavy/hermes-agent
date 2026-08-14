@@ -510,6 +510,67 @@ class HostPortTests(unittest.TestCase):
         self.assertNotIn("credential", json.dumps(requests))
         self.assertNotIn("api_key", json.dumps(requests))
 
+    def test_denied_authorization_is_recoverable_but_unknown_outcome_stays_fatal(self) -> None:
+        calls = 0
+
+        def denied_then_ok(request: dict) -> dict:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return _result(
+                    request,
+                    status="denied",
+                    errorCode="NOT_AUTHORIZED",
+                    errorMessage="operation is not authorized",
+                )
+            return _result(request, output={"accepted": True})
+
+        binding = PlaneHostBinding(
+            port=CallablePlaneHostPort(denied_then_ok),
+            run_id="run:test",
+            invocation_id="invocation:test",
+            correlation_id="correlation:test",
+            cancellation=lambda: False,
+        )
+        denied = binding.call(
+            action="read",
+            operation_ref="operation:read@1",
+            input={},
+            source="model",
+        )
+        recovered = binding.call(
+            action="read",
+            operation_ref="operation:read@2",
+            input={},
+            source="model",
+        )
+        self.assertEqual(denied.status, "denied")
+        self.assertEqual(recovered.status, "ok")
+        self.assertIsNone(binding.fatal_error)
+
+        unknown = PlaneHostBinding(
+            port=CallablePlaneHostPort(
+                lambda request: _result(
+                    request,
+                    status="unavailable",
+                    errorCode="OUTCOME_UNKNOWN",
+                    errorMessage="host outcome is unknown",
+                )
+            ),
+            run_id="run:test",
+            invocation_id="invocation:test",
+            correlation_id="correlation:test",
+            cancellation=lambda: False,
+        )
+        unknown_result = unknown.call(
+            action="mutate",
+            operation_ref="operation:mutate@1",
+            input={},
+            source="model",
+        )
+        self.assertEqual(unknown_result.status, "unavailable")
+        self.assertIsNotNone(unknown.fatal_error)
+
     def test_changed_replay_binding_and_noncanonical_response_fail_closed(self) -> None:
         def changed_response(request: dict) -> dict:
             response = _result(request)

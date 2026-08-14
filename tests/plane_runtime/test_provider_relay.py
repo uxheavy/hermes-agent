@@ -4,7 +4,12 @@ from __future__ import annotations
 
 import io
 import json
+import os
+from pathlib import Path
+import socket
 import sys
+import tempfile
+import threading
 import types
 from unittest import mock
 
@@ -21,6 +26,7 @@ from plane_runtime.hermes_adapter import (
     prepare_provider_relay_credentials,
     provider_relay_base_url,
 )
+from plane_runtime.g1_service import serve_once_g1
 from plane_runtime.service import main as service_main
 
 from tests.plane_runtime.test_g1_runtime_process import make_invocation, make_snapshot, _digest
@@ -64,6 +70,103 @@ def _relay_credentials(
         "relayToken": token,
         "invocationSocket": socket_path,
     }
+
+
+class _LocalCodexRelay:
+    """One-request provider-free HTTP/SSE relay on an AF_UNIX socket."""
+
+    def __init__(self) -> None:
+        self._directory = tempfile.TemporaryDirectory(prefix="plane-codex-relay-")
+        self.path = os.path.join(self._directory.name, "relay.sock")
+        self.requests: list[tuple[str, bytes]] = []
+        self._server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self._server.bind(self.path)
+        self._server.listen(2)
+        self._server.settimeout(0.05)
+        self._stop = threading.Event()
+        self._ready = threading.Event()
+        self._thread = threading.Thread(target=self._serve, daemon=True)
+
+    def __enter__(self) -> "_LocalCodexRelay":
+        self._thread.start()
+        self._ready.wait(timeout=1)
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        self._stop.set()
+        self._server.close()
+        self._thread.join(timeout=1)
+        self._directory.cleanup()
+
+    def _serve(self) -> None:
+        self._ready.set()
+        while not self._stop.is_set():
+            try:
+                channel, _ = self._server.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            with channel:
+                channel.settimeout(1)
+                raw = bytearray()
+                while b"\r\n\r\n" not in raw:
+                    chunk = channel.recv(4096)
+                    if not chunk:
+                        return
+                    raw.extend(chunk)
+                header_bytes, body = bytes(raw).split(b"\r\n\r\n", 1)
+                headers = header_bytes.split(b"\r\n")
+                content_length = next(
+                    int(line.split(b":", 1)[1].strip())
+                    for line in headers[1:]
+                    if line.lower().startswith(b"content-length:")
+                )
+                while len(body) < content_length:
+                    body += channel.recv(4096)
+                self.requests.append((headers[0].decode("ascii"), body[:content_length]))
+                channel.sendall(_codex_sse_response())
+
+
+def _codex_sse_response() -> bytes:
+    events = [
+        {"type": "response.created", "response": {"id": "resp-relay", "status": "in_progress"}},
+        {
+            "type": "response.output_item.added",
+            "item": {"type": "message", "id": "msg-relay", "role": "assistant", "status": "in_progress", "content": []},
+        },
+        {"type": "response.output_text.delta", "delta": "relay-complete"},
+        {
+            "type": "response.output_item.done",
+            "item": {
+                "type": "message",
+                "id": "msg-relay",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{"type": "output_text", "text": "relay-complete", "annotations": []}],
+            },
+        },
+        {
+            "type": "response.completed",
+            "response": {
+                "id": "resp-relay",
+                "status": "completed",
+                "output": [],
+                "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            },
+        },
+    ]
+    body = b"".join(
+        b"data: " + json.dumps(event, separators=(",", ":")).encode() + b"\n\n"
+        for event in events
+    ) + b"data: [DONE]\n\n"
+    return (
+        b"HTTP/1.1 200 OK\r\n"
+        b"Content-Type: text/event-stream\r\n"
+        b"Cache-Control: no-cache\r\n"
+        b"Connection: close\r\n"
+        b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body
+    )
 
 
 class _BinaryStdin:
@@ -188,6 +291,65 @@ def test_openai_codex_relay_rejects_mismatched_provider_and_path() -> None:
             expected_provider="openai-codex",
             provider_relay_socket=socket_path,
         )
+
+
+def test_openai_codex_service_adapter_uses_native_sse_over_bounded_uds_relay() -> None:
+    snapshot, invocation, _request = _hermes_request(
+        provider="openai-codex", model="gpt-5.6-luna"
+    )
+    request_line = json.dumps(
+        {"invocation": invocation, "run": snapshot},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+    with _LocalCodexRelay() as relay:
+        source_credentials, factory = prepare_provider_relay_credentials(
+            _relay_credentials(relay.path, provider="openai-codex"),
+            expected_provider="openai-codex",
+            provider_relay_socket=relay.path,
+        )
+        output = io.StringIO()
+        diagnostics = io.StringIO()
+        with tempfile.TemporaryDirectory(prefix="hermes-plane-relay-home-") as home:
+            with mock.patch.dict(os.environ, {"HERMES_HOME": home}), mock.patch(
+                "agent.agent_init.fetch_model_metadata", return_value=None
+            ), mock.patch(
+                "agent.context_compressor.get_model_context_length", return_value=272000
+            ):
+                import run_agent
+
+                previous_home = run_agent._hermes_home
+                run_agent._hermes_home = Path(home)
+                try:
+                    status = serve_once_g1(
+                        request_line,
+                        output,
+                        production=True,
+                        diagnostics=diagnostics,
+                        model_call_allowance=1,
+                        credential_source=InlineCredentialSource(
+                            source_credentials, "openai-codex"
+                        ),
+                        http_client_factory=factory,
+                    )
+                finally:
+                    run_agent._hermes_home = previous_home
+
+    assert status == 0
+    frames = [json.loads(line) for line in output.getvalue().splitlines()]
+    assert frames[-1]["kind"] == "completed"
+    assert any(
+        frame.get("body", {}).get("kind") == "transcript_evidence_observed"
+        for frame in frames
+    )
+    assert '"protocol":"plane.agent-runtime/internal-usage/v1"' in diagnostics.getvalue()
+    assert len(relay.requests) == 1
+    request_line_seen, request_body = relay.requests[0]
+    assert request_line_seen == "POST /backend-api/codex/responses HTTP/1.1"
+    payload = json.loads(request_body)
+    assert payload["model"] == "gpt-5.6-luna"
+    assert "relay-secret" not in request_body.decode()
 
 
 def test_production_service_passes_only_dummy_openai_codex_credentials() -> None:

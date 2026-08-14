@@ -1300,6 +1300,43 @@ class G1RuntimeProcessTests(unittest.TestCase):
         self.assertEqual(result.usage["inputTokens"], 2)  # type: ignore[index]
         self.assertEqual(result.usage["outputTokens"], 2)  # type: ignore[index]
 
+    def test_hermes_adapter_preserves_terminal_model_call_budget_failure(self) -> None:
+        snapshot = G1RunSnapshot.from_dict(make_snapshot())
+        invocation = G1InvocationEnvelope.from_dict(make_invocation(snapshot.to_dict()))
+
+        class BudgetAgent:
+            session_input_tokens = 1
+            session_output_tokens = 1
+            session_api_calls = 1
+
+            def run_conversation(self, message: str, *, system_message: str) -> dict[str, object]:
+                del message, system_message
+                return {
+                    "failed": True,
+                    "failure_reason": "budget_exhausted",
+                    "error": "model-call allowance is exhausted",
+                }
+
+        class Credentials:
+            def resolve(self, provider: str) -> dict[str, str]:
+                del provider
+                return {"api_key": "trusted-host-secret"}
+
+        result = HermesKernelAdapter(
+            agent_factory=lambda **kwargs: BudgetAgent(),
+            credential_source=Credentials(),
+        ).dispatch(
+            snapshot,
+            invocation,
+            lambda: False,
+            lambda body: None,
+            model_call_allowance=1,
+        )
+
+        self.assertEqual(result.kind, "failed")
+        self.assertEqual(result.failure_code, "budget_exhausted")
+        self.assertFalse(result.retryable)
+
     def test_zero_model_call_allowance_does_not_construct_hermes(self) -> None:
         snapshot = G1RunSnapshot.from_dict(make_snapshot())
         invocation = G1InvocationEnvelope.from_dict(make_invocation(snapshot.to_dict()))
