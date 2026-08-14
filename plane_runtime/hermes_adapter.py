@@ -806,6 +806,8 @@ class HermesKernelAdapter:
         )
         try:
             agent = self._agent_factory(**agent_kwargs)
+            if host_binding is not None:
+                setattr(agent, "_terminal_action_check", host_binding.terminal_action_reason)
             # Plane's provider allowance is a hard invocation boundary. The
             # interactive Hermes summary fallback would spend an additional
             # provider call after that boundary, so return a finite budget
@@ -968,8 +970,14 @@ class HermesKernelAdapter:
         output = result.get("final_response")
         if output is None:
             output = "".join(streamed)
+        terminal_action = str(result.get("turn_exit_reason", "")).startswith(
+            "terminal_action("
+        )
         output_text = bound_runtime_text(
-            redact_runtime_text(str(output or "Hermes invocation completed."), credential_values),
+            redact_runtime_text(
+                str(output or ("" if terminal_action else "Hermes invocation completed.")),
+                credential_values,
+            ),
             event_limit,
         )
         emit_body(
@@ -979,13 +987,14 @@ class HermesKernelAdapter:
                 "publication": {"action": "observation_only"},
             }
         )
-        emit_body(
-            {
-                "kind": "transcript_evidence_observed",
-                "payload": {"kind": "inline_text", "contentType": "text/plain", "text": output_text or "Hermes invocation completed."},
-                "publication": {"action": "observation_only"},
-            }
-        )
+        if output_text:
+            emit_body(
+                {
+                    "kind": "transcript_evidence_observed",
+                    "payload": {"kind": "inline_text", "contentType": "text/plain", "text": output_text},
+                    "publication": {"action": "observation_only"},
+                }
+            )
         return HermesKernelResult(kind="completed", output_text=output_text, usage=usage, model_calls=model_calls)
 
     @staticmethod

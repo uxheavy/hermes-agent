@@ -579,6 +579,7 @@ class PlaneHostBinding:
     records: list[HostCallRecord] = field(default_factory=list)
     described_operation_refs: set[str] = field(default_factory=set, init=False, repr=False)
     _fatal_error: str | None = field(default=None, init=False, repr=False)
+    _terminal_action_reason: str | None = field(default=None, init=False, repr=False)
     _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -606,6 +607,12 @@ class PlaneHostBinding:
     @property
     def publication_count(self) -> int:
         return sum(1 for item in self.records if item.request.action == "publish")
+
+    def terminal_action_reason(self) -> str | None:
+        """Return the one-shot terminal reason after its observation is emitted."""
+
+        with self._lock:
+            return self._terminal_action_reason
 
     def _fail(self, message: str) -> None:
         if self._fatal_error is None:
@@ -766,27 +773,35 @@ class PlaneHostBinding:
             self._fail(str(exc) or "explicit publication receipt was invalid")
             raise PlaneHostUnavailable("explicit publication receipt was invalid") from exc
         if self.emit_body is not None:
-            try:
-                self.emit_body(
-                    {
-                        "kind": (
-                            "conversation_publication_observed"
-                            if kind == "conversation"
-                            else "outcome_submission_observed"
-                        ),
-                        "payload": {
-                            "kind": "inline_text",
-                            "contentType": "text/plain",
-                            "text": content,
-                        },
-                        "publication": publication,
-                    }
+            with self._lock:
+                terminal_outcome = (
+                    kind == "outcome" and publication["action"] == "applied"
                 )
-            except Exception as exc:
-                self._fail("Plane publication observation could not be emitted")
-                raise PlaneHostUnavailable(
-                    "Plane publication observation could not be emitted"
-                ) from exc
+                if terminal_outcome and self._terminal_action_reason is not None:
+                    return result
+                try:
+                    self.emit_body(
+                        {
+                            "kind": (
+                                "conversation_publication_observed"
+                                if kind == "conversation"
+                                else "outcome_submission_observed"
+                            ),
+                            "payload": {
+                                "kind": "inline_text",
+                                "contentType": "text/plain",
+                                "text": content,
+                            },
+                            "publication": publication,
+                        }
+                    )
+                except Exception as exc:
+                    self._fail("Plane publication observation could not be emitted")
+                    raise PlaneHostUnavailable(
+                        "Plane publication observation could not be emitted"
+                    ) from exc
+                if terminal_outcome:
+                    self._terminal_action_reason = "product_outcome_published"
         return result
 
     def _emit_call_observation(

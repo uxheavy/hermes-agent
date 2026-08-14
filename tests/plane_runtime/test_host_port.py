@@ -763,6 +763,204 @@ class HostPortTests(unittest.TestCase):
         )
         self.assertEqual(binding.publication_count, 1)
 
+    def test_terminal_action_requires_applied_outcome_and_is_idempotent(self) -> None:
+        bodies: list[dict] = []
+        calls = 0
+
+        def rpc(request: dict) -> dict:
+            nonlocal calls
+            calls += 1
+            status = "ok" if calls == 1 else "replayed"
+            return _result(
+                request,
+                status=status,
+                output={"published": True},
+                publication={
+                    "action": "applied",
+                    "productKind": "outcome_submission",
+                    "productRef": "outcome-submission:test",
+                    "operationAttemptRef": "operation-attempt:attempt-1",
+                    "operationRef": "operation:conversation-publish@1",
+                    "applicationServiceRef": "application-service:conversation",
+                    "gatewayReceiptRef": "gateway-receipt:receipt-1",
+                    "receiptRef": "receipt:receipt-1",
+                    "auditReceiptRef": "audit-receipt:audit-1",
+                    "productEventRef": "product-event:event-1",
+                },
+            )
+
+        binding = PlaneHostBinding(
+            port=CallablePlaneHostPort(rpc),
+            run_id="run:test",
+            invocation_id="invocation:test",
+            correlation_id="correlation:test",
+            cancellation=lambda: False,
+            emit_body=bodies.append,
+        )
+        binding.publish(
+            kind="outcome",
+            operation_ref="operation:conversation-publish@1",
+            resource_ref="outcome-submission:test",
+            content="bounded outcome",
+        )
+        binding.publish(
+            kind="outcome",
+            operation_ref="operation:conversation-publish@1",
+            resource_ref="outcome-submission:test",
+            content="bounded outcome",
+        )
+
+        self.assertEqual(binding.terminal_action_reason(), "product_outcome_published")
+        self.assertEqual(
+            [body["kind"] for body in bodies],
+            ["progress_observed", "outcome_submission_observed", "progress_observed"],
+        )
+
+    def test_nonterminal_publications_and_plain_calls_do_not_signal(self) -> None:
+        def conversation_rpc(request: dict) -> dict:
+            return _result(
+                request,
+                publication={
+                    "action": "proposal",
+                    "productKind": "conversation",
+                    "productRef": "conversation:test",
+                    "operationAttemptRef": "operation-attempt:attempt-1",
+                },
+            )
+
+        binding = PlaneHostBinding(
+            port=CallablePlaneHostPort(conversation_rpc),
+            run_id="run:test",
+            invocation_id="invocation:test",
+            correlation_id="correlation:test",
+            cancellation=lambda: False,
+            emit_body=lambda _body: None,
+        )
+        binding.publish(
+            kind="conversation",
+            operation_ref="operation:conversation-publish@1",
+            resource_ref="conversation:test",
+            content="conversation evidence",
+        )
+        binding.call(
+            action="read",
+            operation_ref="operation:read@1",
+            input={},
+            source="model",
+        )
+        self.assertIsNone(binding.terminal_action_reason())
+
+        def denied_rpc(request: dict) -> dict:
+            return _result(
+                request,
+                status="denied",
+                errorCode="NOT_AUTHORIZED",
+                errorMessage="publication is not authorized",
+            )
+
+        denied = PlaneHostBinding(
+            port=CallablePlaneHostPort(denied_rpc),
+            run_id="run:test",
+            invocation_id="invocation:test",
+            correlation_id="correlation:test",
+            cancellation=lambda: False,
+            emit_body=lambda _body: None,
+        )
+        denied.publish(
+            kind="outcome",
+            operation_ref="operation:conversation-publish@1",
+            resource_ref="outcome-submission:test",
+            content="denied outcome",
+        )
+        self.assertIsNone(denied.terminal_action_reason())
+        self.assertIsNotNone(denied.fatal_error)
+
+        failed = PlaneHostBinding(
+            port=CallablePlaneHostPort(
+                lambda request: _result(
+                    request,
+                    status="unavailable",
+                    errorCode="OUTCOME_UNKNOWN",
+                    errorMessage="publication outcome is unknown",
+                )
+            ),
+            run_id="run:test",
+            invocation_id="invocation:test",
+            correlation_id="correlation:test",
+            cancellation=lambda: False,
+            emit_body=lambda _body: None,
+        )
+        failed.publish(
+            kind="outcome",
+            operation_ref="operation:conversation-publish@1",
+            resource_ref="outcome-submission:test",
+            content="failed outcome",
+        )
+        self.assertIsNone(failed.terminal_action_reason())
+        self.assertIsNotNone(failed.fatal_error)
+
+        def applied_rpc(request: dict) -> dict:
+            return _result(
+                request,
+                publication={
+                    "action": "applied",
+                    "productKind": "outcome_submission",
+                    "productRef": "outcome-submission:test",
+                    "operationAttemptRef": "operation-attempt:attempt-1",
+                    "operationRef": "operation:conversation-publish@1",
+                    "applicationServiceRef": "application-service:conversation",
+                    "gatewayReceiptRef": "gateway-receipt:receipt-1",
+                    "receiptRef": "receipt:receipt-1",
+                    "auditReceiptRef": "audit-receipt:audit-1",
+                    "productEventRef": "product-event:event-1",
+                },
+            )
+
+        emission_failed = PlaneHostBinding(
+            port=CallablePlaneHostPort(applied_rpc),
+            run_id="run:test",
+            invocation_id="invocation:test",
+            correlation_id="correlation:test",
+            cancellation=lambda: False,
+            emit_body=mock.Mock(side_effect=RuntimeError("event sink failed")),
+        )
+        with self.assertRaises(PlaneHostUnavailable):
+            emission_failed.publish(
+                kind="outcome",
+                operation_ref="operation:conversation-publish@1",
+                resource_ref="outcome-submission:test",
+                content="unobserved outcome",
+            )
+        self.assertIsNone(emission_failed.terminal_action_reason())
+
+        def non_applied_replay(request: dict) -> dict:
+            return _result(
+                request,
+                status="replayed",
+                publication={
+                    "action": "proposal",
+                    "productKind": "conversation",
+                    "productRef": "conversation:test",
+                    "operationAttemptRef": "operation-attempt:attempt-1",
+                },
+            )
+
+        replayed = PlaneHostBinding(
+            port=CallablePlaneHostPort(non_applied_replay),
+            run_id="run:test",
+            invocation_id="invocation:test",
+            correlation_id="correlation:test",
+            cancellation=lambda: False,
+            emit_body=lambda _body: None,
+        )
+        replayed.publish(
+            kind="conversation",
+            operation_ref="operation:conversation-publish@1",
+            resource_ref="conversation:test",
+            content="replayed conversation",
+        )
+        self.assertIsNone(replayed.terminal_action_reason())
+
     def test_tools_are_registry_dispatchable_only_inside_a_bound_context(self) -> None:
         install_plane_tools()
         self.assertIsNotNone(registry.get_entry("plane_operation"))
@@ -1054,6 +1252,143 @@ class HostPortTests(unittest.TestCase):
             [body["payload"]["text"] for body in bodies if body["kind"] == "transcript_evidence_observed"],
             ["ordinary final evidence"],
         )
+
+    def test_real_hermes_adapter_stops_after_applied_outcome_without_fake_final_text(self) -> None:
+        from tests.plane_runtime.test_g1_runtime_process import (
+            G1InvocationEnvelope,
+            G1RunSnapshot,
+            _digest,
+            make_invocation,
+            make_snapshot,
+        )
+        from plane_runtime.hermes_adapter import HermesKernelAdapter
+        from run_agent import AIAgent
+
+        snapshot_raw = make_snapshot()
+        snapshot_raw["runtimePolicy"] = dict(snapshot_raw["runtimePolicy"])  # type: ignore[index]
+        snapshot_raw["runtimePolicy"]["adapter"] = "hermes"  # type: ignore[index]
+        snapshot_raw["runtimePolicy"]["model"] = {  # type: ignore[index]
+            "provider": "openai",
+            "model": "deterministic-local",
+        }
+        snapshot_raw["contentDigest"] = _digest(  # type: ignore[assignment]
+            "snapshot",
+            {key: value for key, value in snapshot_raw.items() if key != "contentDigest"},
+        )
+        snapshot = G1RunSnapshot.from_dict(snapshot_raw)
+        invocation = G1InvocationEnvelope.from_dict(make_invocation(snapshot.to_dict()))
+
+        class Completions:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def create(self, **_kwargs: object):
+                self.calls += 1
+                tool_call = SimpleNamespace(
+                    id="call-outcome",
+                    function=SimpleNamespace(
+                        name="tool_call",
+                        arguments=json.dumps(
+                            {
+                                "name": "plane_publish",
+                                "arguments": {
+                                    "kind": "outcome",
+                                    "operationRef": "operation:conversation-publish",
+                                    "resourceRef": "outcome-submission:test",
+                                    "content": "bounded outcome",
+                                },
+                            }
+                        ),
+                    ),
+                    extra_content=None,
+                )
+                return SimpleNamespace(
+                    choices=[
+                        SimpleNamespace(
+                            finish_reason="tool_calls",
+                            message=SimpleNamespace(
+                                content=None,
+                                tool_calls=[tool_call],
+                                reasoning=None,
+                                reasoning_content=None,
+                                refusal=None,
+                            ),
+                        )
+                    ],
+                    usage=SimpleNamespace(
+                        prompt_tokens=1,
+                        completion_tokens=1,
+                        total_tokens=2,
+                    ),
+                )
+
+        class Client:
+            def __init__(self) -> None:
+                self.completions = Completions()
+                self.chat = SimpleNamespace(completions=self.completions)
+
+        class Credentials:
+            def resolve(self, provider: str) -> dict[str, str]:
+                del provider
+                return {
+                    "api_key": "model-only-secret",
+                    "base_url": "http://127.0.0.1",
+                    "api_mode": "chat_completions",
+                }
+
+        client = Client()
+
+        def agent_factory(**kwargs: object) -> AIAgent:
+            agent = AIAgent(**kwargs)
+            agent._create_request_openai_client = lambda **_: client  # type: ignore[method-assign]
+            return agent
+
+        def rpc(request: dict) -> dict:
+            return _result(
+                request,
+                output={"published": True},
+                publication={
+                    "action": "applied",
+                    "productKind": "outcome_submission",
+                    "productRef": "outcome-submission:test",
+                    "operationAttemptRef": "operation-attempt:attempt-1",
+                    "operationRef": "operation:conversation-publish",
+                    "applicationServiceRef": "application-service:conversation",
+                    "gatewayReceiptRef": "gateway-receipt:receipt-1",
+                    "receiptRef": "receipt:receipt-1",
+                    "auditReceiptRef": "audit-receipt:audit-1",
+                    "productEventRef": "product-event:event-1",
+                },
+            )
+
+        bodies: list[dict] = []
+        with mock.patch.dict(os.environ, {"HERMES_HOME": _TEST_HERMES_HOME.name}):
+            import run_agent
+
+            run_agent._hermes_home = Path(_TEST_HERMES_HOME.name)
+            result = HermesKernelAdapter(
+                agent_factory=agent_factory,
+                credential_source=Credentials(),
+                host_port=CallablePlaneHostPort(rpc),
+            ).dispatch(
+                snapshot,
+                invocation,
+                lambda: False,
+                bodies.append,
+                model_call_allowance=3,
+            )
+
+        self.assertEqual(result.kind, "completed")
+        self.assertEqual(result.output_text, "")
+        self.assertEqual(result.model_calls, 1)
+        self.assertEqual(client.completions.calls, 1)
+        self.assertEqual(
+            sum(body["kind"] == "outcome_submission_observed" for body in bodies),
+            1,
+        )
+        self.assertEqual(sum(body["kind"] == "usage_observed" for body in bodies), 1)
+        self.assertFalse(any(body["kind"] == "transcript_evidence_observed" for body in bodies))
+        self.assertNotIn("Hermes invocation completed.", json.dumps(bodies))
 
     def test_real_hermes_adapter_recovers_from_validation_result(self) -> None:
         from tests.plane_runtime.test_g1_runtime_process import (

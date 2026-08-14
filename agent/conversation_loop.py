@@ -6167,6 +6167,18 @@ def run_conversation(
                     failed = True
                     break
 
+                terminal_action_check = getattr(agent, "_terminal_action_check", None)
+                if callable(terminal_action_check):
+                    terminal_action_reason = terminal_action_check()
+                    if terminal_action_reason is not None:
+                        if (
+                            not isinstance(terminal_action_reason, str)
+                            or not terminal_action_reason
+                        ):
+                            raise TypeError("terminal action reason must be a non-empty string")
+                        _turn_exit_reason = f"terminal_action({terminal_action_reason})"
+                        break
+
                 if agent._tool_guardrail_halt_decision is not None:
                     decision = agent._tool_guardrail_halt_decision
                     _turn_exit_reason = "guardrail_halt"

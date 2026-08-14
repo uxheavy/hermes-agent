@@ -2700,6 +2700,74 @@ class TestRunConversation:
         assert mock_handle_function_call.call_args.kwargs["tool_call_id"] == "c1"
         assert mock_handle_function_call.call_args.kwargs["session_id"] == agent.session_id
 
+    def test_terminal_action_stops_after_tool_without_an_extra_provider_call(self, agent):
+        self._setup_agent(agent)
+        tc = _mock_tool_call(name="web_search", arguments="{}", call_id="terminal")
+        agent.client.chat.completions.create.return_value = _mock_response(
+            content="", finish_reason="tool_calls", tool_calls=[tc]
+        )
+        agent._terminal_action_check = lambda: "product_outcome_published"
+        with (
+            patch("run_agent.handle_function_call", return_value="tool result"),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("publish the result")
+
+        assert result["completed"] is True
+        assert result["failed"] is False
+        assert result["final_response"] is None
+        assert result["turn_exit_reason"] == "terminal_action(product_outcome_published)"
+        assert result["api_calls"] == 1
+        assert agent.client.chat.completions.create.call_count == 1
+
+    def test_terminal_action_check_none_continues_to_the_next_provider_call(self, agent):
+        self._setup_agent(agent)
+        tc = _mock_tool_call(name="web_search", arguments="{}", call_id="continue")
+        agent.client.chat.completions.create.side_effect = [
+            _mock_response(content="", finish_reason="tool_calls", tool_calls=[tc]),
+            _mock_response(content="ordinary final", finish_reason="stop"),
+        ]
+        agent._terminal_action_check = lambda: None
+        with (
+            patch("run_agent.handle_function_call", return_value="tool result"),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("continue the conversation")
+
+        assert result["completed"] is True
+        assert result["final_response"] == "ordinary final"
+        assert result["api_calls"] == 2
+        assert agent.client.chat.completions.create.call_count == 2
+
+    def test_no_terminal_action_still_reaches_the_budget_failure(self, agent):
+        from agent.iteration_budget import IterationBudget
+
+        self._setup_agent(agent)
+        tc = _mock_tool_call(name="web_search", arguments="{}", call_id="budget")
+        agent.client.chat.completions.create.return_value = _mock_response(
+            content="", finish_reason="tool_calls", tool_calls=[tc]
+        )
+        agent.max_iterations = 2
+        agent.iteration_budget = IterationBudget(2)
+        agent._plane_runtime_terminal_budget_failure = True
+        with (
+            patch("run_agent.handle_function_call", return_value="tool result"),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("keep working")
+
+        assert result["completed"] is False
+        assert result["failed"] is True
+        assert result["failure_reason"] == "budget_exhausted"
+        assert result["api_calls"] == 2
+        assert agent.client.chat.completions.create.call_count == 2
+
 
     def test_request_scoped_api_hooks_fire_for_each_api_call(self, agent):
         self._setup_agent(agent)
@@ -5712,5 +5780,4 @@ class TestMemoryContextSanitization:
         assert "memory-context" not in result.lower()
         assert "stale observation" not in result
         assert "how is the honcho working" in result
-
 

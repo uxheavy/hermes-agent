@@ -199,12 +199,15 @@ def finalize_turn(
 
     # Determine if conversation completed successfully
     normal_text_response = str(_turn_exit_reason).startswith("text_response(")
+    terminal_action = str(_turn_exit_reason).startswith("terminal_action(")
     completed = (
-        final_response is not None
-        and not failed
+        not failed
         and (
-            api_call_count < agent.max_iterations
-            or normal_text_response
+            terminal_action
+            or (
+                final_response is not None
+                and (api_call_count < agent.max_iterations or normal_text_response)
+            )
         )
     )
 
@@ -395,7 +398,7 @@ def finalize_turn(
         agent.session_id or "none",
     )
 
-    if _last_msg_role == "tool" and not interrupted:
+    if _last_msg_role == "tool" and not interrupted and not terminal_action:
         # Agent was mid-work — this is the "just stops" case.
         logger.warning(
             "Turn ended with pending tool result (agent may appear stuck). "
@@ -446,7 +449,7 @@ def finalize_turn(
     #     an empty response, the "(empty)" terminal sentinel, or a
     #     suspiciously short partial fragment with no terminating
     #     punctuation (e.g. "The").  A real short answer keeps its text.
-    if not interrupted:
+    if not interrupted and not terminal_action:
         try:
             if agent._turn_completion_explainer_enabled():
                 _stripped = (final_response or "").strip()
