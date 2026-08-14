@@ -25,7 +25,8 @@ import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any, Callable, Iterator, Mapping, Protocol
+from types import MappingProxyType
+from typing import Any, Callable, Iterator, Literal, Mapping, Protocol
 
 
 HOST_PROTOCOL = "plane.agent-runtime/v1"
@@ -52,6 +53,20 @@ _RESULT_STATUSES = {
     "unavailable",
     "invalid",
 }
+
+HostResultDisposition = Literal[
+    "continue_with_tool_result",
+    "poison_invocation",
+]
+
+_HOST_RESULT_DISPOSITIONS: Mapping[tuple[str, str | None], HostResultDisposition] = MappingProxyType(
+    {
+        ("ok", None): "continue_with_tool_result",
+        ("replayed", None): "continue_with_tool_result",
+        ("invalid", "VALIDATION_ERROR"): "continue_with_tool_result",
+        ("denied", "NOT_AUTHORIZED"): "continue_with_tool_result",
+    }
+)
 
 
 class PlaneHostError(ValueError):
@@ -362,6 +377,12 @@ def _bound_host_result(request: HostCallRequest, raw: Any) -> HostCallResult:
     return result
 
 
+def _host_result_disposition(result: HostCallResult) -> HostResultDisposition:
+    return _HOST_RESULT_DISPOSITIONS.get(
+        (result.status, result.error_code), "poison_invocation"
+    )
+
+
 class UnixSocketPlaneHostPort:
     """Invocation-scoped canonical JSONL client for the trusted Plane host.
 
@@ -624,7 +645,7 @@ class PlaneHostBinding:
                 raise PlaneHostUnavailable("Plane host callback failed") from exc
             self.records.append(HostCallRecord(request, result))
             self._emit_call_observation(request, result)
-            if result.status in {"unavailable", "invalid", "conflict"}:
+            if _host_result_disposition(result) == "poison_invocation":
                 self._fail(result.error_message or "Plane host rejected the callback")
             if self._is_cancelled():
                 self._fail("Plane host callback cancelled")
