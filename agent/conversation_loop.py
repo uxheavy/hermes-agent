@@ -2001,6 +2001,13 @@ def run_conversation(
         api_kwargs = None  # Guard against UnboundLocalError in except handler
         api_request_id = f"{turn_id}:api:{api_call_count}"
         agent._current_api_request_id = api_request_id
+        _plane_provider_relay = bool(
+            getattr(
+                getattr(agent, "_http_client_factory", None),
+                "_plane_provider_relay",
+                False,
+            )
+        )
 
         while retry_count < max_retries:
             # ── Nous Portal rate limit guard ──────────────────────
@@ -2173,7 +2180,7 @@ def run_conversation(
                 except Exception:
                     pass
 
-                if env_var_enabled("HERMES_DUMP_REQUESTS"):
+                if env_var_enabled("HERMES_DUMP_REQUESTS") and not _plane_provider_relay:
                     agent._dump_api_request_debug(api_kwargs, reason="preflight")
 
                 # This object is private to the in-process MoA facade.  Add it
@@ -4903,7 +4910,11 @@ def run_conversation(
                         compression_attempts = 0
                         _retry.primary_recovery_attempted = False
                         continue
-                    if api_kwargs is not None and not is_terminal_failure:
+                    if (
+                        api_kwargs is not None
+                        and not is_terminal_failure
+                        and not _plane_provider_relay
+                    ):
                         agent._dump_api_request_debug(
                             api_kwargs, reason="non_retryable_client_error", error=api_error,
                         )
@@ -5270,7 +5281,7 @@ def run_conversation(
                         agent.log_prefix, max_retries, _final_summary,
                         _provider, _model, len(api_messages), f"{approx_tokens:,}",
                     )
-                    if api_kwargs is not None:
+                    if api_kwargs is not None and not _plane_provider_relay:
                         agent._dump_api_request_debug(
                             api_kwargs, reason="max_retries_exhausted", error=api_error,
                         )

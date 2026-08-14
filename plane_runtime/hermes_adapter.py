@@ -14,6 +14,8 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Callable, Mapping, MutableMapping, Protocol, Sequence
 
+import httpx
+
 from .g1_contract import (
     G1ContractError,
     G1InvocationEnvelope,
@@ -65,9 +67,40 @@ class ProviderOutcomeUnknownError(RuntimeError):
         super().__init__("provider outcome is unknown; reconcile before retrying")
 
 
+class _ProviderRelayBodyStream(httpx.SyncByteStream):
+    """Turn post-header relay read failures into the typed terminal signal."""
+
+    def __init__(self, stream: Any, *, status_code: int) -> None:
+        self._stream = stream
+        self._status_code = status_code
+
+    def __iter__(self):
+        try:
+            yield from self._stream
+        except ProviderOutcomeUnknownError:
+            raise
+        except Exception as exc:
+            raise ProviderOutcomeUnknownError(status_code=self._status_code) from exc
+
+    def close(self) -> None:
+        close = getattr(self._stream, "close", None)
+        if not callable(close):
+            return
+        try:
+            close()
+        except ProviderOutcomeUnknownError:
+            raise
+        except Exception as exc:
+            raise ProviderOutcomeUnknownError(status_code=self._status_code) from exc
+
+
 def _raise_on_provider_outcome_unknown(response: Any) -> None:
     """Decode the relay's bounded ambiguity marker at the HTTP boundary."""
 
+    response.stream = _ProviderRelayBodyStream(
+        response.stream,
+        status_code=int(response.status_code),
+    )
     if response.status_code < 400:
         return
     content_length = response.headers.get("content-length")
@@ -79,8 +112,10 @@ def _raise_on_provider_outcome_unknown(response: Any) -> None:
         return
     try:
         body = response.read()
-    except Exception:
-        return
+    except ProviderOutcomeUnknownError:
+        raise
+    except Exception as exc:
+        raise ProviderOutcomeUnknownError(status_code=int(response.status_code)) from exc
     if len(body) > _MAX_PROVIDER_ERROR_BODY_BYTES:
         return
     try:
@@ -185,8 +220,6 @@ class _ProviderRelayConfig:
         """Build fresh SDK-owned HTTP clients bound to this invocation relay."""
 
         def create_client() -> Any:
-            import httpx
-
             client_request_id = str(uuid.uuid4())
 
             def apply_relay_headers(request: Any) -> None:
@@ -215,6 +248,7 @@ class _ProviderRelayConfig:
                 },
             )
 
+        setattr(create_client, "_plane_provider_relay", True)
         return create_client
 
 

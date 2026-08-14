@@ -170,6 +170,19 @@ def _codex_sse_response() -> bytes:
     )
 
 
+def _broken_codex_sse_response() -> bytes:
+    body = b'data: {"type":"response.created"}\n\n'
+    return (
+        b"HTTP/1.1 200 OK\r\n"
+        b"Content-Type: text/event-stream\r\n"
+        b"Connection: close\r\n"
+        b"Content-Length: "
+        + str(len(body) + 1).encode()
+        + b"\r\n\r\n"
+        + body
+    )
+
+
 def _outcome_unknown_response(*, status_code: int = 502) -> bytes:
     body = json.dumps(
         {
@@ -214,6 +227,7 @@ def test_provider_relay_metadata_is_consumed_and_client_factory_is_exact() -> No
         "api_mode": "chat_completions",
     }
     assert factory is not None
+    assert getattr(factory, "_plane_provider_relay", False) is True
 
     clients = [object(), object()]
     with mock.patch("httpx.HTTPTransport") as transport, mock.patch(
@@ -433,6 +447,71 @@ def test_openai_codex_outcome_unknown_stops_without_replay_or_fallback() -> None
     assert len(relay.requests) == 1
     activate_fallback.assert_not_called()
     assert '"modelCalls":' in diagnostics.getvalue()
+    assert "relay-secret" not in output.getvalue()
+    assert "Return a deterministic runtime outcome." not in output.getvalue()
+
+
+def test_openai_codex_midstream_failure_stops_without_replay_fallback_or_dump() -> None:
+    snapshot, invocation, _request = _hermes_request(
+        provider="openai-codex", model="gpt-5.6-luna"
+    )
+    request_line = json.dumps(
+        {"invocation": invocation, "run": snapshot},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+    with _LocalCodexRelay(response=_broken_codex_sse_response()) as relay:
+        source_credentials, factory = prepare_provider_relay_credentials(
+            _relay_credentials(relay.path, provider="openai-codex"),
+            expected_provider="openai-codex",
+            provider_relay_socket=relay.path,
+        )
+        output = io.StringIO()
+        diagnostics = io.StringIO()
+        with tempfile.TemporaryDirectory(prefix="hermes-plane-relay-home-") as home:
+            with mock.patch.dict(
+                os.environ,
+                {"HERMES_HOME": home, "HERMES_DUMP_REQUESTS": "1"},
+            ), mock.patch(
+                "agent.agent_init.fetch_model_metadata", return_value=None
+            ), mock.patch(
+                "agent.context_compressor.get_model_context_length", return_value=272000
+            ):
+                import run_agent
+
+                previous_home = run_agent._hermes_home
+                run_agent._hermes_home = Path(home)
+                try:
+                    with mock.patch.object(
+                        run_agent.AIAgent, "_try_activate_fallback", return_value=False
+                    ) as activate_fallback:
+                        status = serve_once_g1(
+                            request_line,
+                            output,
+                            production=True,
+                            diagnostics=diagnostics,
+                            model_call_allowance=12,
+                            credential_source=InlineCredentialSource(
+                                source_credentials, "openai-codex"
+                            ),
+                            http_client_factory=factory,
+                        )
+                finally:
+                    run_agent._hermes_home = previous_home
+            request_dumps = list(Path(home).rglob("request_dump_*.json"))
+
+    assert status == 0
+    frames = [json.loads(line) for line in output.getvalue().splitlines()]
+    assert frames[-1]["kind"] == "failed"
+    assert frames[-1]["failure"] == {
+        "code": "outcome_unknown",
+        "message": "Provider outcome is unknown; Plane reconciliation is required before retrying.",
+        "retryable": False,
+    }
+    assert len(relay.requests) == 1
+    activate_fallback.assert_not_called()
+    assert request_dumps == []
     assert "relay-secret" not in output.getvalue()
     assert "Return a deterministic runtime outcome." not in output.getvalue()
 
