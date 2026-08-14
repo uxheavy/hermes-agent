@@ -580,6 +580,7 @@ class PlaneHostBinding:
     described_operation_refs: set[str] = field(default_factory=set, init=False, repr=False)
     _fatal_error: str | None = field(default=None, init=False, repr=False)
     _terminal_action_reason: str | None = field(default=None, init=False, repr=False)
+    _terminal_action_result: HostCallResult | None = field(default=None, init=False, repr=False)
     _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -751,6 +752,16 @@ class PlaneHostBinding:
         except PlaneHostError as exc:
             self._fail(str(exc) or "publication request was invalid")
             raise
+        with self._lock:
+            if self._terminal_action_reason is not None:
+                # A fresh applied outcome already requested terminal stop.  Do
+                # not send another publication through Plane while the current
+                # model tool batch is being drained; return the applied receipt
+                # that armed terminal state instead.
+                if self._terminal_action_result is None:
+                    self._fail("terminal publication receipt is unavailable")
+                    raise PlaneHostUnavailable("terminal publication receipt is unavailable")
+                return self._terminal_action_result
         result = self.call(
             action="publish",
             operation_ref=operation_ref,
@@ -807,6 +818,7 @@ class PlaneHostBinding:
                     ) from exc
                 if terminal_outcome:
                     self._terminal_action_reason = "product_outcome_published"
+                    self._terminal_action_result = result
         return result
 
     def _emit_call_observation(

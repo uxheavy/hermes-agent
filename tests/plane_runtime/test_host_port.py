@@ -763,17 +763,22 @@ class HostPortTests(unittest.TestCase):
         )
         self.assertEqual(binding.publication_count, 1)
 
-    def test_terminal_action_requires_applied_outcome_and_is_idempotent(self) -> None:
+    def test_terminal_action_does_not_repeat_host_publish_after_applied_outcome(self) -> None:
         bodies: list[dict] = []
-        calls = 0
+        calls: list[dict] = []
 
         def rpc(request: dict) -> dict:
-            nonlocal calls
-            calls += 1
-            status = "ok" if calls == 1 else "replayed"
+            calls.append(request)
+            if len(calls) > 1:
+                return _result(
+                    request,
+                    status="conflict",
+                    output={"error": "duplicate publication"},
+                    errorCode="IDEMPOTENCY_CONFLICT",
+                    errorMessage="the outcome was already published",
+                )
             return _result(
                 request,
-                status=status,
                 output={"published": True},
                 publication={
                     "action": "applied",
@@ -797,13 +802,13 @@ class HostPortTests(unittest.TestCase):
             cancellation=lambda: False,
             emit_body=bodies.append,
         )
-        binding.publish(
+        first = binding.publish(
             kind="outcome",
             operation_ref="operation:conversation-publish@1",
             resource_ref="outcome-submission:test",
             content="bounded outcome",
         )
-        binding.publish(
+        duplicate = binding.publish(
             kind="outcome",
             operation_ref="operation:conversation-publish@1",
             resource_ref="outcome-submission:test",
@@ -811,9 +816,12 @@ class HostPortTests(unittest.TestCase):
         )
 
         self.assertEqual(binding.terminal_action_reason(), "product_outcome_published")
+        self.assertEqual(duplicate, first)
+        self.assertEqual(len(calls), 1)
+        self.assertIsNone(binding.fatal_error)
         self.assertEqual(
             [body["kind"] for body in bodies],
-            ["progress_observed", "outcome_submission_observed", "progress_observed"],
+            ["progress_observed", "outcome_submission_observed"],
         )
 
     def test_replayed_applied_outcome_on_fresh_binding_does_not_signal(self) -> None:
@@ -1327,31 +1335,36 @@ class HostPortTests(unittest.TestCase):
 
             def create(self, **_kwargs: object):
                 self.calls += 1
-                tool_call = SimpleNamespace(
-                    id="call-outcome",
-                    function=SimpleNamespace(
-                        name="tool_call",
-                        arguments=json.dumps(
-                            {
-                                "name": "plane_publish",
-                                "arguments": {
-                                    "kind": "outcome",
-                                    "operationRef": "operation:conversation-publish",
-                                    "resourceRef": "outcome-submission:test",
-                                    "content": "bounded outcome",
-                                },
-                            }
+                def tool_call(call_id: str) -> SimpleNamespace:
+                    return SimpleNamespace(
+                        id=call_id,
+                        function=SimpleNamespace(
+                            name="tool_call",
+                            arguments=json.dumps(
+                                {
+                                    "name": "plane_publish",
+                                    "arguments": {
+                                        "kind": "outcome",
+                                        "operationRef": "operation:conversation-publish",
+                                        "resourceRef": "outcome-submission:test",
+                                        "content": "bounded outcome",
+                                    },
+                                }
+                            ),
                         ),
-                    ),
-                    extra_content=None,
-                )
+                        extra_content=None,
+                    )
+
                 return SimpleNamespace(
                     choices=[
                         SimpleNamespace(
                             finish_reason="tool_calls",
                             message=SimpleNamespace(
                                 content=None,
-                                tool_calls=[tool_call],
+                                tool_calls=[
+                                    tool_call("call-outcome"),
+                                    tool_call("call-duplicate-outcome"),
+                                ],
                                 reasoning=None,
                                 reasoning_content=None,
                                 refusal=None,
@@ -1386,7 +1399,18 @@ class HostPortTests(unittest.TestCase):
             agent._create_request_openai_client = lambda **_: client  # type: ignore[method-assign]
             return agent
 
+        requests: list[dict] = []
+
         def rpc(request: dict) -> dict:
+            requests.append(request)
+            if len(requests) > 1:
+                return _result(
+                    request,
+                    status="conflict",
+                    output={"error": "duplicate publication"},
+                    errorCode="IDEMPOTENCY_CONFLICT",
+                    errorMessage="the outcome was already published",
+                )
             return _result(
                 request,
                 output={"published": True},
@@ -1425,6 +1449,7 @@ class HostPortTests(unittest.TestCase):
         self.assertEqual(result.output_text, "")
         self.assertEqual(result.model_calls, 1)
         self.assertEqual(client.completions.calls, 1)
+        self.assertEqual(len(requests), 1)
         self.assertEqual(
             sum(body["kind"] == "outcome_submission_observed" for body in bodies),
             1,
