@@ -1881,6 +1881,61 @@ class HostPortTests(unittest.TestCase):
         self.assertFalse(any(body["kind"] == "transcript_evidence_observed" for body in bodies))
         self.assertNotIn("Hermes invocation completed.", json.dumps(bodies))
 
+    def test_terminal_action_preserves_text_from_terminal_assistant_tool_turn(self) -> None:
+        from tests.plane_runtime.test_g1_runtime_process import (
+            G1InvocationEnvelope,
+            G1RunSnapshot,
+            make_invocation,
+            make_snapshot,
+        )
+        from plane_runtime.hermes_adapter import HermesKernelAdapter
+
+        snapshot = G1RunSnapshot.from_dict(make_snapshot())
+        invocation = G1InvocationEnvelope.from_dict(make_invocation(snapshot.to_dict()))
+
+        class TerminalAgent:
+            session_input_tokens = 1
+            session_output_tokens = 1
+            session_api_calls = 1
+
+            def run_conversation(self, *_args: object, **_kwargs: object) -> dict[str, object]:
+                return {
+                    "final_response": None,
+                    "turn_exit_reason": "terminal_action(product_outcome_published)",
+                    "messages": [
+                        {
+                            "role": "assistant",
+                            "content": "ordinary final evidence",
+                            "tool_calls": [{"function": {"name": "plane_publish"}}],
+                        },
+                        {"role": "tool", "name": "plane_publish", "content": "published"},
+                    ],
+                }
+
+        class Credentials:
+            def resolve(self, provider: str) -> dict[str, str]:
+                del provider
+                return {"api_key": "model-only-secret"}
+
+        bodies: list[dict] = []
+        result = HermesKernelAdapter(
+            agent_factory=lambda **_kwargs: TerminalAgent(),
+            credential_source=Credentials(),
+        ).dispatch(
+            snapshot,
+            invocation,
+            lambda: False,
+            bodies.append,
+            model_call_allowance=1,
+        )
+
+        self.assertEqual(result.kind, "completed")
+        self.assertEqual(result.output_text, "ordinary final evidence")
+        self.assertEqual(
+            [body["payload"]["text"] for body in bodies if body["kind"] == "transcript_evidence_observed"],
+            ["ordinary final evidence"],
+        )
+
     def test_post_terminal_host_failure_does_not_overturn_applied_outcome(self) -> None:
         from tests.plane_runtime.test_g1_runtime_process import (
             G1InvocationEnvelope,
