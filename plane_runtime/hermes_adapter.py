@@ -556,6 +556,26 @@ def bound_runtime_text(value: str, maximum_bytes: int) -> str:
     return encoded[:available].decode("utf-8", errors="ignore") + marker
 
 
+def _terminal_assistant_text(messages: object) -> str:
+    """Read text already stored on the assistant turn that invoked a terminal tool.
+
+    A terminal action intentionally leaves ``final_response`` unset.  This
+    helper does not create a completion or inspect the publication result; it
+    only reuses the persisted assistant message from the same model turn.
+    """
+
+    if not isinstance(messages, Sequence) or isinstance(messages, (str, bytes)):
+        return ""
+    for message in reversed(messages):
+        if not isinstance(message, Mapping) or message.get("role") != "assistant":
+            continue
+        if not message.get("tool_calls"):
+            return ""
+        content = message.get("content")
+        return content if isinstance(content, str) else ""
+    return ""
+
+
 class HermesKernelAdapter:
     """Translate one G1 invocation to one existing ``AIAgent`` turn.
 
@@ -971,12 +991,16 @@ class HermesKernelAdapter:
                 usage=usage,
                 model_calls=model_calls,
             )
-        output = result.get("final_response")
-        if output is None:
-            output = "".join(streamed)
         terminal_action = str(result.get("turn_exit_reason", "")).startswith(
             "terminal_action("
         )
+        output = result.get("final_response")
+        if terminal_action and not output:
+            terminal_text = _terminal_assistant_text(result.get("messages"))
+            if terminal_text:
+                output = terminal_text
+        if output is None:
+            output = "".join(streamed)
         output_text = bound_runtime_text(
             redact_runtime_text(
                 str(output or ("" if terminal_action else "Hermes invocation completed.")),

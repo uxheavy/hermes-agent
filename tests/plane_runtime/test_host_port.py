@@ -1881,7 +1881,7 @@ class HostPortTests(unittest.TestCase):
         self.assertFalse(any(body["kind"] == "transcript_evidence_observed" for body in bodies))
         self.assertNotIn("Hermes invocation completed.", json.dumps(bodies))
 
-    def test_terminal_action_preserves_text_from_terminal_assistant_tool_turn(self) -> None:
+    def test_terminal_action_emits_existing_tool_turn_text_as_transcript_evidence(self) -> None:
         from tests.plane_runtime.test_g1_runtime_process import (
             G1InvocationEnvelope,
             G1RunSnapshot,
@@ -1900,6 +1900,9 @@ class HostPortTests(unittest.TestCase):
 
             def run_conversation(self, *_args: object, **_kwargs: object) -> dict[str, object]:
                 return {
+                    # This is the assistant message persisted before tool
+                    # execution.  The terminal action leaves final_response
+                    # unset; the adapter must not invent replacement prose.
                     "final_response": None,
                     "turn_exit_reason": "terminal_action(product_outcome_published)",
                     "messages": [
