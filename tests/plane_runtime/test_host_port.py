@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import json
 import io
 import os
@@ -22,6 +23,7 @@ from plane_runtime.host_port import (
     PlaneHostError,
     PlaneHostUnavailable,
     HostCallRequest,
+    PLANE_OUTCOME_PUBLISH_OPERATION,
     UnixSocketPlaneHostPort,
     bind_plane_host,
     install_plane_tools,
@@ -38,6 +40,7 @@ _TEST_EAGER_OPERATION_REFS = frozenset(
         "operation:mutate@1",
         "operation:work-item-update@1",
         "operation:conversation-publish@1",
+        PLANE_OUTCOME_PUBLISH_OPERATION,
         "operation:compose@1",
     }
 )
@@ -122,6 +125,23 @@ def _result(request: dict, *, status: str = "ok", output: object = None, **extra
         "replayed": status == "replayed",
         "output": output if output is not None else {"accepted": True},
         **extra,
+    }
+
+
+def _applied_outcome_publication(
+    *, operation_ref: str = PLANE_OUTCOME_PUBLISH_OPERATION
+) -> dict[str, str]:
+    return {
+        "action": "applied",
+        "productKind": "outcome_submission",
+        "productRef": "outcome-submission:test",
+        "operationAttemptRef": "operation-attempt:attempt-1",
+        "operationRef": operation_ref,
+        "applicationServiceRef": "application-service:conversation",
+        "gatewayReceiptRef": "gateway-receipt:receipt-1",
+        "receiptRef": "receipt:receipt-1",
+        "auditReceiptRef": "audit-receipt:audit-1",
+        "productEventRef": "product-event:event-1",
     }
 
 
@@ -761,6 +781,7 @@ class HostPortTests(unittest.TestCase):
             [body["kind"] for body in bodies],
             ["progress_observed", "conversation_publication_observed"],
         )
+        self.assertIsNone(binding.terminal_action_reason())
         self.assertEqual(binding.publication_count, 1)
 
     def test_terminal_action_does_not_repeat_host_publish_after_applied_outcome(self) -> None:
@@ -785,7 +806,7 @@ class HostPortTests(unittest.TestCase):
                     "productKind": "outcome_submission",
                     "productRef": "outcome-submission:test",
                     "operationAttemptRef": "operation-attempt:attempt-1",
-                    "operationRef": "operation:conversation-publish@1",
+                    "operationRef": PLANE_OUTCOME_PUBLISH_OPERATION,
                     "applicationServiceRef": "application-service:conversation",
                     "gatewayReceiptRef": "gateway-receipt:receipt-1",
                     "receiptRef": "receipt:receipt-1",
@@ -804,13 +825,13 @@ class HostPortTests(unittest.TestCase):
         )
         first = binding.publish(
             kind="outcome",
-            operation_ref="operation:conversation-publish@1",
+            operation_ref=PLANE_OUTCOME_PUBLISH_OPERATION,
             resource_ref="outcome-submission:test",
             content="bounded outcome",
         )
         duplicate = binding.publish(
             kind="outcome",
-            operation_ref="operation:conversation-publish@1",
+            operation_ref=PLANE_OUTCOME_PUBLISH_OPERATION,
             resource_ref="outcome-submission:test",
             content="bounded outcome",
         )
@@ -822,6 +843,277 @@ class HostPortTests(unittest.TestCase):
         self.assertEqual(
             [body["kind"] for body in bodies],
             ["progress_observed", "outcome_submission_observed"],
+        )
+
+    def test_generic_outcome_publication_arms_and_dedicated_route_reuses_receipt(self) -> None:
+        bodies: list[dict] = []
+        calls: list[dict] = []
+
+        def rpc(request: dict) -> dict:
+            calls.append(request)
+            return _result(
+                request,
+                output={"published": True},
+                publication=_applied_outcome_publication(),
+            )
+
+        binding = PlaneHostBinding(
+            port=CallablePlaneHostPort(rpc),
+            run_id="run:test",
+            invocation_id="invocation:test",
+            correlation_id="correlation:test",
+            cancellation=lambda: False,
+            emit_body=bodies.append,
+        )
+        install_plane_tools()
+        with bind_plane_host(binding):
+            generic_payload = registry.dispatch(
+                "plane_operation",
+                {
+                    "action": "mutate",
+                    "operationRef": PLANE_OUTCOME_PUBLISH_OPERATION,
+                    "input": {
+                        "run_ref": "run:test",
+                        "outcome_ref": "outcome-submission:test",
+                        "content": "generic outcome",
+                    },
+                },
+            )
+
+        self.assertEqual(json.loads(generic_payload)["status"], "ok")
+        original = binding.records[0].result
+        dedicated = binding.publish(
+            kind="outcome",
+            operation_ref=PLANE_OUTCOME_PUBLISH_OPERATION,
+            resource_ref="outcome-submission:test",
+            content="generic outcome",
+        )
+        self.assertIs(dedicated, original)
+        self.assertEqual(calls[0]["action"], "mutate")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(binding.terminal_action_reason(), "product_outcome_published")
+        self.assertEqual(
+            [body["kind"] for body in bodies],
+            ["progress_observed", "outcome_submission_observed"],
+        )
+
+    def test_code_mode_outcome_publication_uses_the_same_observation_seam(self) -> None:
+        bodies: list[dict] = []
+        calls: list[dict] = []
+
+        def rpc(request: dict) -> dict:
+            calls.append(request)
+            return _result(
+                request,
+                publication=_applied_outcome_publication(),
+            )
+
+        binding = PlaneHostBinding(
+            port=CallablePlaneHostPort(rpc),
+            run_id="run:test",
+            invocation_id="invocation:test",
+            correlation_id="correlation:test",
+            cancellation=lambda: False,
+            emit_body=bodies.append,
+        )
+        install_plane_tools()
+        with bind_plane_host(binding), plane_code_mode():
+            code_payload = registry.dispatch(
+                "plane_operation",
+                {
+                    "action": "code",
+                    "operationRef": PLANE_OUTCOME_PUBLISH_OPERATION,
+                    "input": {
+                        "run_ref": "run:test",
+                        "outcome_ref": "outcome-submission:test",
+                        "content": "code mode outcome",
+                    },
+                },
+            )
+
+        self.assertEqual(json.loads(code_payload)["status"], "ok")
+        self.assertEqual([(request["action"], request["source"]) for request in calls], [("code", "code")])
+        self.assertEqual(binding.terminal_action_reason(), "product_outcome_published")
+        self.assertEqual(
+            [body["kind"] for body in bodies],
+            ["progress_observed", "outcome_submission_observed"],
+        )
+
+    def test_generic_replay_denial_failure_and_other_operation_never_arm(self) -> None:
+        cases = (
+            ("replayed", None, _applied_outcome_publication()),
+            ("denied", "NOT_AUTHORIZED", None),
+            ("unavailable", "OUTCOME_UNKNOWN", None),
+        )
+        for status, error_code, publication in cases:
+            with self.subTest(status=status):
+                def rpc(request: dict, *, status=status, error_code=error_code, publication=publication) -> dict:
+                    extra: dict[str, object] = {}
+                    if error_code is not None:
+                        extra.update(
+                            errorCode=error_code,
+                            errorMessage="test host result",
+                        )
+                    if publication is not None:
+                        extra["publication"] = publication
+                    return _result(request, status=status, **extra)
+
+                binding = PlaneHostBinding(
+                    port=CallablePlaneHostPort(rpc),
+                    run_id="run:test",
+                    invocation_id="invocation:test",
+                    correlation_id="correlation:test",
+                    cancellation=lambda: False,
+                    emit_body=lambda _body: None,
+                )
+                binding.call(
+                    action="mutate",
+                    operation_ref=PLANE_OUTCOME_PUBLISH_OPERATION,
+                    input={
+                        "run_ref": "run:test",
+                        "outcome_ref": "outcome-submission:test",
+                        "content": "outcome",
+                    },
+                    source="model",
+                )
+                self.assertIsNone(binding.terminal_action_reason())
+
+        def other_rpc(request: dict) -> dict:
+            return _result(
+                request,
+                publication=_applied_outcome_publication(),
+            )
+
+        other = PlaneHostBinding(
+            port=CallablePlaneHostPort(other_rpc),
+            run_id="run:test",
+            invocation_id="invocation:test",
+            correlation_id="correlation:test",
+            cancellation=lambda: False,
+            eager_operation_refs=_TEST_EAGER_OPERATION_REFS | {"operation:other"},
+            emit_body=lambda _body: None,
+        )
+        other.call(
+            action="mutate",
+            operation_ref="operation:other",
+            input={"content": "not an outcome operation"},
+            source="model",
+        )
+        self.assertIsNone(other.terminal_action_reason())
+
+    def test_generic_and_dedicated_missing_or_malformed_publication_fail_closed(self) -> None:
+        for route in ("generic", "dedicated"):
+            with self.subTest(route=route):
+                def missing_rpc(request: dict) -> dict:
+                    return _result(request)
+
+                binding = PlaneHostBinding(
+                    port=CallablePlaneHostPort(missing_rpc),
+                    run_id="run:test",
+                    invocation_id="invocation:test",
+                    correlation_id="correlation:test",
+                    cancellation=lambda: False,
+                    emit_body=lambda _body: None,
+                )
+                with self.assertRaises(PlaneHostUnavailable):
+                    if route == "generic":
+                        binding.call(
+                            action="mutate",
+                            operation_ref=PLANE_OUTCOME_PUBLISH_OPERATION,
+                            input={
+                                "run_ref": "run:test",
+                                "outcome_ref": "outcome-submission:test",
+                                "content": "outcome",
+                            },
+                            source="model",
+                        )
+                    else:
+                        binding.publish(
+                            kind="outcome",
+                            operation_ref=PLANE_OUTCOME_PUBLISH_OPERATION,
+                            resource_ref="outcome-submission:test",
+                            content="outcome",
+                        )
+                self.assertIsNone(binding.terminal_action_reason())
+                self.assertIsNotNone(binding.fatal_error)
+
+        def malformed_rpc(request: dict) -> dict:
+            publication = _applied_outcome_publication()
+            publication["productKind"] = "conversation"
+            return _result(request, publication=publication)
+
+        malformed = PlaneHostBinding(
+            port=CallablePlaneHostPort(malformed_rpc),
+            run_id="run:test",
+            invocation_id="invocation:test",
+            correlation_id="correlation:test",
+            cancellation=lambda: False,
+            emit_body=lambda _body: None,
+        )
+        with self.assertRaises(PlaneHostUnavailable):
+            malformed.call(
+                action="mutate",
+                operation_ref=PLANE_OUTCOME_PUBLISH_OPERATION,
+                input={
+                    "run_ref": "run:test",
+                    "outcome_ref": "outcome-submission:test",
+                    "content": "outcome",
+                },
+                source="model",
+            )
+        self.assertIsNone(malformed.terminal_action_reason())
+
+    def test_concurrent_generic_and_dedicated_publications_share_one_receipt(self) -> None:
+        calls: list[dict] = []
+        calls_lock = threading.Lock()
+        bodies: list[dict] = []
+
+        def rpc(request: dict) -> dict:
+            with calls_lock:
+                calls.append(request)
+            time.sleep(0.01)
+            return _result(request, publication=_applied_outcome_publication())
+
+        binding = PlaneHostBinding(
+            port=CallablePlaneHostPort(rpc),
+            run_id="run:test",
+            invocation_id="invocation:test",
+            correlation_id="correlation:test",
+            cancellation=lambda: False,
+            emit_body=bodies.append,
+        )
+
+        def generic() -> object:
+            return binding.call(
+                action="mutate",
+                operation_ref=PLANE_OUTCOME_PUBLISH_OPERATION,
+                input={
+                    "run_ref": "run:test",
+                    "outcome_ref": "outcome-submission:test",
+                    "content": "concurrent outcome",
+                },
+                source="model",
+            )
+
+        def dedicated() -> object:
+            return binding.publish(
+                kind="outcome",
+                operation_ref=PLANE_OUTCOME_PUBLISH_OPERATION,
+                resource_ref="outcome-submission:test",
+                content="concurrent outcome",
+            )
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = [executor.submit(generic), executor.submit(dedicated)]
+            returned = [future.result() for future in results]
+
+        self.assertEqual(len(calls), 1)
+        self.assertIs(returned[0], returned[1])
+        self.assertIs(returned[0], binding.records[0].result)
+        self.assertEqual(binding.terminal_action_reason(), "product_outcome_published")
+        self.assertEqual(
+            sum(body["kind"] == "outcome_submission_observed" for body in bodies),
+            1,
         )
 
     def test_pre_terminal_host_failure_remains_fatal_after_later_terminal(self) -> None:
@@ -844,7 +1136,7 @@ class HostPortTests(unittest.TestCase):
                     "productKind": "outcome_submission",
                     "productRef": "outcome-submission:test",
                     "operationAttemptRef": "operation-attempt:attempt-1",
-                    "operationRef": "operation:conversation-publish",
+                    "operationRef": PLANE_OUTCOME_PUBLISH_OPERATION,
                     "applicationServiceRef": "application-service:conversation",
                     "gatewayReceiptRef": "gateway-receipt:receipt-1",
                     "receiptRef": "receipt:receipt-1",
@@ -869,7 +1161,7 @@ class HostPortTests(unittest.TestCase):
         )
         binding.publish(
             kind="outcome",
-            operation_ref="operation:conversation-publish@1",
+            operation_ref=PLANE_OUTCOME_PUBLISH_OPERATION,
             resource_ref="outcome-submission:test",
             content="bounded outcome",
         )
@@ -893,7 +1185,7 @@ class HostPortTests(unittest.TestCase):
                     "productKind": "outcome_submission",
                     "productRef": "outcome-submission:test",
                     "operationAttemptRef": "operation-attempt:attempt-1",
-                    "operationRef": "operation:conversation-publish@1",
+                    "operationRef": PLANE_OUTCOME_PUBLISH_OPERATION,
                     "applicationServiceRef": "application-service:conversation",
                     "gatewayReceiptRef": "gateway-receipt:receipt-1",
                     "receiptRef": "receipt:receipt-1",
@@ -912,7 +1204,7 @@ class HostPortTests(unittest.TestCase):
         )
         binding.publish(
             kind="outcome",
-            operation_ref="operation:conversation-publish@1",
+            operation_ref=PLANE_OUTCOME_PUBLISH_OPERATION,
             resource_ref="outcome-submission:test",
             content="replayed outcome",
         )
@@ -975,7 +1267,7 @@ class HostPortTests(unittest.TestCase):
         )
         denied.publish(
             kind="outcome",
-            operation_ref="operation:conversation-publish@1",
+            operation_ref=PLANE_OUTCOME_PUBLISH_OPERATION,
             resource_ref="outcome-submission:test",
             content="denied outcome",
         )
@@ -999,7 +1291,7 @@ class HostPortTests(unittest.TestCase):
         )
         failed.publish(
             kind="outcome",
-            operation_ref="operation:conversation-publish@1",
+            operation_ref=PLANE_OUTCOME_PUBLISH_OPERATION,
             resource_ref="outcome-submission:test",
             content="failed outcome",
         )
@@ -1014,7 +1306,7 @@ class HostPortTests(unittest.TestCase):
                     "productKind": "outcome_submission",
                     "productRef": "outcome-submission:test",
                     "operationAttemptRef": "operation-attempt:attempt-1",
-                    "operationRef": "operation:conversation-publish@1",
+                    "operationRef": PLANE_OUTCOME_PUBLISH_OPERATION,
                     "applicationServiceRef": "application-service:conversation",
                     "gatewayReceiptRef": "gateway-receipt:receipt-1",
                     "receiptRef": "receipt:receipt-1",
@@ -1034,7 +1326,7 @@ class HostPortTests(unittest.TestCase):
         with self.assertRaises(PlaneHostUnavailable):
             emission_failed.publish(
                 kind="outcome",
-                operation_ref="operation:conversation-publish@1",
+                operation_ref=PLANE_OUTCOME_PUBLISH_OPERATION,
                 resource_ref="outcome-submission:test",
                 content="unobserved outcome",
             )
@@ -1360,7 +1652,7 @@ class HostPortTests(unittest.TestCase):
             ["ordinary final evidence"],
         )
 
-    def test_real_hermes_adapter_stops_after_applied_outcome_without_fake_final_text(self) -> None:
+    def test_real_hermes_adapter_stops_after_generic_applied_outcome_without_fake_final_text(self) -> None:
         from tests.plane_runtime.test_g1_runtime_process import (
             G1InvocationEnvelope,
             G1RunSnapshot,
@@ -1398,12 +1690,15 @@ class HostPortTests(unittest.TestCase):
                             name="tool_call",
                             arguments=json.dumps(
                                 {
-                                    "name": "plane_publish",
+                                    "name": "plane_operation",
                                     "arguments": {
-                                        "kind": "outcome",
-                                        "operationRef": "operation:conversation-publish",
-                                        "resourceRef": "outcome-submission:test",
-                                        "content": "bounded outcome",
+                                        "action": "mutate",
+                                        "operationRef": PLANE_OUTCOME_PUBLISH_OPERATION,
+                                        "input": {
+                                            "run_ref": "run:test",
+                                            "outcome_ref": "outcome-submission:test",
+                                            "content": "bounded outcome",
+                                        },
                                     },
                                 }
                             ),
@@ -1475,7 +1770,7 @@ class HostPortTests(unittest.TestCase):
                     "productKind": "outcome_submission",
                     "productRef": "outcome-submission:test",
                     "operationAttemptRef": "operation-attempt:attempt-1",
-                    "operationRef": "operation:conversation-publish",
+                    "operationRef": PLANE_OUTCOME_PUBLISH_OPERATION,
                     "applicationServiceRef": "application-service:conversation",
                     "gatewayReceiptRef": "gateway-receipt:receipt-1",
                     "receiptRef": "receipt:receipt-1",
@@ -1564,7 +1859,7 @@ class HostPortTests(unittest.TestCase):
                             "name": "plane_publish",
                             "arguments": {
                                 "kind": "outcome",
-                                "operationRef": "operation:conversation-publish",
+                                "operationRef": PLANE_OUTCOME_PUBLISH_OPERATION,
                                 "resourceRef": "outcome-submission:test",
                                 "content": "bounded outcome",
                             },
@@ -1638,7 +1933,7 @@ class HostPortTests(unittest.TestCase):
                         "productKind": "outcome_submission",
                         "productRef": "outcome-submission:test",
                         "operationAttemptRef": "operation-attempt:attempt-1",
-                        "operationRef": "operation:conversation-publish",
+                        "operationRef": PLANE_OUTCOME_PUBLISH_OPERATION,
                         "applicationServiceRef": "application-service:conversation",
                         "gatewayReceiptRef": "gateway-receipt:receipt-1",
                         "receiptRef": "receipt:receipt-1",
@@ -1684,7 +1979,7 @@ class HostPortTests(unittest.TestCase):
                 and body["payload"]["text"].startswith("Plane host ")
             ],
             [
-                "Plane host model publish operation:conversation-publish -> ok",
+                "Plane host model publish operation:agent.outcome.publish -> ok",
                 "Plane host model read operation:work-item-read -> unavailable",
             ],
         )

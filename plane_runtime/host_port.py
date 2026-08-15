@@ -35,6 +35,7 @@ HOST_PROTOCOL = "plane.agent-runtime/v1"
 PLANE_RUNTIME_TOOLSET = "plane_runtime"
 PLANE_OPERATION_TOOL = "plane_operation"
 PLANE_PUBLISH_TOOL = "plane_publish"
+PLANE_OUTCOME_PUBLISH_OPERATION = "operation:agent.outcome.publish"
 PLANE_DISCOVERY_OPERATION = "plane.operations.discover@1"
 PLANE_CATALOG_SEARCH_OPERATION = "operation:catalog.search"
 PLANE_CATALOG_DESCRIBE_OPERATION = "operation:catalog.describe"
@@ -701,6 +702,18 @@ class PlaneHostBinding:
         source: str,
     ) -> HostCallResult:
         with self._lock:
+            if (
+                operation_ref == PLANE_OUTCOME_PUBLISH_OPERATION
+                and self._terminal_action_reason is not None
+            ):
+                # Generic operation and explicit publication routes share the
+                # same semantic operation.  Once a fresh applied receipt has
+                # armed terminal state, return that original receipt instead
+                # of allowing a later same-batch retry to reach Plane.
+                if self._terminal_action_result is None:
+                    self._fail("terminal publication receipt is unavailable")
+                    raise PlaneHostUnavailable("terminal publication receipt is unavailable")
+                return self._terminal_action_result
             if self._is_cancelled():
                 self._fail("Plane host callback cancelled")
                 raise PlaneHostCancelled("Plane host callback cancelled")
@@ -733,6 +746,7 @@ class PlaneHostBinding:
             self.records.append(HostCallRecord(request, result))
             self._record_catalog_description(request, result)
             self._emit_call_observation(request, result)
+            self._observe_publication(request, result)
             if _host_result_disposition(result) == "poison_invocation":
                 self._fail(result.error_message or "Plane host rejected the callback")
             if self._is_cancelled():
@@ -762,7 +776,10 @@ class PlaneHostBinding:
             self._fail(str(exc) or "publication request was invalid")
             raise
         with self._lock:
-            if self._terminal_action_reason is not None:
+            if (
+                operation_ref == PLANE_OUTCOME_PUBLISH_OPERATION
+                and self._terminal_action_reason is not None
+            ):
                 # A fresh applied outcome already requested terminal stop.  Do
                 # not send another publication through Plane while the current
                 # model tool batch is being drained; return the applied receipt
@@ -780,30 +797,58 @@ class PlaneHostBinding:
         if result.status not in {"ok", "replayed"}:
             self._fail("explicit publication was not authorized by the Plane host")
             return result
+        return result
+
+    def _observe_publication(
+        self, request: HostCallRequest, result: HostCallResult
+    ) -> None:
+        """Observe the versioned publication receipt from every host route."""
+
+        if request.action == "publish":
+            kind = request.input.get("kind")
+            resource_ref = request.input.get("resourceRef")
+            content = request.input.get("content")
+            if kind not in {"conversation", "outcome"}:
+                self._fail("publication kind must be conversation or outcome")
+                raise PlaneHostUnavailable("publication kind must be conversation or outcome")
+        elif request.operation_ref == PLANE_OUTCOME_PUBLISH_OPERATION:
+            kind = "outcome"
+            resource_ref = request.input.get("outcome_ref")
+            if resource_ref is None:
+                resource_ref = request.input.get("resourceRef")
+            content = request.input.get("content")
+        else:
+            return
+
+        if result.status not in {"ok", "replayed"}:
+            return
         if result.publication is None:
-            self._fail("explicit publication has no gateway publication receipt")
-            raise PlaneHostUnavailable("explicit publication has no gateway publication receipt")
+            if request.action == "publish" or result.status == "ok":
+                self._fail("publication has no gateway publication receipt")
+                raise PlaneHostUnavailable("publication has no gateway publication receipt")
+            return
+
         try:
+            resource_ref = _text(resource_ref, "publication.resourceRef", 256)
+            content = _text(content, "publication.content", MAX_HOST_CONTENT_BYTES)
             publication = _validated_publication(
                 result.publication,
                 kind=kind,
                 resource_ref=resource_ref,
             )
+            if (
+                request.operation_ref == PLANE_OUTCOME_PUBLISH_OPERATION
+                and publication.get("operationRef") != PLANE_OUTCOME_PUBLISH_OPERATION
+            ):
+                raise PlaneHostUnavailable(
+                    "host publication is not bound to agent.outcome.publish"
+                )
         except PlaneHostError as exc:
-            self._fail(str(exc) or "explicit publication receipt was invalid")
-            raise PlaneHostUnavailable("explicit publication receipt was invalid") from exc
-        if self.emit_body is not None:
-            with self._lock:
-                applied_outcome = (
-                    kind == "outcome" and publication["action"] == "applied"
-                )
-                if applied_outcome and self._terminal_action_reason is not None:
-                    return result
-                terminal_outcome = (
-                    applied_outcome
-                    and result.status == "ok"
-                    and result.replayed is False
-                )
+            self._fail(str(exc) or "publication receipt was invalid")
+            raise PlaneHostUnavailable("publication receipt was invalid") from exc
+
+        with self._lock:
+            if self.emit_body is not None:
                 try:
                     self.emit_body(
                         {
@@ -825,10 +870,15 @@ class PlaneHostBinding:
                     raise PlaneHostUnavailable(
                         "Plane publication observation could not be emitted"
                     ) from exc
-                if terminal_outcome:
-                    self._terminal_action_reason = "product_outcome_published"
-                    self._terminal_action_result = result
-        return result
+            if (
+                request.operation_ref == PLANE_OUTCOME_PUBLISH_OPERATION
+                and kind == "outcome"
+                and result.status == "ok"
+                and result.replayed is False
+                and publication["action"] == "applied"
+            ):
+                self._terminal_action_reason = "product_outcome_published"
+                self._terminal_action_result = result
 
     def _emit_call_observation(
         self, request: HostCallRequest, result: HostCallResult
@@ -1101,6 +1151,7 @@ __all__ = [
     "PlaneHostSchemaNotDisclosed",
     "PlaneHostPort",
     "PlaneHostUnavailable",
+    "PLANE_OUTCOME_PUBLISH_OPERATION",
     "bind_plane_host",
     "current_plane_host",
     "install_plane_tools",

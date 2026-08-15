@@ -106,6 +106,7 @@ def make_snapshot() -> dict[str, object]:
                         "operation:read",
                         "operation:work-item-read",
                         "operation:conversation-publish",
+                        "operation:agent.outcome.publish",
                     )
                 ],
             ],
