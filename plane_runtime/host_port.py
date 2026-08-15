@@ -70,6 +70,7 @@ _HOST_RESULT_DISPOSITIONS: Mapping[tuple[str, str | None], HostResultDisposition
         ("replayed", None): "continue_with_tool_result",
         ("invalid", "VALIDATION_ERROR"): "continue_with_tool_result",
         ("denied", "NOT_AUTHORIZED"): "continue_with_tool_result",
+        ("conflict", "PLANE_CONFLICT"): "continue_with_tool_result",
     }
 )
 
@@ -583,6 +584,7 @@ class PlaneHostBinding:
     _fatal_error_after_terminal: bool = field(default=False, init=False, repr=False)
     _terminal_action_reason: str | None = field(default=None, init=False, repr=False)
     _terminal_action_result: HostCallResult | None = field(default=None, init=False, repr=False)
+    _terminal_action_request: HostCallRequest | None = field(default=None, init=False, repr=False)
     _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -693,6 +695,52 @@ class PlaneHostBinding:
             raise PlaneHostUnavailable("cancellation signal was not boolean")
         return cancelled
 
+    @staticmethod
+    def _outcome_publication_identity(
+        request: HostCallRequest,
+    ) -> tuple[str, str, str] | None:
+        if request.operation_ref != PLANE_OUTCOME_PUBLISH_OPERATION:
+            return None
+        if request.action == "publish":
+            kind = request.input.get("kind")
+            resource_ref = request.input.get("resourceRef")
+        else:
+            kind = "outcome"
+            resource_ref = request.input.get("outcome_ref")
+            if resource_ref is None:
+                resource_ref = request.input.get("resourceRef")
+        content = request.input.get("content")
+        if (
+            kind != "outcome"
+            or not isinstance(resource_ref, str)
+            or not isinstance(content, str)
+        ):
+            return None
+        return kind, resource_ref, content
+
+    def _terminal_result_for(self, request: HostCallRequest) -> HostCallResult | None:
+        """Reuse equal outcome receipts or expose a terminal conflict."""
+
+        if self._terminal_action_reason is None:
+            return None
+        if self._terminal_action_result is None or self._terminal_action_request is None:
+            self._fail("terminal publication receipt is unavailable")
+            raise PlaneHostUnavailable("terminal publication receipt is unavailable")
+        if self._outcome_publication_identity(request) == self._outcome_publication_identity(
+            self._terminal_action_request
+        ):
+            return self._terminal_action_result
+        return HostCallResult(
+            request_ref=request.request_ref,
+            correlation_id=request.correlation_id,
+            idempotency_key=request.idempotency_key,
+            status="conflict",
+            replayed=False,
+            output=None,
+            error_code="PLANE_CONFLICT",
+            error_message="the invocation already has an applied outcome publication",
+        )
+
     def call(
         self,
         *,
@@ -702,25 +750,10 @@ class PlaneHostBinding:
         source: str,
     ) -> HostCallResult:
         with self._lock:
-            if (
-                operation_ref == PLANE_OUTCOME_PUBLISH_OPERATION
-                and self._terminal_action_reason is not None
-            ):
-                # Generic operation and explicit publication routes share the
-                # same semantic operation.  Once a fresh applied receipt has
-                # armed terminal state, return that original receipt instead
-                # of allowing a later same-batch retry to reach Plane.
-                if self._terminal_action_result is None:
-                    self._fail("terminal publication receipt is unavailable")
-                    raise PlaneHostUnavailable("terminal publication receipt is unavailable")
-                return self._terminal_action_result
             if self._is_cancelled():
                 self._fail("Plane host callback cancelled")
                 raise PlaneHostCancelled("Plane host callback cancelled")
             self._require_schema_disclosure(action=action, operation_ref=operation_ref)
-            if len(self.records) >= self.max_calls:
-                self._fail("Plane host call budget exhausted")
-                raise PlaneHostBoundsError("Plane host call budget exhausted")
             try:
                 request = HostCallRequest(
                     run_id=self.run_id,
@@ -735,6 +768,12 @@ class PlaneHostBinding:
             except PlaneHostError as exc:
                 self._fail(str(exc) or "Plane host request was invalid")
                 raise
+            terminal_result = self._terminal_result_for(request)
+            if terminal_result is not None:
+                return terminal_result
+            if len(self.records) >= self.max_calls:
+                self._fail("Plane host call budget exhausted")
+                raise PlaneHostBoundsError("Plane host call budget exhausted")
             try:
                 result = self.port.invoke(request)
             except PlaneHostError as exc:
@@ -775,19 +814,6 @@ class PlaneHostBinding:
         except PlaneHostError as exc:
             self._fail(str(exc) or "publication request was invalid")
             raise
-        with self._lock:
-            if (
-                operation_ref == PLANE_OUTCOME_PUBLISH_OPERATION
-                and self._terminal_action_reason is not None
-            ):
-                # A fresh applied outcome already requested terminal stop.  Do
-                # not send another publication through Plane while the current
-                # model tool batch is being drained; return the applied receipt
-                # that armed terminal state instead.
-                if self._terminal_action_result is None:
-                    self._fail("terminal publication receipt is unavailable")
-                    raise PlaneHostUnavailable("terminal publication receipt is unavailable")
-                return self._terminal_action_result
         result = self.call(
             action="publish",
             operation_ref=operation_ref,
@@ -795,6 +821,8 @@ class PlaneHostBinding:
             source="model",
         )
         if result.status not in {"ok", "replayed"}:
+            if result.status == "conflict" and result.error_code == "PLANE_CONFLICT":
+                return result
             self._fail("explicit publication was not authorized by the Plane host")
             return result
         return result
@@ -896,6 +924,7 @@ class PlaneHostBinding:
             ):
                 self._terminal_action_reason = "product_outcome_published"
                 self._terminal_action_result = result
+                self._terminal_action_request = request
 
     def _emit_call_observation(
         self, request: HostCallRequest, result: HostCallResult

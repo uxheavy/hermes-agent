@@ -214,6 +214,50 @@ def _cancelled_tool_result(reason: str = "user interrupt") -> str:
     )
 
 
+def _terminal_action_reason(agent) -> str | None:
+    """Return a validated terminal action reason, if this turn is terminal."""
+
+    terminal_action_check = getattr(agent, "_terminal_action_check", None)
+    if not callable(terminal_action_check):
+        return None
+    reason = terminal_action_check()
+    if reason is None:
+        return None
+    if not isinstance(reason, str) or not reason:
+        raise TypeError("terminal action reason must be a non-empty string")
+    return reason
+
+
+def _skip_tool_calls_after_terminal(
+    agent,
+    tool_calls,
+    messages: list,
+    reason: str,
+) -> bool:
+    """Append durable result rows for calls barred by a terminal action."""
+
+    for tool_call in tool_calls:
+        tool_name = tool_call.function.name
+        messages.append(
+            make_tool_result_message(
+                tool_name,
+                (
+                    f"[Tool execution skipped — terminal action '{reason}' "
+                    "already completed]"
+                ),
+                tool_call.id,
+                effect_disposition="none",
+            )
+        )
+        if not _flush_session_db_after_tool_progress(
+            agent,
+            messages,
+            stage=f"terminal-action skipped tool result {tool_name}",
+        ):
+            return False
+    return True
+
+
 def _emit_cancelled_terminal_post_tool_call(
     agent,
     *,
@@ -1326,6 +1370,22 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
     for i, tool_call in enumerate(assistant_message.tool_calls, 1):
         if getattr(agent, "_incremental_persistence_failed", False):
             return
+        terminal_action_reason = _terminal_action_reason(agent)
+        if terminal_action_reason is not None:
+            remaining_calls = assistant_message.tool_calls[i - 1 :]
+            if remaining_calls:
+                agent._vprint(
+                    f"{agent.log_prefix}⚡ Terminal action: skipping "
+                    f"{len(remaining_calls)} tool call(s)",
+                    force=True,
+                )
+                _skip_tool_calls_after_terminal(
+                    agent,
+                    remaining_calls,
+                    messages,
+                    terminal_action_reason,
+                )
+            break
         # SAFETY: check interrupt BEFORE starting each tool.
         # If the user sent "stop" during a previous tool's execution,
         # do NOT start any more tools -- skip them all immediately.
@@ -2023,9 +2083,24 @@ def execute_tool_calls_segmented(agent, assistant_message, messages: list, effec
         _exec_cwd = Path(_active_env.cwd) if _active_env is not None and _active_env.cwd else None
         segments = _plan_tool_batch_segments(assistant_message.tool_calls, execution_cwd=_exec_cwd)
 
-    for kind, calls in segments:
+    for segment_index, (kind, calls) in enumerate(segments):
         if getattr(agent, "_incremental_persistence_failed", False):
             return
+        terminal_action_reason = _terminal_action_reason(agent)
+        if terminal_action_reason is not None:
+            remaining_calls = [
+                tool_call
+                for _, segment_calls in segments[segment_index:]
+                for tool_call in segment_calls
+            ]
+            if not _skip_tool_calls_after_terminal(
+                agent,
+                remaining_calls,
+                messages,
+                terminal_action_reason,
+            ):
+                return
+            break
         segment_message = SimpleNamespace(tool_calls=list(calls))
         if kind == "parallel":
             execute_tool_calls_concurrent(
@@ -2040,6 +2115,21 @@ def execute_tool_calls_segmented(agent, assistant_message, messages: list, effec
 
         if getattr(agent, "_incremental_persistence_failed", False):
             return
+        terminal_action_reason = _terminal_action_reason(agent)
+        if terminal_action_reason is not None:
+            remaining_calls = [
+                tool_call
+                for _, segment_calls in segments[segment_index + 1 :]
+                for tool_call in segment_calls
+            ]
+            if not _skip_tool_calls_after_terminal(
+                agent,
+                remaining_calls,
+                messages,
+                terminal_action_reason,
+            ):
+                return
+            break
 
     # ── Whole-turn finalize (budget + /steer) ─────────────────────────
     total_tools = len(assistant_message.tool_calls)

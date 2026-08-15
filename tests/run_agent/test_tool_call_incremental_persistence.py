@@ -438,6 +438,139 @@ def test_segmented_batch_stops_before_later_segment_after_persist_failure():
     assert getattr(agent, "_incremental_persistence_failed", False) is True
 
 
+def test_terminal_action_barrier_skips_later_calls_and_persists_one_result_each():
+    agent = _make_agent()
+    tool_calls = [
+        _mock_tool_call(name="submit", call_id="submit"),
+        _mock_tool_call(name="plane_publish", call_id="publish"),
+        _mock_tool_call(name="mutate", call_id="late-mutation"),
+    ]
+    assistant_message = SimpleNamespace(content="", tool_calls=tool_calls)
+    messages: list = []
+    executed: list[str] = []
+    terminal_armed = False
+    flushed_tool_ids: list[str] = []
+
+    def terminal_action_check() -> str | None:
+        return "product_outcome_published" if terminal_armed else None
+
+    def fake_handle(function_name, _args, _task_id, **_kwargs):
+        nonlocal terminal_armed
+        executed.append(function_name)
+        if function_name == "plane_publish":
+            terminal_armed = True
+        return f"{function_name} result"
+
+    agent._terminal_action_check = terminal_action_check
+    agent._flush_messages_to_session_db = MagicMock(
+        side_effect=lambda flushed, _history=None: flushed_tool_ids.append(
+            flushed[-1]["tool_call_id"]
+        )
+    )
+
+    with (
+        patch("run_agent.handle_function_call", side_effect=fake_handle),
+        patch(
+            "agent.tool_executor.maybe_persist_tool_result",
+            side_effect=lambda **kwargs: kwargs["content"],
+        ),
+    ):
+        agent._execute_tool_calls(assistant_message, messages, "task-1")
+
+    assert executed == ["submit", "plane_publish"]
+    assert [message["tool_call_id"] for message in messages] == [
+        "submit",
+        "publish",
+        "late-mutation",
+    ]
+    assert flushed_tool_ids == ["submit", "publish", "late-mutation"]
+    assert messages[-1]["effect_disposition"] == "none"
+    assert "terminal action 'product_outcome_published' already completed" in messages[-1]["content"]
+
+
+def test_terminal_action_barrier_does_not_change_normal_batches():
+    agent = _make_agent()
+    tool_calls = [
+        _mock_tool_call(name="first", call_id="first"),
+        _mock_tool_call(name="second", call_id="second"),
+    ]
+    assistant_message = SimpleNamespace(content="", tool_calls=tool_calls)
+    messages: list = []
+    executed: list[str] = []
+    agent._terminal_action_check = lambda: None
+    agent._flush_messages_to_session_db = MagicMock(return_value=True)
+
+    with (
+        patch(
+            "run_agent.handle_function_call",
+            side_effect=lambda name, _args, _task_id, **_kwargs: executed.append(name)
+            or f"{name} result",
+        ),
+        patch(
+            "agent.tool_executor.maybe_persist_tool_result",
+            side_effect=lambda **kwargs: kwargs["content"],
+        ),
+    ):
+        agent._execute_tool_calls(assistant_message, messages, "task-1")
+
+    assert executed == ["first", "second"]
+    assert [message["tool_call_id"] for message in messages] == ["first", "second"]
+
+
+def test_terminal_action_segmented_batch_finalizes_once_after_skipping_calls():
+    agent = _make_agent()
+    submit = _mock_tool_call(name="submit", call_id="submit")
+    publish = _mock_tool_call(name="plane_publish", call_id="publish")
+    late_mutation = _mock_tool_call(name="mutate", call_id="late-mutation")
+    assistant_message = SimpleNamespace(
+        content="",
+        tool_calls=[submit, publish, late_mutation],
+    )
+    messages: list = []
+    executed: list[str] = []
+    terminal_armed = False
+    agent._terminal_action_check = lambda: (
+        "product_outcome_published" if terminal_armed else None
+    )
+    agent._flush_messages_to_session_db = MagicMock(return_value=True)
+
+    def fake_handle(function_name, _args, _task_id, **_kwargs):
+        nonlocal terminal_armed
+        executed.append(function_name)
+        if function_name == "plane_publish":
+            terminal_armed = True
+        return f"{function_name} result"
+
+    with (
+        patch("run_agent.handle_function_call", side_effect=fake_handle),
+        patch(
+            "agent.tool_executor.maybe_persist_tool_result",
+            side_effect=lambda **kwargs: kwargs["content"],
+        ),
+        patch("agent.tool_executor.enforce_turn_budget") as enforce_budget,
+        patch.object(agent, "_apply_pending_steer_to_tool_results") as apply_steer,
+    ):
+        execute_tool_calls_segmented(
+            agent,
+            assistant_message,
+            messages,
+            "task-1",
+            segments=[
+                ("sequential", [submit, publish]),
+                ("sequential", [late_mutation]),
+            ],
+        )
+
+    assert executed == ["submit", "plane_publish"]
+    assert [message["tool_call_id"] for message in messages] == [
+        "submit",
+        "publish",
+        "late-mutation",
+    ]
+    enforce_budget.assert_called_once()
+    assert apply_steer.call_args[0] == (messages, 3)
+
+
 # ---------------------------------------------------------------------------
 # Contract 3: the CONCURRENT path flushes each collected tool result in append
 # order.  Dispatch goes through agent._invoke_tool (the real concurrent

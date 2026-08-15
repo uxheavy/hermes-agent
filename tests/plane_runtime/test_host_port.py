@@ -610,6 +610,126 @@ class HostPortTests(unittest.TestCase):
         self.assertEqual(unknown_result.status, "unavailable")
         self.assertIsNotNone(unknown.fatal_error)
 
+    def test_plane_conflict_is_model_observable_but_idempotency_conflict_stays_fatal(self) -> None:
+        conflict = PlaneHostBinding(
+            port=CallablePlaneHostPort(
+                lambda request: _result(
+                    request,
+                    status="conflict",
+                    errorCode="PLANE_CONFLICT",
+                    errorMessage="the invocation already has an applied outcome publication",
+                )
+            ),
+            run_id="run:test",
+            invocation_id="invocation:test",
+            correlation_id="correlation:test",
+            cancellation=lambda: False,
+        )
+        result = conflict.call(
+            action="mutate",
+            operation_ref="operation:work-item-update@1",
+            input={},
+            source="model",
+        )
+        self.assertEqual(result.status, "conflict")
+        self.assertEqual(result.error_code, "PLANE_CONFLICT")
+        self.assertEqual(json.loads(result.model_payload())["errorCode"], "PLANE_CONFLICT")
+        self.assertIsNone(conflict.fatal_error)
+
+        idempotency_conflict = PlaneHostBinding(
+            port=CallablePlaneHostPort(
+                lambda request: _result(
+                    request,
+                    status="conflict",
+                    errorCode="IDEMPOTENCY_CONFLICT",
+                    errorMessage="the request is not the original operation",
+                )
+            ),
+            run_id="run:test",
+            invocation_id="invocation:test",
+            correlation_id="correlation:test",
+            cancellation=lambda: False,
+        )
+        idempotency_result = idempotency_conflict.call(
+            action="mutate",
+            operation_ref="operation:work-item-update@1",
+            input={},
+            source="model",
+        )
+        self.assertEqual(idempotency_result.status, "conflict")
+        self.assertIsNotNone(idempotency_conflict.fatal_error)
+
+    def test_terminal_action_returns_conflict_for_differing_duplicate_and_late_mutation(self) -> None:
+        calls: list[dict] = []
+
+        def rpc(request: dict) -> dict:
+            calls.append(request)
+            if request["action"] == "publish":
+                return _result(
+                    request,
+                    output={"published": True},
+                    publication=_applied_outcome_publication(),
+                )
+            return _result(request, output={"accepted": True})
+
+        binding = PlaneHostBinding(
+            port=CallablePlaneHostPort(rpc),
+            run_id="run:test",
+            invocation_id="invocation:test",
+            correlation_id="correlation:test",
+            cancellation=lambda: False,
+        )
+        binding.publish(
+            kind="outcome",
+            operation_ref=PLANE_OUTCOME_PUBLISH_OPERATION,
+            resource_ref="outcome-submission:test",
+            content="first outcome",
+        )
+
+        differing_duplicate = binding.publish(
+            kind="outcome",
+            operation_ref=PLANE_OUTCOME_PUBLISH_OPERATION,
+            resource_ref="outcome-submission:test",
+            content="different outcome",
+        )
+        late_mutation = binding.call(
+            action="mutate",
+            operation_ref="operation:work-item-update@1",
+            input={"workItemRef": "work-item:test", "title": "late"},
+            source="model",
+        )
+
+        for result in (differing_duplicate, late_mutation):
+            self.assertEqual(result.status, "conflict")
+            self.assertEqual(result.error_code, "PLANE_CONFLICT")
+            self.assertEqual(json.loads(result.model_payload())["status"], "conflict")
+        self.assertEqual(len(calls), 1)
+        self.assertIsNone(binding.fatal_error)
+
+    def test_successful_host_result_with_error_fields_remains_rejected(self) -> None:
+        binding = PlaneHostBinding(
+            port=CallablePlaneHostPort(
+                lambda request: _result(
+                    request,
+                    errorCode="SHOULD_NOT_BE_ACCEPTED",
+                    errorMessage="successful result with an error",
+                )
+            ),
+            run_id="run:test",
+            invocation_id="invocation:test",
+            correlation_id="correlation:test",
+            cancellation=lambda: False,
+        )
+
+        with self.assertRaises(PlaneHostUnavailable):
+            binding.call(
+                action="read",
+                operation_ref="operation:read@1",
+                input={},
+                source="model",
+            )
+        self.assertIsNotNone(binding.fatal_error)
+
     def test_nonrecoverable_host_results_poison_the_invocation(self) -> None:
         cases = (
             ("denied", "CALLBACK_BINDING_INVALID"),
@@ -1939,7 +2059,7 @@ class HostPortTests(unittest.TestCase):
             ["ordinary final evidence"],
         )
 
-    def test_post_terminal_host_failure_does_not_overturn_applied_outcome(self) -> None:
+    def test_terminal_action_barrier_skips_later_host_mutation(self) -> None:
         from tests.plane_runtime.test_g1_runtime_process import (
             G1InvocationEnvelope,
             G1RunSnapshot,
@@ -1986,6 +2106,21 @@ class HostPortTests(unittest.TestCase):
                     self.tool_call(
                         "tool_call",
                         {
+                            "name": "plane_operation",
+                            "arguments": {
+                                "action": "mutate",
+                                "operationRef": "operation:work-item-update",
+                                "input": {
+                                    "workItemRef": "work-item:test",
+                                    "title": "submitted",
+                                },
+                            },
+                        },
+                        "call-submit",
+                    ),
+                    self.tool_call(
+                        "tool_call",
+                        {
                             "name": "plane_publish",
                             "arguments": {
                                 "kind": "outcome",
@@ -2001,12 +2136,15 @@ class HostPortTests(unittest.TestCase):
                         {
                             "name": "plane_operation",
                             "arguments": {
-                                "action": "read",
-                                "operationRef": "operation:work-item-read",
-                                "input": {"workItemRef": "work-item:test"},
+                                "action": "mutate",
+                                "operationRef": "operation:work-item-update",
+                                "input": {
+                                    "workItemRef": "work-item:test",
+                                    "title": "must-not-run",
+                                },
                             },
                         },
-                        "call-late-read",
+                        "call-late-mutation",
                     ),
                 ]
                 return SimpleNamespace(
@@ -2071,13 +2209,7 @@ class HostPortTests(unittest.TestCase):
                         "productEventRef": "product-event:event-1",
                     },
                 )
-            return _result(
-                request,
-                status="unavailable",
-                output={"available": False},
-                errorCode="OPERATION_UNAVAILABLE",
-                errorMessage="required operation is unavailable",
-            )
+            return _result(request, output={"accepted": True})
 
         bodies: list[dict] = []
         with mock.patch.dict(os.environ, {"HERMES_HOME": _TEST_HERMES_HOME.name}):
@@ -2097,10 +2229,15 @@ class HostPortTests(unittest.TestCase):
             )
 
         self.assertEqual(result.kind, "completed")
+        self.assertIsNone(result.failure_code)
         self.assertEqual(result.output_text, "")
         self.assertEqual(result.model_calls, 1)
         self.assertEqual(client.completions.calls, 1)
-        self.assertEqual([request["action"] for request in requests], ["publish", "read"])
+        self.assertEqual([request["action"] for request in requests], ["mutate", "publish"])
+        self.assertEqual(
+            [request["operationRef"] for request in requests],
+            ["operation:work-item-update", PLANE_OUTCOME_PUBLISH_OPERATION],
+        )
         self.assertEqual(
             [
                 body["payload"]["text"]
@@ -2109,8 +2246,8 @@ class HostPortTests(unittest.TestCase):
                 and body["payload"]["text"].startswith("Plane host ")
             ],
             [
+                "Plane host model mutate operation:work-item-update -> ok",
                 "Plane host model publish operation:agent.outcome.publish -> ok",
-                "Plane host model read operation:work-item-read -> unavailable",
             ],
         )
         self.assertFalse(any(body["kind"] == "transcript_evidence_observed" for body in bodies))
