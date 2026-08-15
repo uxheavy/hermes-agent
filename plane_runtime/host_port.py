@@ -822,7 +822,24 @@ class PlaneHostBinding:
 
         if result.status not in {"ok", "replayed"}:
             return
-        if result.publication is None:
+        publication = result.publication
+        if (
+            publication is None
+            and request.action != "publish"
+            and request.operation_ref == PLANE_OUTCOME_PUBLISH_OPERATION
+            and result.status == "ok"
+        ):
+            try:
+                publication = _outcome_publication_from_operation_result(
+                    result.output,
+                    resource_ref=resource_ref,
+                )
+            except PlaneHostError as exc:
+                self._fail(str(exc) or "generic outcome publication receipt was invalid")
+                raise PlaneHostUnavailable(
+                    "generic outcome publication receipt was invalid"
+                ) from exc
+        if publication is None:
             if request.action == "publish" or result.status == "ok":
                 self._fail("publication has no gateway publication receipt")
                 raise PlaneHostUnavailable("publication has no gateway publication receipt")
@@ -832,7 +849,7 @@ class PlaneHostBinding:
             resource_ref = _text(resource_ref, "publication.resourceRef", 256)
             content = _text(content, "publication.content", MAX_HOST_CONTENT_BYTES)
             publication = _validated_publication(
-                result.publication,
+                publication,
                 kind=kind,
                 resource_ref=resource_ref,
             )
@@ -957,6 +974,53 @@ def _validated_publication(
                 f"publication.{field_name} must use {namespace}: namespace"
             )
     return data
+
+
+def _outcome_publication_from_operation_result(
+    value: Any, *, resource_ref: Any
+) -> dict[str, str]:
+    """Normalize the generic operation receipt into the publication binding."""
+
+    output = _object(value, "host.result.output")
+    if (
+        output.get("ok") is not True
+        or output.get("replayed") is not False
+        or output.get("operationRef") != PLANE_OUTCOME_PUBLISH_OPERATION
+    ):
+        raise PlaneHostUnavailable("generic outcome publication receipt is not applied")
+    result = _object(output.get("result"), "host.result.output.result")
+    outcome = _object(result.get("outcome"), "host.result.output.result.outcome")
+    request_id = _text(output.get("requestId"), "host.result.output.requestId", 256)
+    gateway_receipt = _text(
+        output.get("gatewayReceipt"),
+        "host.result.output.gatewayReceipt",
+        256,
+    )
+    audit_receipt = _text(
+        output.get("auditReceipt"),
+        "host.result.output.auditReceipt",
+        256,
+    )
+    product_event_ref = _text(
+        outcome.get("productEventRef"),
+        "host.result.output.result.outcome.productEventRef",
+        256,
+    )
+    product_ref = _text(resource_ref, "publication.resourceRef", 256)
+    if not product_ref.startswith("outcome-submission:"):
+        raise PlaneHostUnavailable("generic outcome publication resource is invalid")
+    return {
+        "action": "applied",
+        "productKind": "outcome_submission",
+        "productRef": product_ref,
+        "operationAttemptRef": f"operation-attempt:{request_id}",
+        "operationRef": PLANE_OUTCOME_PUBLISH_OPERATION,
+        "applicationServiceRef": "application-service:agent-lifecycle",
+        "gatewayReceiptRef": f"gateway-receipt:{gateway_receipt}",
+        "receiptRef": f"receipt:{request_id}",
+        "auditReceiptRef": f"audit-receipt:{audit_receipt}",
+        "productEventRef": product_event_ref,
+    }
 
 
 _CURRENT_BINDING: contextvars.ContextVar[PlaneHostBinding | None] = contextvars.ContextVar(

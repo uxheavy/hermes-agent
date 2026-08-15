@@ -897,6 +897,78 @@ class HostPortTests(unittest.TestCase):
             ["progress_observed", "outcome_submission_observed"],
         )
 
+    def test_generic_outcome_receipt_in_output_arms_terminal_publication(self) -> None:
+        bodies: list[dict] = []
+        calls: list[dict] = []
+
+        def rpc(request: dict) -> dict:
+            calls.append(request)
+            return _result(
+                request,
+                output={
+                    "ok": True,
+                    "replayed": False,
+                    "operationRef": PLANE_OUTCOME_PUBLISH_OPERATION,
+                    "requestId": "request-1",
+                    "gatewayReceipt": "gateway-1",
+                    "auditReceipt": "audit-1",
+                    "result": {
+                        "outcome": {
+                            "productEventRef": "product-event:event-1",
+                        }
+                    },
+                },
+            )
+
+        binding = PlaneHostBinding(
+            port=CallablePlaneHostPort(rpc),
+            run_id="run:test",
+            invocation_id="invocation:test",
+            correlation_id="correlation:test",
+            cancellation=lambda: False,
+            emit_body=bodies.append,
+        )
+        generic = binding.call(
+            action="mutate",
+            operation_ref=PLANE_OUTCOME_PUBLISH_OPERATION,
+            input={
+                "run_ref": "run:test",
+                "outcome_ref": "outcome-submission:test",
+                "content": "generic outcome",
+            },
+            source="model",
+        )
+        dedicated = binding.publish(
+            kind="outcome",
+            operation_ref=PLANE_OUTCOME_PUBLISH_OPERATION,
+            resource_ref="outcome-submission:test",
+            content="generic outcome",
+        )
+
+        self.assertIs(dedicated, generic)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(binding.terminal_action_reason(), "product_outcome_published")
+        self.assertIsNone(binding.fatal_error)
+        self.assertEqual(
+            [body["kind"] for body in bodies],
+            ["progress_observed", "outcome_submission_observed"],
+        )
+        self.assertEqual(
+            bodies[1]["publication"],
+            {
+                "action": "applied",
+                "productKind": "outcome_submission",
+                "productRef": "outcome-submission:test",
+                "operationAttemptRef": "operation-attempt:request-1",
+                "operationRef": PLANE_OUTCOME_PUBLISH_OPERATION,
+                "applicationServiceRef": "application-service:agent-lifecycle",
+                "gatewayReceiptRef": "gateway-receipt:gateway-1",
+                "receiptRef": "receipt:request-1",
+                "auditReceiptRef": "audit-receipt:audit-1",
+                "productEventRef": "product-event:event-1",
+            },
+        )
+
     def test_code_mode_outcome_publication_uses_the_same_observation_seam(self) -> None:
         bodies: list[dict] = []
         calls: list[dict] = []
