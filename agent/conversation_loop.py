@@ -1184,6 +1184,18 @@ def run_conversation(
     _plugin_user_context = _ctx.plugin_user_context
     _ext_prefetch_cache = _ctx.ext_prefetch_cache
 
+    # An adapter may install this hook before entering the loop. Keep a
+    # bounded, turn-local diagnostic so an external runtime can distinguish a
+    # missing hook from a hook that observed a terminal action but lost its
+    # exit reason during finalization. The fields contain no model or tool
+    # payloads and are consumed only by the turn finalizer.
+    agent._terminal_hook_installed = callable(
+        getattr(agent, "_terminal_action_check", None)
+    )
+    agent._terminal_action_observed = False
+    agent._terminal_action_snapshot = None
+    agent._turn_provider_responses = 0
+
     # Commentary deduplication spans all provider continuations and tool calls
     # within one user turn, but must not suppress the same phrase next turn.
     agent._delivered_interim_texts = set()
@@ -2606,6 +2618,7 @@ def run_conversation(
                     continue  # Retry the API call
 
                 agent._turn_received_provider_response = True
+                agent._turn_provider_responses += 1
 
                 # Check finish_reason before proceeding
                 if agent.api_mode == "codex_responses":
@@ -6176,6 +6189,20 @@ def run_conversation(
                             or not terminal_action_reason
                         ):
                             raise TypeError("terminal action reason must be a non-empty string")
+                        agent._terminal_action_observed = True
+                        _iteration_budget = getattr(agent, "iteration_budget", None)
+                        agent._terminal_action_snapshot = {
+                            "reason": terminal_action_reason,
+                            "observed_at": "post_tool_batch",
+                            "api_call_count": api_call_count,
+                            "provider_responses": agent._turn_provider_responses,
+                            "iteration_budget_used": getattr(
+                                _iteration_budget, "used", 0
+                            ),
+                            "iteration_budget_remaining": getattr(
+                                _iteration_budget, "remaining", 0
+                            ),
+                        }
                         _turn_exit_reason = f"terminal_action({terminal_action_reason})"
                         break
 

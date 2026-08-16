@@ -585,6 +585,9 @@ class PlaneHostBinding:
     _terminal_action_reason: str | None = field(default=None, init=False, repr=False)
     _terminal_action_result: HostCallResult | None = field(default=None, init=False, repr=False)
     _terminal_action_request: HostCallRequest | None = field(default=None, init=False, repr=False)
+    _outcome_publication_metadata: dict[str, Any] | None = field(
+        default=None, init=False, repr=False
+    )
     _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -625,6 +628,14 @@ class PlaneHostBinding:
 
         with self._lock:
             return self._terminal_action_reason
+
+    def outcome_publication_metadata(self) -> dict[str, Any] | None:
+        """Return the last validated outcome publication's bounded facts."""
+
+        with self._lock:
+            if self._outcome_publication_metadata is None:
+                return None
+            return dict(self._outcome_publication_metadata)
 
     def _fail(self, message: str) -> None:
         if self._fatal_error is None:
@@ -893,6 +904,14 @@ class PlaneHostBinding:
             raise PlaneHostUnavailable("publication receipt was invalid") from exc
 
         with self._lock:
+            if request.operation_ref == PLANE_OUTCOME_PUBLISH_OPERATION and kind == "outcome":
+                self._outcome_publication_metadata = {
+                    "status": result.status,
+                    "replayed": result.replayed,
+                    "publication_action": publication.get("action", "none"),
+                    "operation_ref": request.operation_ref,
+                    "terminal_armed": False,
+                }
             if self.emit_body is not None:
                 try:
                     self.emit_body(
@@ -925,6 +944,8 @@ class PlaneHostBinding:
                 self._terminal_action_reason = "product_outcome_published"
                 self._terminal_action_result = result
                 self._terminal_action_request = request
+                if self._outcome_publication_metadata is not None:
+                    self._outcome_publication_metadata["terminal_armed"] = True
 
     def _emit_call_observation(
         self, request: HostCallRequest, result: HostCallResult

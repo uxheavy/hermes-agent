@@ -52,6 +52,42 @@ _VERIFICATION_CONTINUATION_FLAGS = (
     "_pre_verify_synthetic",
 )
 
+_DIAGNOSTIC_MAX_COUNTER = 1_000_000
+_DIAGNOSTIC_EXIT_CATEGORIES = frozenset(
+    {
+        "unknown",
+        "text_response",
+        "terminal_action",
+        "max_iterations_reached",
+        "budget_exhausted",
+        "interrupted_by_user",
+        "session_persistence_failed",
+        "guardrail_halt",
+        "local_processing_error",
+        "error_near_max_iterations",
+        "partial_stream_recovery",
+        "other",
+    }
+)
+
+
+def _diagnostic_counter(value) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        return 0
+    return max(0, min(value, _DIAGNOSTIC_MAX_COUNTER))
+
+
+def _diagnostic_exit_category(value) -> str:
+    category = str(value or "unknown").split("(", 1)[0]
+    return category if category in _DIAGNOSTIC_EXIT_CATEGORIES else "other"
+
+
+def _diagnostic_terminal_reason(value) -> str:
+    # The external runtime currently supplies product_outcome_published. Keep
+    # the diagnostic closed over known categories so a future hook cannot
+    # retain provider/model text or a secret in runtime evidence.
+    return "product_outcome_published" if value == "product_outcome_published" else "terminal_action_observed"
+
 
 def _drop_verification_continuation_scaffolding(messages) -> None:
     """Remove verification-continuation nudge messages from *messages* in place.
@@ -90,6 +126,8 @@ def finalize_turn(
     loop). See module docstring.
     """
     from agent.conversation_loop import logger
+
+    _diagnostic_exit_before_mapping = _diagnostic_exit_category(_turn_exit_reason)
 
     budget_exhausted = (
         api_call_count >= agent.max_iterations
@@ -615,6 +653,59 @@ def finalize_turn(
         ).get("service_tier"),
         "session_id": agent.session_id,
     }
+    if getattr(agent, "_terminal_hook_installed", False):
+        _budget = getattr(agent, "iteration_budget", None)
+        _terminal_action = getattr(agent, "_terminal_action_snapshot", None)
+        if not isinstance(_terminal_action, dict):
+            _terminal_action = None
+        result["terminal_lifecycle"] = {
+            "hook_installed": True,
+            "terminal_action_observed": bool(
+                getattr(agent, "_terminal_action_observed", False)
+            ),
+            "terminal_action": (
+                {
+                    "reason": _diagnostic_terminal_reason(_terminal_action.get("reason")),
+                    "observed_at": "post_tool_batch",
+                    "api_call_count": _diagnostic_counter(
+                        _terminal_action.get("api_call_count")
+                    ),
+                    "provider_responses": _diagnostic_counter(
+                        _terminal_action.get("provider_responses")
+                    ),
+                    "iteration_budget_used": _diagnostic_counter(
+                        _terminal_action.get("iteration_budget_used")
+                    ),
+                    "iteration_budget_remaining": _diagnostic_counter(
+                        _terminal_action.get("iteration_budget_remaining")
+                    ),
+                }
+                if _terminal_action is not None
+                else None
+            ),
+            "finalization": {
+                "api_call_count": _diagnostic_counter(api_call_count),
+                "provider_responses": _diagnostic_counter(
+                    getattr(agent, "_turn_provider_responses", 0)
+                ),
+                "max_iterations": _diagnostic_counter(
+                    getattr(agent, "max_iterations", 0)
+                ),
+                "iteration_budget_max_total": _diagnostic_counter(
+                    getattr(_budget, "max_total", 0)
+                ),
+                "iteration_budget_used": _diagnostic_counter(
+                    getattr(_budget, "used", 0)
+                ),
+                "iteration_budget_remaining": _diagnostic_counter(
+                    getattr(_budget, "remaining", 0)
+                ),
+                "exit_reason_before_mapping": _diagnostic_exit_before_mapping,
+                "exit_reason_after_mapping": _diagnostic_exit_category(
+                    _turn_exit_reason
+                ),
+            },
+        }
     if terminal_budget_failure:
         result["failure_reason"] = "budget_exhausted"
         result["error"] = "model-call allowance is exhausted"

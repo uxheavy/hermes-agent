@@ -2721,6 +2721,29 @@ class TestRunConversation:
         assert result["turn_exit_reason"] == "terminal_action(product_outcome_published)"
         assert result["api_calls"] == 1
         assert agent.client.chat.completions.create.call_count == 1
+        remaining = agent.iteration_budget.remaining
+        assert result["terminal_lifecycle"] == {
+            "hook_installed": True,
+            "terminal_action_observed": True,
+            "terminal_action": {
+                "reason": "product_outcome_published",
+                "observed_at": "post_tool_batch",
+                "api_call_count": 1,
+                "provider_responses": 1,
+                "iteration_budget_used": 1,
+                "iteration_budget_remaining": remaining,
+            },
+            "finalization": {
+                "api_call_count": 1,
+                "provider_responses": 1,
+                "max_iterations": agent.max_iterations,
+                "iteration_budget_max_total": agent.iteration_budget.max_total,
+                "iteration_budget_used": 1,
+                "iteration_budget_remaining": remaining,
+                "exit_reason_before_mapping": "terminal_action",
+                "exit_reason_after_mapping": "terminal_action",
+            },
+        }
 
     def test_terminal_action_check_none_continues_to_the_next_provider_call(self, agent):
         self._setup_agent(agent)
@@ -2753,6 +2776,7 @@ class TestRunConversation:
         )
         agent.max_iterations = 2
         agent.iteration_budget = IterationBudget(2)
+        agent._terminal_action_check = lambda: None
         agent._plane_runtime_terminal_budget_failure = True
         with (
             patch("run_agent.handle_function_call", return_value="tool result"),
@@ -2767,6 +2791,21 @@ class TestRunConversation:
         assert result["failure_reason"] == "budget_exhausted"
         assert result["api_calls"] == 2
         assert agent.client.chat.completions.create.call_count == 2
+        assert result["terminal_lifecycle"] == {
+            "hook_installed": True,
+            "terminal_action_observed": False,
+            "terminal_action": None,
+            "finalization": {
+                "api_call_count": 2,
+                "provider_responses": 2,
+                "max_iterations": 2,
+                "iteration_budget_max_total": 2,
+                "iteration_budget_used": 2,
+                "iteration_budget_remaining": 0,
+                "exit_reason_before_mapping": "unknown",
+                "exit_reason_after_mapping": "max_iterations_reached",
+            },
+        }
 
 
     def test_request_scoped_api_hooks_fire_for_each_api_call(self, agent):
@@ -5780,4 +5819,3 @@ class TestMemoryContextSanitization:
         assert "memory-context" not in result.lower()
         assert "stale observation" not in result
         assert "how is the honcho working" in result
-

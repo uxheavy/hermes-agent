@@ -965,6 +965,41 @@ class HostPortTests(unittest.TestCase):
             ["progress_observed", "outcome_submission_observed"],
         )
 
+    def test_replayed_outcome_publication_retains_nonarming_metadata(self) -> None:
+        def rpc(request: dict) -> dict:
+            return _result(
+                request,
+                status="replayed",
+                publication=_applied_outcome_publication(),
+            )
+
+        binding = PlaneHostBinding(
+            port=CallablePlaneHostPort(rpc),
+            run_id="run:test",
+            invocation_id="invocation:test",
+            correlation_id="correlation:test",
+            cancellation=lambda: False,
+            emit_body=lambda _body: None,
+        )
+        binding.publish(
+            kind="outcome",
+            operation_ref=PLANE_OUTCOME_PUBLISH_OPERATION,
+            resource_ref="outcome-submission:test",
+            content="replayed outcome",
+        )
+
+        self.assertIsNone(binding.terminal_action_reason())
+        self.assertEqual(
+            binding.outcome_publication_metadata(),
+            {
+                "status": "replayed",
+                "replayed": True,
+                "publication_action": "applied",
+                "operation_ref": PLANE_OUTCOME_PUBLISH_OPERATION,
+                "terminal_armed": False,
+            },
+        )
+
     def test_generic_outcome_publication_arms_and_dedicated_route_reuses_receipt(self) -> None:
         bodies: list[dict] = []
         calls: list[dict] = []
@@ -2000,6 +2035,50 @@ class HostPortTests(unittest.TestCase):
         self.assertEqual(sum(body["kind"] == "usage_observed" for body in bodies), 1)
         self.assertFalse(any(body["kind"] == "transcript_evidence_observed" for body in bodies))
         self.assertNotIn("Hermes invocation completed.", json.dumps(bodies))
+        lifecycle_events = [
+            json.loads(body["payload"]["text"])
+            for body in bodies
+            if body["kind"] == "progress_observed"
+            and body.get("payload", {}).get("kind") == "inline_text"
+            and body["payload"]["text"].startswith('{"category":"terminal_lifecycle"')
+        ]
+        self.assertEqual(len(lifecycle_events), 1)
+        self.assertEqual(
+            lifecycle_events[0],
+            {
+                "category": "terminal_lifecycle",
+                "hook_installed": True,
+                "protocol": "hermes.terminal-lifecycle/v1",
+                "terminal_action_observed": True,
+                "terminal_reason": "product_outcome_published",
+                "terminal_action": {
+                    "api_call_count": 1,
+                    "iteration_budget_remaining": 2,
+                    "iteration_budget_used": 1,
+                    "provider_responses": 1,
+                    "observed_at": "post_tool_batch",
+                    "reason": "product_outcome_published",
+                },
+                "outcome_publication": {
+                    "operation_ref": PLANE_OUTCOME_PUBLISH_OPERATION,
+                    "publication_action": "applied",
+                    "replayed": False,
+                    "status": "ok",
+                    "terminal_armed": True,
+                },
+                "finalization": {
+                    "api_call_count": 1,
+                    "exit_reason_after_mapping": "terminal_action",
+                    "exit_reason_before_mapping": "terminal_action",
+                    "iteration_budget_max_total": 3,
+                    "iteration_budget_remaining": 2,
+                    "iteration_budget_used": 1,
+                    "max_iterations": 3,
+                    "provider_responses": 1,
+                },
+            },
+        )
+        self.assertNotIn("bounded outcome", json.dumps(lifecycle_events))
 
     def test_terminal_action_emits_existing_tool_turn_text_as_transcript_evidence(self) -> None:
         from tests.plane_runtime.test_g1_runtime_process import (

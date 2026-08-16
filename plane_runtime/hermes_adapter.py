@@ -478,6 +478,108 @@ class HermesKernelResult:
     failure_cause: str | None = None
 
 
+def _terminal_lifecycle_observation(
+    lifecycle: Mapping[str, Any] | None,
+    maximum_bytes: int,
+) -> str | None:
+    """Return one bounded, non-secret observation for the Plane harness."""
+
+    if not isinstance(lifecycle, Mapping):
+        return None
+    terminal_action = lifecycle.get("terminal_action")
+    finalization = lifecycle.get("finalization")
+    if terminal_action is not None and not isinstance(terminal_action, Mapping):
+        terminal_action = None
+    if not isinstance(finalization, Mapping):
+        return None
+    if lifecycle.get("hook_installed") is not True:
+        return None
+
+    def counter(value: Any) -> int:
+        if isinstance(value, bool) or not isinstance(value, int):
+            return 0
+        return max(0, min(value, 1_000_000))
+
+    def snapshot(value: Mapping[str, Any]) -> dict[str, int]:
+        return {
+            "api_call_count": counter(value.get("api_call_count")),
+            "provider_responses": counter(value.get("provider_responses")),
+            "iteration_budget_used": counter(value.get("iteration_budget_used")),
+            "iteration_budget_remaining": counter(
+                value.get("iteration_budget_remaining")
+            ),
+        }
+
+    outcome_publication = lifecycle.get("outcome_publication")
+    if not isinstance(outcome_publication, Mapping):
+        outcome_publication = None
+
+    terminal_action_snapshot = None
+    if isinstance(terminal_action, Mapping):
+        terminal_action_snapshot = {
+            **snapshot(terminal_action),
+            "reason": (
+                "product_outcome_published"
+                if terminal_action.get("reason") == "product_outcome_published"
+                else "terminal_action_observed"
+            ),
+            "observed_at": "post_tool_batch",
+        }
+    observation = {
+        "protocol": "hermes.terminal-lifecycle/v1",
+        "category": "terminal_lifecycle",
+        "hook_installed": lifecycle.get("hook_installed") is True,
+        "terminal_action_observed": lifecycle.get("terminal_action_observed") is True,
+        "terminal_reason": (
+            "product_outcome_published"
+            if isinstance(terminal_action, Mapping)
+            and terminal_action.get("reason") == "product_outcome_published"
+            else "none"
+        ),
+        "terminal_action": terminal_action_snapshot,
+        "outcome_publication": (
+            {
+                "status": str(outcome_publication.get("status", "unknown"))[:32],
+                "replayed": outcome_publication.get("replayed") is True,
+                "publication_action": str(
+                    outcome_publication.get("publication_action", "none")
+                )[:32],
+                "operation_ref": str(
+                    outcome_publication.get("operation_ref", "none")
+                )[:128],
+                "terminal_armed": outcome_publication.get("terminal_armed") is True,
+            }
+            if outcome_publication is not None
+            else None
+        ),
+        "finalization": {
+            **snapshot(finalization),
+            "max_iterations": counter(finalization.get("max_iterations")),
+            "iteration_budget_max_total": counter(
+                finalization.get("iteration_budget_max_total")
+            ),
+            "exit_reason_before_mapping": str(
+                finalization.get("exit_reason_before_mapping", "other")
+            )[:32],
+            "exit_reason_after_mapping": str(
+                finalization.get("exit_reason_after_mapping", "other")
+            )[:32],
+        },
+    }
+    try:
+        encoded = json.dumps(
+            observation,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    except (TypeError, ValueError):
+        return None
+    if len(encoded.encode("utf-8")) > min(maximum_bytes, 2_048):
+        return None
+    return encoded
+
+
 class NeverCancelled:
     """Explicit no-cancellation seam for callers that own no control signal."""
 
@@ -917,6 +1019,31 @@ class HermesKernelAdapter:
             )
         if not isinstance(result, Mapping):
             raise G1ContractError("Hermes adapter returned a non-object result")
+        terminal_lifecycle = result.get("terminal_lifecycle")
+        if not isinstance(terminal_lifecycle, Mapping):
+            terminal_lifecycle = None
+        if terminal_lifecycle is not None and host_binding is not None:
+            outcome_publication = host_binding.outcome_publication_metadata()
+            if outcome_publication is not None:
+                terminal_lifecycle = {
+                    **terminal_lifecycle,
+                    "outcome_publication": outcome_publication,
+                }
+        lifecycle_observation = _terminal_lifecycle_observation(
+            terminal_lifecycle, event_limit
+        )
+        if lifecycle_observation is not None:
+            emit_body(
+                {
+                    "kind": "progress_observed",
+                    "payload": {
+                        "kind": "inline_text",
+                        "contentType": "text/plain",
+                        "text": lifecycle_observation,
+                    },
+                    "publication": {"action": "observation_only"},
+                }
+            )
         usage_values = (
             getattr(agent, "session_input_tokens", 0),
             getattr(agent, "session_output_tokens", 0),
@@ -1023,7 +1150,12 @@ class HermesKernelAdapter:
                     "publication": {"action": "observation_only"},
                 }
             )
-        return HermesKernelResult(kind="completed", output_text=output_text, usage=usage, model_calls=model_calls)
+        return HermesKernelResult(
+            kind="completed",
+            output_text=output_text,
+            usage=usage,
+            model_calls=model_calls,
+        )
 
     @staticmethod
     def _observed_model_calls(agent: Any | None, result: Mapping[str, Any] | None) -> int | None:
