@@ -384,9 +384,9 @@ class G1RuntimeProcessTests(unittest.TestCase):
                         function_name = "execute_code"
                         arguments = {
                             "code": (
-                                "from hermes_tools import plane_operation\n"
-                                "print(plane_operation('code', 'operation:compose', "
-                                "{'workItemRef': 'work-item:test'}))"
+                                "export default ({ input }: { input: Record<string, unknown> }) => ({"
+                                " accepted: true, input"
+                                "});"
                             )
                         }
                         finish_reason = "tool_calls"

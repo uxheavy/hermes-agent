@@ -29,6 +29,7 @@ from .host_port import (
     PlaneHostPort,
     bind_plane_host,
     install_plane_tools,
+    PLANE_CODE_MODE_TOOLSET,
 )
 from .presentation import PresentationBoundsError, build_model_guidance
 
@@ -857,10 +858,12 @@ class HermesKernelAdapter:
             for toolset in self._enabled_toolsets
             if toolset != "code_execution"
         ]
-        if _code_mode_is_available(snapshot):
+        if self._host_port is None and _code_mode_is_available(snapshot):
             enabled_toolsets.append("code_execution")
         if self._host_port is not None:
             enabled_toolsets.append("plane_runtime")
+            if _code_mode_is_available(snapshot):
+                enabled_toolsets.append(PLANE_CODE_MODE_TOOLSET)
         # Preserve caller ordering while keeping adapter-added toolsets
         # idempotent when a compatibility caller already supplied one.
         enabled_toolsets = list(dict.fromkeys(enabled_toolsets))

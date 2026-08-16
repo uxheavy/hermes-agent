@@ -33,8 +33,12 @@ from .g1_contract import G1ContractError, validate_eager_input_schema
 
 HOST_PROTOCOL = "plane.agent-runtime/v1"
 PLANE_RUNTIME_TOOLSET = "plane_runtime"
+PLANE_CODE_MODE_TOOLSET = "plane_runtime_code_mode"
 PLANE_OPERATION_TOOL = "plane_operation"
 PLANE_PUBLISH_TOOL = "plane_publish"
+PLANE_CODE_MODE_TOOL = "execute_code"
+PLANE_CODE_MODE_SCHEMA_VERSION = "plane.code-mode/v1"
+PLANE_CODE_MODE_EXECUTE_OPERATION = "plane.code-mode.execute@1"
 PLANE_OUTCOME_PUBLISH_OPERATION = "operation:agent.outcome.publish"
 PLANE_DISCOVERY_OPERATION = "plane.operations.discover@1"
 PLANE_CATALOG_SEARCH_OPERATION = "operation:catalog.search"
@@ -44,6 +48,7 @@ MAX_HOST_REQUEST_BYTES = 16 * 1024
 MAX_HOST_RESULT_BYTES = 16 * 1024
 MAX_HOST_INPUT_BYTES = 8 * 1024
 MAX_HOST_RESULT_TEXT_BYTES = 12 * 1024
+MAX_CODE_MODE_SOURCE_BYTES = 4 * 1024
 MAX_HOST_CALLS = 32
 MAX_HOST_OPERATION_REF_BYTES = 256
 MAX_HOST_CONTENT_BYTES = 4 * 1024
@@ -648,6 +653,8 @@ class PlaneHostBinding:
     def _require_schema_disclosure(self, *, action: str, operation_ref: str) -> None:
         if action == "discover":
             return
+        if action == "code" and operation_ref == PLANE_CODE_MODE_EXECUTE_OPERATION:
+            return
         if operation_ref in {
             PLANE_CATALOG_SEARCH_OPERATION,
             PLANE_CATALOG_DESCRIBE_OPERATION,
@@ -1123,6 +1130,42 @@ def _binding_or_error() -> PlaneHostBinding:
     return binding
 
 
+def _handle_plane_code_mode(args: Mapping[str, Any], **_: Any) -> str:
+    """Submit TypeScript source to the versioned Plane host action.
+
+    The source is opaque to Hermes.  It is never evaluated here and the
+    capsule deliberately carries no credentials, endpoint, filesystem, or
+    network data.  Plane parses the capsule and invokes its existing
+    credential-free child isolate; callbacks from that isolate stay on the
+    Plane-owned operation gateway.
+    """
+
+    try:
+        data = _object(args, PLANE_CODE_MODE_TOOL)
+        _reject_unknown(data, {"code"}, PLANE_CODE_MODE_TOOL)
+        source = _text(data.get("code"), f"{PLANE_CODE_MODE_TOOL}.code", MAX_CODE_MODE_SOURCE_BYTES)
+        if not source.strip():
+            raise PlaneHostError(f"{PLANE_CODE_MODE_TOOL}.code must be non-empty TypeScript")
+        capsule = {
+            "schemaVersion": PLANE_CODE_MODE_SCHEMA_VERSION,
+            "entrypoint": "default",
+            "source": source,
+            "input": {},
+        }
+        _bounded_json(capsule, "codeMode.capsule", MAX_HOST_INPUT_BYTES)
+        result = _binding_or_error().call(
+            action="code",
+            operation_ref=PLANE_CODE_MODE_EXECUTE_OPERATION,
+            input=capsule,
+            source="code",
+        )
+        return result.model_payload()
+    except PlaneHostCancelled as exc:
+        return _error_payload(str(exc), code="cancelled")
+    except PlaneHostError as exc:
+        return _error_payload(str(exc))
+
+
 def _handle_plane_operation(args: Mapping[str, Any], **_: Any) -> str:
     try:
         data = _object(args, "plane_operation")
@@ -1199,6 +1242,33 @@ def install_plane_tools() -> None:
         from tools.registry import registry
 
         registry.register(
+            PLANE_CODE_MODE_TOOL,
+            PLANE_CODE_MODE_TOOLSET,
+            {
+                "name": PLANE_CODE_MODE_TOOL,
+                "description": (
+                    "Run bounded TypeScript in Plane's credential-free Code Mode "
+                    "isolate. Export a default function receiving { host, input }; "
+                    "use only the typed host callbacks supplied by Plane."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "code": {
+                            "type": "string",
+                            "description": "Bounded TypeScript source exporting a default function.",
+                        },
+                    },
+                    "required": ["code"],
+                },
+            },
+            _handle_plane_code_mode,
+            description="Bounded TypeScript Plane Code Mode execution",
+            max_result_size_chars=MAX_HOST_RESULT_TEXT_BYTES,
+            override=True,
+        )
+        registry.register(
             PLANE_OPERATION_TOOL,
             PLANE_RUNTIME_TOOLSET,
             {
@@ -1265,6 +1335,11 @@ __all__ = [
     "PlaneHostSchemaNotDisclosed",
     "PlaneHostPort",
     "PlaneHostUnavailable",
+    "MAX_CODE_MODE_SOURCE_BYTES",
+    "PLANE_CODE_MODE_EXECUTE_OPERATION",
+    "PLANE_CODE_MODE_SCHEMA_VERSION",
+    "PLANE_CODE_MODE_TOOLSET",
+    "PLANE_CODE_MODE_TOOL",
     "PLANE_OUTCOME_PUBLISH_OPERATION",
     "bind_plane_host",
     "current_plane_host",
