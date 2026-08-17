@@ -980,6 +980,53 @@ class HermesKernelAdapter:
                     retryable=False,
                     model_calls=self._observed_model_calls(agent, None),
                 )
+            if host_binding is not None and host_binding.fatal_error_after_terminal:
+                # Plane's applied publication already owns terminalization.
+                # A later host callback can still escape the kernel loop, but
+                # it must remain bounded runtime evidence rather than relabel
+                # the first Plane-visible terminal product event.
+                messages = getattr(agent, "_session_messages", None)
+                if not isinstance(messages, Sequence):
+                    messages = getattr(agent, "messages", None)
+                terminal_text = _terminal_assistant_text(messages)
+                output_text = bound_runtime_text(
+                    redact_runtime_text(terminal_text, credential_values),
+                    event_limit,
+                )
+                try:
+                    emit_body(
+                        {
+                            "kind": "progress_observed",
+                            "payload": {
+                                "kind": "inline_text",
+                                "contentType": "text/plain",
+                                "text": "Hermes preserved the applied Plane terminal after a late host callback failure.",
+                            },
+                            "publication": {"action": "observation_only"},
+                        }
+                    )
+                    if output_text:
+                        emit_body(
+                            {
+                                "kind": "transcript_evidence_observed",
+                                "payload": {
+                                    "kind": "inline_text",
+                                    "contentType": "text/plain",
+                                    "text": output_text,
+                                },
+                                "publication": {"action": "observation_only"},
+                            }
+                        )
+                except Exception:
+                    # The event sink may be the callback that failed. The
+                    # applied product terminal remains authoritative even if
+                    # this diagnostic projection cannot be delivered.
+                    pass
+                return HermesKernelResult(
+                    kind="completed",
+                    output_text=output_text,
+                    model_calls=self._observed_model_calls(agent, None),
+                )
             message = bound_runtime_text(redact_runtime_text(str(exc), credential_values), event_limit)
             return HermesKernelResult(
                 kind="failed",

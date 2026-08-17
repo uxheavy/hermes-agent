@@ -291,3 +291,186 @@ def test_real_hermes_long_route_preserves_applied_publication_after_observation_
         for body in bodies
     )
     assert "provider-test-marker" not in json.dumps(requests + bodies)
+
+
+def test_post_terminal_code_mode_host_exception_preserves_applied_publication() -> None:
+    """A late Code Mode host exception cannot overturn the applied terminal."""
+
+    from plane_runtime import current_plane_host
+    from plane_runtime.hermes_adapter import HermesKernelAdapter
+    from plane_runtime.host_port import PlaneHostError
+    from tests.plane_runtime.test_g1_runtime_process import (
+        G1InvocationEnvelope,
+        G1RunSnapshot,
+        make_invocation,
+        make_snapshot,
+    )
+
+    snapshot = G1RunSnapshot.from_dict(make_snapshot())
+    invocation = G1InvocationEnvelope.from_dict(make_invocation(snapshot.to_dict()))
+    host_requests: list[dict] = []
+    model_calls = 0
+
+    def rpc(request: dict) -> dict:
+        host_requests.append(request)
+        assert request["action"] == "publish"
+        return _result(
+            request,
+            output={"published": True},
+            publication={
+                "action": "applied",
+                "productKind": "outcome_submission",
+                "productRef": "outcome-submission:test",
+                "operationAttemptRef": "operation-attempt:test",
+                "operationRef": PLANE_OUTCOME_PUBLISH_OPERATION,
+                "applicationServiceRef": "application-service:agent-lifecycle",
+                "gatewayReceiptRef": "gateway-receipt:test",
+                "receiptRef": "receipt:test",
+                "auditReceiptRef": "audit-receipt:test",
+                "productEventRef": "product-event:test",
+            },
+        )
+
+    class FakeAgent:
+        session_input_tokens = 1
+        session_output_tokens = 1
+        session_api_calls = 0
+
+        def __init__(self, **_kwargs: object) -> None:
+            self._session_messages = [
+                {
+                    "role": "assistant",
+                    "content": "ordinary final transcript evidence",
+                    "tool_calls": [{"function": {"name": "plane_publish"}}],
+                }
+            ]
+
+        def interrupt(self, _reason: str) -> None:
+            return
+
+        def run_conversation(self, *_args: object, **_kwargs: object) -> dict[str, object]:
+            nonlocal model_calls
+            model_calls += 1
+            self.session_api_calls = model_calls
+            binding = current_plane_host()
+            assert binding is not None
+            binding.publish(
+                kind="outcome",
+                operation_ref=PLANE_OUTCOME_PUBLISH_OPERATION,
+                resource_ref="outcome-submission:test",
+                content="bounded outcome",
+            )
+            try:
+                # This is the late Code Mode host callback. The invalid
+                # capsule is rejected at the binding seam after publication,
+                # so no second host mutation can occur.
+                binding.call(
+                    action="code",
+                    operation_ref=PLANE_CODE_MODE_EXECUTE_OPERATION,
+                    input={"code": object()},
+                    source="code",
+                )
+            except PlaneHostError:
+                assert binding.fatal_error_after_terminal is True
+                raise
+            raise AssertionError("late host exception did not escape the fake agent")
+
+    bodies: list[dict] = []
+    result = HermesKernelAdapter(
+        agent_factory=lambda **kwargs: FakeAgent(**kwargs),
+        credential_source=type(
+            "Credentials",
+            (),
+            {"resolve": lambda _self, _provider: {"api_key": "provider-test-marker"}},
+        )(),
+        host_port=CallablePlaneHostPort(rpc),
+    ).dispatch(
+        snapshot,
+        invocation,
+        lambda: False,
+        bodies.append,
+        model_call_allowance=2,
+    )
+
+    assert result.kind == "completed", (
+        "event=terminal_handoff.post_terminal_exception actor=hermes "
+        "operation=code_mode_host_callback risk=applied_outcome_relabeled "
+        "expected=completed_product_outcome_published "
+        f"actual={result.kind} suggestion=inspect_adapter_exception_path"
+    )
+    assert result.output_text == "ordinary final transcript evidence"
+    assert result.model_calls == 1
+    assert model_calls == 1
+    assert len(host_requests) == 1
+    assert host_requests[0]["action"] == "publish"
+    assert sum(body["kind"] == "outcome_submission_observed" for body in bodies) == 1
+    assert sum(
+        body["kind"] == "progress_observed"
+        and body["payload"]["text"]
+        == "Hermes preserved the applied Plane terminal after a late host callback failure."
+        for body in bodies
+    ) == 1
+    assert sum(body["kind"] == "transcript_evidence_observed" for body in bodies) == 1
+    assert not any(body.get("publication", {}).get("action") == "terminal" for body in bodies)
+    assert "provider-test-marker" not in json.dumps(host_requests + bodies)
+
+
+def test_pre_terminal_code_mode_host_exception_remains_failed() -> None:
+    """The terminal-preserving exception branch must not swallow pre-terminal errors."""
+
+    from plane_runtime import current_plane_host
+    from plane_runtime.hermes_adapter import HermesKernelAdapter
+    from plane_runtime.host_port import PlaneHostError
+    from tests.plane_runtime.test_g1_runtime_process import (
+        G1InvocationEnvelope,
+        G1RunSnapshot,
+        make_invocation,
+        make_snapshot,
+    )
+
+    snapshot = G1RunSnapshot.from_dict(make_snapshot())
+    invocation = G1InvocationEnvelope.from_dict(make_invocation(snapshot.to_dict()))
+
+    class FakeAgent:
+        session_input_tokens = 0
+        session_output_tokens = 0
+        session_api_calls = 1
+
+        def interrupt(self, _reason: str) -> None:
+            return
+
+        def run_conversation(self, *_args: object, **_kwargs: object) -> dict[str, object]:
+            binding = current_plane_host()
+            assert binding is not None
+            try:
+                binding.call(
+                    action="code",
+                    operation_ref=PLANE_CODE_MODE_EXECUTE_OPERATION,
+                    input={"code": object()},
+                    source="code",
+                )
+            except PlaneHostError:
+                assert binding.fatal_error_after_terminal is False
+                raise
+            raise AssertionError("pre-terminal host exception did not escape the fake agent")
+
+    result = HermesKernelAdapter(
+        agent_factory=lambda **kwargs: FakeAgent(),
+        credential_source=type(
+            "Credentials",
+            (),
+            {"resolve": lambda _self, _provider: {"api_key": "provider-test-marker"}},
+        )(),
+        host_port=CallablePlaneHostPort(
+            lambda _request: (_ for _ in ()).throw(AssertionError("host mutation was attempted"))
+        ),
+    ).dispatch(
+        snapshot,
+        invocation,
+        lambda: False,
+        lambda _body: None,
+        model_call_allowance=1,
+    )
+
+    assert result.kind == "failed"
+    assert result.failure_code == "runtime_error"
