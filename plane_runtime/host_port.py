@@ -919,6 +919,22 @@ class PlaneHostBinding:
                     "operation_ref": request.operation_ref,
                     "terminal_armed": False,
                 }
+            if (
+                request.operation_ref == PLANE_OUTCOME_PUBLISH_OPERATION
+                and kind == "outcome"
+                and result.status == "ok"
+                and result.replayed is False
+                and publication["action"] == "applied"
+            ):
+                # The Plane host has already applied the product mutation. Arm
+                # the kernel stop before emitting the corresponding runtime
+                # observation so a late event-handoff failure cannot turn an
+                # applied publication into a pre-terminal host failure.
+                self._terminal_action_reason = "product_outcome_published"
+                self._terminal_action_result = result
+                self._terminal_action_request = request
+                if self._outcome_publication_metadata is not None:
+                    self._outcome_publication_metadata["terminal_armed"] = True
             if self.emit_body is not None:
                 try:
                     self.emit_body(
@@ -941,18 +957,6 @@ class PlaneHostBinding:
                     raise PlaneHostUnavailable(
                         "Plane publication observation could not be emitted"
                     ) from exc
-            if (
-                request.operation_ref == PLANE_OUTCOME_PUBLISH_OPERATION
-                and kind == "outcome"
-                and result.status == "ok"
-                and result.replayed is False
-                and publication["action"] == "applied"
-            ):
-                self._terminal_action_reason = "product_outcome_published"
-                self._terminal_action_result = result
-                self._terminal_action_request = request
-                if self._outcome_publication_metadata is not None:
-                    self._outcome_publication_metadata["terminal_armed"] = True
 
     def _emit_call_observation(
         self, request: HostCallRequest, result: HostCallResult
