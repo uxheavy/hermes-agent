@@ -53,6 +53,52 @@ _CODE_MODE_RUNTIME_POLICY_FIELDS = (
 _OUTCOME_UNKNOWN_RUNTIME_MESSAGE = (
     "Provider outcome is unknown; Plane reconciliation is required before retrying."
 )
+_PROVIDER_CLIENT_EXCEPTION_TYPES = frozenset(
+    {
+        ("httpx", "HTTPError"),
+        ("httpx", "HTTPStatusError"),
+        ("httpx", "RequestError"),
+        ("httpx", "TransportError"),
+        ("httpx", "TimeoutException"),
+        ("openai", "APIConnectionError"),
+        ("openai", "APIError"),
+        ("openai", "APIResponseValidationError"),
+        ("openai", "APIStatusError"),
+        ("openai", "APITimeoutError"),
+        ("openai", "AuthenticationError"),
+        ("openai", "BadRequestError"),
+        ("openai", "ConflictError"),
+        ("openai", "InternalServerError"),
+        ("openai", "NotFoundError"),
+        ("openai", "PermissionDeniedError"),
+        ("openai", "RateLimitError"),
+        ("openai", "UnprocessableEntityError"),
+    }
+)
+_PROVIDER_TIMEOUT_EXCEPTION_TYPES = frozenset(
+    {"ConnectTimeout", "PoolTimeout", "ReadTimeout", "WriteTimeout"}
+)
+
+
+def _classify_runtime_exception(exception: BaseException) -> str:
+    """Return finite non-content runtime evidence for an adapter exception."""
+
+    if isinstance(exception, (ModuleNotFoundError, ImportError)):
+        return "dependency_failure"
+    if isinstance(exception, PermissionError):
+        return "permission_failure"
+    if isinstance(exception, MemoryError):
+        return "resource_failure"
+    if isinstance(exception, TimeoutError):
+        return "timeout_failure"
+    exception_type = type(exception)
+    module = exception_type.__module__
+    name = exception_type.__name__
+    if name in _PROVIDER_TIMEOUT_EXCEPTION_TYPES and module == "httpx":
+        return "timeout_failure"
+    if (module, name) in _PROVIDER_CLIENT_EXCEPTION_TYPES:
+        return "provider_client_failure"
+    return "runtime_unknown_failure"
 
 
 class ProviderOutcomeUnknownError(RuntimeError):
@@ -1032,12 +1078,12 @@ class HermesKernelAdapter:
                     output_text=output_text,
                     model_calls=self._observed_model_calls(agent, None),
                 )
-            message = bound_runtime_text(redact_runtime_text(str(exc), credential_values), event_limit)
             return HermesKernelResult(
                 kind="failed",
                 failure_code="runtime_error",
-                failure_message=message or "Hermes invocation failed",
+                failure_message="Hermes invocation failed",
                 retryable=True,
+                failure_cause=_classify_runtime_exception(exc),
                 model_calls=self._observed_model_calls(agent, None),
             )
 

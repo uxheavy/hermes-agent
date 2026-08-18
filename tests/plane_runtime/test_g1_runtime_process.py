@@ -1578,6 +1578,63 @@ class G1RuntimeProcessTests(unittest.TestCase):
         self.assertEqual(budget_result.failure_code, "budget_exhausted")
         self.assertIsNone(budget_result.failure_cause)
 
+    def test_adapter_classifies_runtime_exceptions_without_content_leakage(self) -> None:
+        snapshot_raw = make_snapshot()
+        snapshot_raw["runtimePolicy"] = dict(snapshot_raw["runtimePolicy"])  # type: ignore[arg-type]
+        snapshot_raw["runtimePolicy"]["adapter"] = "hermes"  # type: ignore[index]
+        snapshot_raw["contentDigest"] = _digest(
+            "snapshot", {key: value for key, value in snapshot_raw.items() if key != "contentDigest"}
+        )
+        snapshot = G1RunSnapshot.from_dict(snapshot_raw)
+        invocation = G1InvocationEnvelope.from_dict(make_invocation(snapshot.to_dict()))
+
+        class Credentials:
+            def resolve(self, provider: str) -> dict[str, str]:
+                del provider
+                return {"api_key": "trusted-host-secret"}
+
+        class APIConnectionError(Exception):
+            pass
+
+        APIConnectionError.__module__ = "openai"
+
+        cases = (
+            (ModuleNotFoundError("secret/path"), "dependency_failure"),
+            (ImportError("prompt/path"), "dependency_failure"),
+            (PermissionError("token/path"), "permission_failure"),
+            (MemoryError("secret allocation"), "resource_failure"),
+            (TimeoutError("secret timeout"), "timeout_failure"),
+            (APIConnectionError("provider secret"), "provider_client_failure"),
+            (RuntimeError("secret/path prompt token"), "runtime_unknown_failure"),
+        )
+        for exception, cause in cases:
+            def failing_factory(**kwargs: object) -> object:
+                del kwargs
+                raise exception
+
+            result = HermesKernelAdapter(
+                agent_factory=failing_factory,
+                credential_source=Credentials(),
+            ).dispatch(
+                snapshot,
+                invocation,
+                lambda: False,
+                lambda body: None,
+                model_call_allowance=1,
+            )
+            self.assertEqual(result.kind, "failed")
+            self.assertEqual(result.failure_code, "runtime_error")
+            self.assertTrue(result.retryable)
+            self.assertEqual(result.failure_cause, cause)
+            self.assertEqual(result.failure_message, "Hermes invocation failed")
+            serialized = json.dumps(result.__dict__)
+            for secret in ("secret", "path", "prompt", "token"):
+                self.assertNotIn(secret, serialized)
+
+            exit_frame = _terminal_failure(snapshot, invocation, result, 0)
+            self.assertEqual(exit_frame["failure"]["cause"], cause)
+            self.assertNotIn("secret", json.dumps(exit_frame))
+
     def test_approved_checkpoint_is_loaded_once_and_prefilled_before_hermes(self) -> None:
         snapshot = G1RunSnapshot.from_dict(make_snapshot())
         invocation_raw = make_invocation(snapshot.to_dict())
