@@ -1440,6 +1440,47 @@ class G1RuntimeProcessTests(unittest.TestCase):
         self.assertEqual(result.failure_code, "budget_exhausted")
         self.assertFalse(result.retryable)
 
+    def test_hermes_adapter_classifies_bounded_provider_result_failures(self) -> None:
+        snapshot = G1RunSnapshot.from_dict(make_snapshot())
+        invocation = G1InvocationEnvelope.from_dict(make_invocation(snapshot.to_dict()))
+
+        class Credentials:
+            def resolve(self, provider: str) -> dict[str, str]:
+                del provider
+                return {"api_key": "trusted-host-secret"}
+
+        cases = (
+            ({"code": "rate_limit_exceeded", "message": "provider secret"}, None, "provider_rate_limit"),
+            ({"code": "insufficient_quota", "message": "provider secret"}, None, "provider_entitlement_failure"),
+            ({"message": "unavailable"}, "auth", "provider_auth_failure"),
+            ({"message": "unavailable"}, "timeout", "provider_transport_failure"),
+            ({"code": "invalid_request_error", "message": "provider secret"}, None, "provider_unknown_failure"),
+        )
+        for error, failure_reason, expected_cause in cases:
+            class FailedAgent:
+                session_input_tokens = 1
+                session_output_tokens = 1
+
+                def run_conversation(self, message: str, *, system_message: str) -> dict[str, object]:
+                    del message, system_message
+                    result: dict[str, object] = {"failed": True, "error": error}
+                    if failure_reason is not None:
+                        result["failure_reason"] = failure_reason
+                    return result
+
+            result = HermesKernelAdapter(
+                agent_factory=lambda **kwargs: FailedAgent(),
+                credential_source=Credentials(),
+            ).dispatch(snapshot, invocation, lambda: False, lambda body: None, model_call_allowance=1)
+
+            self.assertEqual(result.failure_code, "runtime_error")
+            self.assertEqual(result.failure_cause, expected_cause)
+            self.assertEqual(result.failure_message, "Hermes invocation failed")
+            self.assertNotIn("provider secret", json.dumps(result.__dict__))
+            exit_frame = _terminal_failure(snapshot, invocation, result, 0)
+            self.assertEqual(exit_frame["failure"]["cause"], expected_cause)
+            self.assertNotIn("provider secret", json.dumps(exit_frame))
+
     def test_zero_model_call_allowance_does_not_construct_hermes(self) -> None:
         snapshot = G1RunSnapshot.from_dict(make_snapshot())
         invocation = G1InvocationEnvelope.from_dict(make_invocation(snapshot.to_dict()))

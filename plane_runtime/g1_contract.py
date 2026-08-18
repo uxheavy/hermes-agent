@@ -35,10 +35,10 @@ G1_CONTRACT_DIGESTS = {
     "runSnapshot": "308101c6a2c9f56e7deb5c6a07c8bc74b59831b92cbbb5b07c5a7eefc21f4947",
     "invocationEnvelope": "b7a15d74406f1624cdb7cd95b42edfd1ffee596abe57e4f00ed60e2e23ded995",
     "runtimeEvent": "78da5ce9d112b6545ea471e5fcae25ff5dfeb2e5db74a8d5796d0ee026823a27",
-    "runtimeExit": "aa7aaf6e8b99e7001b87f02bec3cce206d83d585e1db40eaf7c810439f409d91",
+    "runtimeExit": "cb36a536fe2ddae8bd102d5abc33cb829c992366428362e5ec91707adcadc739",
     "runtimeDurableState": "444c944ec8a5054f33c8662470529a1f4565d42ff06138438beceeef7967a0da",
 }
-G1_MANIFEST_DIGEST = "d1a5b746d15b1e8cc64bd105b1e8440fc133b3d22608208256cbe0b409ae7d71"
+G1_MANIFEST_DIGEST = "0ebbaef00c56af0c7f35ff74c0fc711353fb1690e04b8df80a73d5f1ae651fd1"
 
 _ROLES = {"worker", "delegator", "gardener", "chief_of_staff", "hr", "evaluator", "custom"}
 _TRIGGERS = {"initial", "human_input", "recoverable_restart", "continuation"}
@@ -84,6 +84,12 @@ RUNTIME_FAILURE_CAUSES = frozenset(
         "timeout_failure",
         "provider_client_failure",
         "runtime_unknown_failure",
+        "provider_auth_failure",
+        "provider_entitlement_failure",
+        "provider_rate_limit",
+        "provider_request_failure",
+        "provider_transport_failure",
+        "provider_unknown_failure",
     }
 )
 

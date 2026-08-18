@@ -15,6 +15,7 @@ from types import MappingProxyType
 from typing import Any, Callable, Mapping, MutableMapping, Protocol, Sequence
 
 import httpx
+from agent.error_classifier import FailoverReason, classify_api_error
 
 from .g1_contract import (
     G1ContractError,
@@ -78,6 +79,96 @@ _PROVIDER_CLIENT_EXCEPTION_TYPES = frozenset(
 _PROVIDER_TIMEOUT_EXCEPTION_TYPES = frozenset(
     {"ConnectTimeout", "PoolTimeout", "ReadTimeout", "WriteTimeout"}
 )
+
+_PROVIDER_RESULT_FAILURE_CAUSES = MappingProxyType(
+    {
+        FailoverReason.auth: "provider_auth_failure",
+        FailoverReason.auth_permanent: "provider_auth_failure",
+        FailoverReason.billing: "provider_entitlement_failure",
+        FailoverReason.provider_policy_blocked: "provider_entitlement_failure",
+        FailoverReason.rate_limit: "provider_rate_limit",
+        FailoverReason.upstream_rate_limit: "provider_rate_limit",
+        FailoverReason.overloaded: "provider_rate_limit",
+        FailoverReason.timeout: "provider_transport_failure",
+        FailoverReason.ssl_cert_verification: "provider_transport_failure",
+        FailoverReason.server_error: "provider_request_failure",
+        FailoverReason.format_error: "provider_request_failure",
+        FailoverReason.context_overflow: "provider_request_failure",
+        FailoverReason.payload_too_large: "provider_request_failure",
+        FailoverReason.image_too_large: "provider_request_failure",
+        FailoverReason.model_not_found: "provider_request_failure",
+        FailoverReason.content_policy_blocked: "provider_request_failure",
+        FailoverReason.invalid_encrypted_content: "provider_request_failure",
+        FailoverReason.multimodal_tool_content_unsupported: "provider_request_failure",
+    }
+)
+_PROVIDER_RESULT_FAILURE_REASON_ALIASES = MappingProxyType(
+    {
+        "auth": FailoverReason.auth,
+        "auth_permanent": FailoverReason.auth_permanent,
+        "billing": FailoverReason.billing,
+        "rate_limited": FailoverReason.rate_limit,
+        "rate_limit_exceeded": FailoverReason.rate_limit,
+        "timeout": FailoverReason.timeout,
+        "server_error": FailoverReason.server_error,
+        "request_error": FailoverReason.format_error,
+    }
+)
+
+
+class _BoundedProviderResultError(Exception):
+    """Classifier input built from one bounded Hermes result error only."""
+
+    def __init__(self, error: object) -> None:
+        body: dict[str, object]
+        status_code: int | None = None
+        if isinstance(error, Mapping):
+            bounded: dict[str, object] = {}
+            for key in ("code", "type", "message", "param"):
+                value = error.get(key)
+                if isinstance(value, str) and len(value.encode("utf-8")) <= 512:
+                    bounded[key] = value
+            for key in ("status_code", "statusCode", "status"):
+                value = error.get(key)
+                if isinstance(value, int) and not isinstance(value, bool) and 100 <= value < 600:
+                    status_code = value
+                    break
+            body = {"error": bounded} if bounded else {}
+        elif isinstance(error, str) and len(error.encode("utf-8")) <= 512:
+            body = {"error": {"message": error}}
+        else:
+            body = {}
+        self.body = body
+        self.status_code = status_code
+        super().__init__("bounded provider result failure")
+
+
+def _provider_result_failure_cause(
+    error: object,
+    failure_reason: object,
+    *,
+    provider: str,
+    model: str,
+) -> str:
+    """Classify bounded provider result metadata without exposing its content."""
+
+    reason: FailoverReason | None = None
+    if isinstance(failure_reason, str):
+        candidate = failure_reason.strip().lower()
+        reason = _PROVIDER_RESULT_FAILURE_REASON_ALIASES.get(candidate)
+        if reason is None:
+            try:
+                reason = FailoverReason(candidate)
+            except ValueError:
+                reason = None
+    if reason is None:
+        classified = classify_api_error(
+            _BoundedProviderResultError(error),
+            provider=provider,
+            model=model,
+        )
+        reason = classified.reason
+    return _PROVIDER_RESULT_FAILURE_CAUSES.get(reason, "provider_unknown_failure")
 
 
 def _classify_runtime_exception(exception: BaseException) -> str:
@@ -1200,16 +1291,21 @@ class HermesKernelAdapter:
                     usage=usage,
                     model_calls=model_calls,
                 )
+            model = snapshot.raw["runtimePolicy"].get("model", {})
+            provider_failure_cause = _provider_result_failure_cause(
+                result.get("error"),
+                result.get("failure_reason"),
+                provider=str(model.get("provider", snapshot.model_provider)),
+                model=str(model.get("model", snapshot.model_name)),
+            )
             return HermesKernelResult(
                 kind="failed",
                 failure_code="runtime_error",
-                failure_message=bound_runtime_text(
-                    redact_runtime_text(str(result.get("error") or "Hermes invocation failed"), credential_values),
-                    event_limit,
-                ),
+                failure_message="Hermes invocation failed",
                 retryable=True,
                 usage=usage,
                 model_calls=model_calls,
+                failure_cause=provider_failure_cause,
             )
         question = result.get("input_request") or result.get("waiting_for_input")
         if isinstance(question, str) and question:
