@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
+import hashlib
 import json
 import io
 import os
@@ -12,8 +12,10 @@ import sys
 import tempfile
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Mapping
 import unittest
 from unittest import mock
 
@@ -150,6 +152,140 @@ def _applied_outcome_publication(
 
 
 class HostPortTests(unittest.TestCase):
+    def test_host_operation_diagnostic_is_bounded_and_phase_exact(self) -> None:
+        operation_ref = "operation:work-item-get@1"
+        operation_ref_digest = hashlib.sha256(operation_ref.encode("utf-8")).hexdigest()
+        raw_input = "input-secret-must-not-leak"
+        raw_result = "result-secret-must-not-leak"
+
+        returned = PlaneHostBinding(
+            port=CallablePlaneHostPort(
+                lambda request: _result(
+                    request,
+                    output={"rawResult": raw_result},
+                )
+            ),
+            run_id="run:diagnostic",
+            invocation_id="invocation:diagnostic",
+            correlation_id="correlation:diagnostic",
+            cancellation=lambda: False,
+        )
+        returned.call(
+            action="read",
+            operation_ref=operation_ref,
+            input={"rawInput": raw_input},
+            source="model",
+        )
+        self.assertEqual(
+            returned.host_operation_diagnostic,
+            {
+                "callbackPhase": "host_return",
+                "operationRefDigest": operation_ref_digest,
+            },
+        )
+
+        before_call = PlaneHostBinding(
+            port=CallablePlaneHostPort(
+                lambda _request: (_ for _ in ()).throw(
+                    RuntimeError("provider-secret-before-return")
+                )
+            ),
+            run_id="run:diagnostic",
+            invocation_id="invocation:diagnostic",
+            correlation_id="correlation:diagnostic",
+            cancellation=lambda: False,
+        )
+        with self.assertRaises(PlaneHostUnavailable):
+            before_call.call(
+                action="read",
+                operation_ref=operation_ref,
+                input={"rawInput": raw_input},
+                source="model",
+            )
+        self.assertEqual(
+            before_call.host_operation_diagnostic,
+            {
+                "callbackPhase": "before_host_call",
+                "operationRefDigest": operation_ref_digest,
+            },
+        )
+
+        observation_emit = PlaneHostBinding(
+            port=CallablePlaneHostPort(
+                lambda request: _result(request, output={"rawResult": raw_result})
+            ),
+            run_id="run:diagnostic",
+            invocation_id="invocation:diagnostic",
+            correlation_id="correlation:diagnostic",
+            cancellation=lambda: False,
+            emit_body=mock.Mock(side_effect=RuntimeError("provider-secret-observation")),
+        )
+        with self.assertRaises(PlaneHostUnavailable):
+            observation_emit.call(
+                action="read",
+                operation_ref=operation_ref,
+                input={"rawInput": raw_input},
+                source="model",
+            )
+        self.assertEqual(
+            observation_emit.host_operation_diagnostic,
+            {
+                "callbackPhase": "model_observation_emit",
+                "operationRefDigest": operation_ref_digest,
+            },
+        )
+
+        event_count = 0
+
+        def emit_event(_body: Mapping[str, object]) -> None:
+            nonlocal event_count
+            event_count += 1
+            if event_count == 2:
+                raise RuntimeError("provider-secret-adapter-event")
+
+        adapter_event = PlaneHostBinding(
+            port=CallablePlaneHostPort(
+                lambda request: _result(
+                    request,
+                    publication=_applied_outcome_publication(),
+                )
+            ),
+            run_id="run:diagnostic",
+            invocation_id="invocation:diagnostic",
+            correlation_id="correlation:diagnostic",
+            cancellation=lambda: False,
+            emit_body=emit_event,
+        )
+        with self.assertRaises(PlaneHostUnavailable):
+            adapter_event.publish(
+                kind="outcome",
+                operation_ref=PLANE_OUTCOME_PUBLISH_OPERATION,
+                resource_ref="outcome-submission:diagnostic",
+                content=raw_input,
+            )
+        adapter_diagnostic = adapter_event.host_operation_diagnostic
+        assert adapter_diagnostic is not None
+        self.assertEqual(adapter_diagnostic["callbackPhase"], "adapter_event")
+        self.assertEqual(
+            adapter_diagnostic["operationRefDigest"],
+            hashlib.sha256(
+                PLANE_OUTCOME_PUBLISH_OPERATION.encode("utf-8")
+            ).hexdigest(),
+        )
+
+        serialized = json.dumps(
+            {
+                "returned": returned.host_operation_diagnostic,
+                "beforeCall": before_call.host_operation_diagnostic,
+                "observationEmit": observation_emit.host_operation_diagnostic,
+                "adapterEvent": adapter_diagnostic,
+            },
+            sort_keys=True,
+        )
+        self.assertNotIn(raw_input, serialized)
+        self.assertNotIn(raw_result, serialized)
+        self.assertNotIn("provider-secret", serialized)
+
     def test_ambiguous_prepared_search_handoff_stays_pending_until_read(self) -> None:
         """A multi-result search cannot silently become an ordinary text exit."""
 

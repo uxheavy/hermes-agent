@@ -53,6 +53,15 @@ MAX_HOST_CALLS = 32
 MAX_HOST_OPERATION_REF_BYTES = 256
 MAX_HOST_CONTENT_BYTES = 4 * 1024
 
+HOST_CALLBACK_PHASES = frozenset(
+    {
+        "before_host_call",
+        "host_return",
+        "model_observation_emit",
+        "adapter_event",
+    }
+)
+
 _ACTIONS = {"discover", "read", "mutate", "code", "publish"}
 _SOURCES = {"model", "code"}
 _RESULT_STATUSES = {
@@ -174,6 +183,10 @@ def _duplicate_rejecting_pairs(items: list[tuple[str, Any]]) -> dict[str, Any]:
 
 def _digest(value: Mapping[str, Any]) -> str:
     return hashlib.sha256(_canonical(value, "host request")).hexdigest()
+
+
+def _operation_ref_digest(operation_ref: str) -> str:
+    return hashlib.sha256(operation_ref.encode("utf-8")).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -635,6 +648,9 @@ class PlaneHostBinding:
     described_operation_refs: set[str] = field(default_factory=set, init=False, repr=False)
     _fatal_error: str | None = field(default=None, init=False, repr=False)
     _fatal_error_after_terminal: bool = field(default=False, init=False, repr=False)
+    _host_operation_diagnostic: dict[str, str] | None = field(
+        default=None, init=False, repr=False
+    )
     _terminal_action_reason: str | None = field(default=None, init=False, repr=False)
     _terminal_action_result: HostCallResult | None = field(default=None, init=False, repr=False)
     _terminal_action_request: HostCallRequest | None = field(default=None, init=False, repr=False)
@@ -674,6 +690,15 @@ class PlaneHostBinding:
             return self._fatal_error_after_terminal
 
     @property
+    def host_operation_diagnostic(self) -> dict[str, str] | None:
+        """Return only bounded, non-secret facts about the last host callback."""
+
+        with self._lock:
+            if self._host_operation_diagnostic is None:
+                return None
+            return dict(self._host_operation_diagnostic)
+
+    @property
     def publication_count(self) -> int:
         return sum(1 for item in self.records if item.request.action == "publish")
 
@@ -701,6 +726,22 @@ class PlaneHostBinding:
         if self._fatal_error is None:
             self._fatal_error = message[:2048]
             self._fatal_error_after_terminal = self._terminal_action_reason is not None
+
+    def _set_callback_phase(
+        self, phase: str, request: HostCallRequest | None = None
+    ) -> None:
+        if phase not in HOST_CALLBACK_PHASES:
+            raise ValueError("unsupported Plane host callback phase")
+        if request is not None:
+            operation_ref_digest = _operation_ref_digest(request.operation_ref)
+        elif self._host_operation_diagnostic is not None:
+            operation_ref_digest = self._host_operation_diagnostic["operationRefDigest"]
+        else:
+            return
+        self._host_operation_diagnostic = {
+            "callbackPhase": phase,
+            "operationRefDigest": operation_ref_digest,
+        }
 
     def _schema_is_disclosed(self, operation_ref: str) -> bool:
         return operation_ref in self.eager_operation_refs or operation_ref in self.described_operation_refs
@@ -847,6 +888,7 @@ class PlaneHostBinding:
             if len(self.records) >= self.max_calls:
                 self._fail("Plane host call budget exhausted")
                 raise PlaneHostBoundsError("Plane host call budget exhausted")
+            self._set_callback_phase("before_host_call", request)
             try:
                 result = self.port.invoke(request)
             except PlaneHostError as exc:
@@ -855,10 +897,19 @@ class PlaneHostBinding:
             except Exception as exc:
                 self._fail("Plane host callback failed")
                 raise PlaneHostUnavailable("Plane host callback failed") from exc
+            self._set_callback_phase("host_return", request)
             self.records.append(HostCallRecord(request, result))
-            self._record_catalog_description(request, result)
+            try:
+                self._record_catalog_description(request, result)
+            except Exception:
+                self._set_callback_phase("adapter_event")
+                raise
             self._emit_call_observation(request, result)
-            self._observe_publication(request, result)
+            try:
+                self._observe_publication(request, result)
+            except Exception:
+                self._set_callback_phase("adapter_event")
+                raise
             prepared_ref: str | None = None
             if (
                 operation_ref == "operation:search_workspace"
@@ -894,6 +945,7 @@ class PlaneHostBinding:
             if _host_result_disposition(result) == "poison_invocation":
                 self._fail(result.error_message or "Plane host rejected the callback")
             if self._is_cancelled():
+                self._set_callback_phase("adapter_event")
                 self._fail("Plane host callback cancelled")
                 raise PlaneHostCancelled("Plane host callback cancelled")
             return result
@@ -1067,6 +1119,7 @@ class PlaneHostBinding:
                 }
             )
         except Exception as exc:
+            self._set_callback_phase("model_observation_emit", request)
             self._fail("Plane host observation could not be emitted")
             raise PlaneHostUnavailable("Plane host observation could not be emitted") from exc
 

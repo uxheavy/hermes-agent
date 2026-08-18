@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-import json
+import hashlib
 import io
+import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import os
 from pathlib import Path
@@ -1607,6 +1608,18 @@ class G1RuntimeProcessTests(unittest.TestCase):
             exit_frame = _terminal_failure(snapshot, invocation, result, 0)
             self.assertEqual(exit_frame["failure"]["cause"], cause)
             self.assertNotIn("secret", json.dumps(exit_frame))
+
+        self.assertEqual(
+            host_result.host_operation_diagnostic,
+            {
+                "callbackPhase": "host_return",
+                "operationRefDigest": hashlib.sha256(
+                    "operation:work-item-read".encode("utf-8")
+                ).hexdigest(),
+            },
+        )
+        self.assertIn("callbackPhase=host_return", host_result.failure_message)
+        self.assertIn("operationRefDigest=", host_result.failure_message)
 
         budget_result = HermesKernelAdapter(agent_factory=lambda **kwargs: object()).dispatch(
             snapshot, invocation, lambda: False, lambda body: None, model_call_allowance=0

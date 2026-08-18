@@ -26,6 +26,7 @@ from .g1_contract import (
     RUNTIME_FAILURE_CAUSES,
 )
 from .host_port import (
+    HOST_CALLBACK_PHASES,
     PlaneHostBinding,
     PlaneHostPort,
     bind_plane_host,
@@ -614,6 +615,28 @@ class HermesKernelResult:
     usage: Mapping[str, int] | None = None
     model_calls: int | None = None
     failure_cause: str | None = None
+    host_operation_diagnostic: Mapping[str, str] | None = None
+
+
+def _host_operation_failure_message(
+    host_binding: PlaneHostBinding,
+) -> str:
+    diagnostic = host_binding.host_operation_diagnostic
+    if diagnostic is None:
+        return "Plane host operation failed"
+    phase = diagnostic.get("callbackPhase")
+    operation_ref_digest = diagnostic.get("operationRefDigest")
+    if (
+        phase not in HOST_CALLBACK_PHASES
+        or not isinstance(operation_ref_digest, str)
+        or len(operation_ref_digest) != 64
+        or any(char not in "0123456789abcdef" for char in operation_ref_digest)
+    ):
+        return "Plane host operation failed"
+    return (
+        "Plane host operation failed "
+        f"[callbackPhase={phase} operationRefDigest={operation_ref_digest}]"
+    )
 
 
 def _terminal_lifecycle_observation(
@@ -1122,6 +1145,21 @@ class HermesKernelAdapter:
                     retryable=False,
                     model_calls=self._observed_model_calls(agent, None),
                 )
+            if (
+                host_binding is not None
+                and host_binding.fatal_error is not None
+                and not host_binding.fatal_error_after_terminal
+            ):
+                diagnostic = host_binding.host_operation_diagnostic
+                return HermesKernelResult(
+                    kind="failed",
+                    failure_code="runtime_error",
+                    failure_message=_host_operation_failure_message(host_binding),
+                    failure_cause="host_operation_failure",
+                    retryable=False,
+                    model_calls=self._observed_model_calls(agent, None),
+                    host_operation_diagnostic=diagnostic,
+                )
             if host_binding is not None and host_binding.fatal_error_after_terminal:
                 # Plane's applied publication already owns terminalization.
                 # A later host callback can still escape the kernel loop, but
@@ -1201,13 +1239,15 @@ class HermesKernelAdapter:
             and host_binding.fatal_error is not None
             and not host_binding.fatal_error_after_terminal
         ):
+            diagnostic = host_binding.host_operation_diagnostic
             return HermesKernelResult(
                 kind="failed",
                 failure_code="runtime_error",
-                failure_message="Plane host operation failed",
+                failure_message=_host_operation_failure_message(host_binding),
                 failure_cause="host_operation_failure",
                 retryable=False,
                 model_calls=self._observed_model_calls(agent, result),
+                host_operation_diagnostic=diagnostic,
             )
         if not isinstance(result, Mapping):
             raise G1ContractError("Hermes adapter returned a non-object result")
