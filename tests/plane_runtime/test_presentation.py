@@ -25,11 +25,53 @@ class PresentationTests(unittest.TestCase):
         self.assertIn('"contextRefs":[]', first)
         self.assertIn('"operationRef":"operation:work_item.read"', first)
         self.assertIn('"required":["project_id","issue_id"]', first)
-        self.assertIn("Call plane_operation with the listed exact input shape", first)
-        self.assertIn("operation:catalog.describe", first)
+        self.assertIn("Call plane_operation directly with the listed exact input shape", first)
+        self.assertIn("eager operations are already disclosed and must not be rediscovered", first)
+        self.assertIn("operation:catalog.describe once", first)
+        self.assertIn("operation:search_workspace the first Plane call", first)
         self.assertIn("Never guess input field names.", first)
         self.assertIn("Disclosure is not authorization.", first)
         self.assertIn("Ordinary final text is not publication.", first)
+
+    def test_manager_guidance_prioritizes_prepared_search_over_catalog_rediscovery(self) -> None:
+        raw = copy.deepcopy(make_snapshot())
+        raw["assignment"] = {
+            "assignmentRef": "assignment:manager",
+            "revision": "revision:one",
+            "targetRef": "target:assigned-work-item",
+            "objective": "Coordinate a bounded Manager objective for the assigned work item.",
+            "acceptanceCriteria": ["Publish one reviewable result."],
+        }
+        raw["toolCatalog"]["eagerOperations"] = [  # type: ignore[index]
+            {
+                "operationRef": operation_ref,
+                "schemaDigest": "content:" + "e" * 64,
+                "inputSchema": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["query"],
+                    "properties": {"query": {"type": "string"}},
+                },
+                "disclosure": "eager",
+            }
+            for operation_ref in (
+                "operation:catalog.search",
+                "operation:catalog.describe",
+                "operation:search_workspace",
+                "operation:agent.assignment.delegate",
+            )
+        ]
+        raw["contentDigest"] = _digest(
+            "snapshot",
+            {key: value for key, value in raw.items() if key != "contentDigest"},
+        )
+
+        guidance = build_model_guidance(G1RunSnapshot.from_dict(raw))
+
+        self.assertIn('"operation:search_workspace"', guidance)
+        self.assertIn("operation:search_workspace the first Plane call", guidance)
+        self.assertIn("do not begin with catalog.search or catalog.describe", guidance)
+        self.assertNotIn("catalog.describe before invocation", guidance)
 
     def test_guidance_rejects_oversize_without_truncating_behavioral_prompt(self) -> None:
         raw = copy.deepcopy(make_snapshot())

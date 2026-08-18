@@ -14,11 +14,41 @@ from tools.registry import registry
 
 
 class AdapterPresentationTests(unittest.TestCase):
-    def test_fake_agent_uses_search_then_canonical_work_item_read_input(self) -> None:
+    def test_manager_route_uses_search_then_canonical_work_item_read_input(self) -> None:
         raw = copy.deepcopy(make_snapshot())
+        raw["assignment"] = {
+            "assignmentRef": "assignment:manager",
+            "revision": "revision:one",
+            "targetRef": "target:assigned-work-item",
+            "objective": "Coordinate a bounded Manager objective for the assigned work item.",
+            "acceptanceCriteria": ["Publish one reviewable result."],
+        }
+        raw["profile"]["role"] = "delegator"  # type: ignore[index]
         raw["toolCatalog"] = {
             "catalogDigest": "content:" + "c" * 64,
             "eagerOperations": [
+                {
+                    "operationRef": "operation:catalog.search",
+                    "schemaDigest": "content:" + "b" * 64,
+                    "inputSchema": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": ["query"],
+                        "properties": {"query": {"type": "string"}},
+                    },
+                    "disclosure": "eager",
+                },
+                {
+                    "operationRef": "operation:catalog.describe",
+                    "schemaDigest": "content:" + "a" * 64,
+                    "inputSchema": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": ["operation_id"],
+                        "properties": {"operation_id": {"type": "string"}},
+                    },
+                    "disclosure": "eager",
+                },
                 {
                     "operationRef": "operation:search_workspace",
                     "schemaDigest": "content:" + "d" * 64,
@@ -105,6 +135,8 @@ class AdapterPresentationTests(unittest.TestCase):
             def run_conversation(self, message: str, *, system_message: str) -> dict[str, str]:
                 captured["message"] = message
                 captured["system_message"] = system_message
+                if "operation:search_workspace the first Plane call" not in system_message:
+                    raise AssertionError("Manager guidance did not prioritize search_workspace")
                 binding = current_plane_host()
                 self.assert_binding(binding)
                 search = json.loads(
@@ -140,6 +172,7 @@ class AdapterPresentationTests(unittest.TestCase):
             [request["operationRef"] for request in requests],
             ["operation:search_workspace", "operation:work_item.read"],
         )
+        self.assertNotIn("operation:catalog.describe", [request["operationRef"] for request in requests])
         self.assertIn('"project_id"', str(captured["system_message"]))
         self.assertIn('"issue_id"', str(captured["system_message"]))
 

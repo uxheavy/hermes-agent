@@ -13,8 +13,9 @@ class PresentationBoundsError(ValueError):
 
 
 _RULES = (
-    "Call plane_operation with the listed exact input shape for eager operations.",
-    "For any progressive operation, use discovery then operation:catalog.describe before invocation.",
+    "Call plane_operation directly with the listed exact input shape for every eager operation; eager operations are already disclosed and must not be rediscovered.",
+    "For an operation not listed under eagerOperations, call catalog.search once and then operation:catalog.describe once before invocation.",
+    "For an assigned work-item route, make operation:search_workspace the first Plane call and use its prepared typed references; do not begin with catalog.search or catalog.describe.",
     "Never guess input field names.",
     "Disclosure is not authorization.",
     "Ordinary final text is not publication.",
