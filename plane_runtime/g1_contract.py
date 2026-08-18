@@ -651,7 +651,11 @@ def _publication(
 
 def _validate_failure(value: Any, name: str = "failure") -> dict[str, Any]:
     data = _object(value, name)
-    _reject_unknown(data, {"code", "message", "retryable", "cause"}, name)
+    _reject_unknown(
+        data,
+        {"code", "message", "retryable", "cause", "callbackPhase", "operationRefDigest"},
+        name,
+    )
     _required(data, {"code", "message", "retryable"}, name)
     if data["code"] not in _FAILURE_CODES or not isinstance(data["retryable"], bool):
         raise G1ContractError(f"{name} is invalid")
@@ -659,6 +663,25 @@ def _validate_failure(value: Any, name: str = "failure") -> dict[str, Any]:
         data["code"] != "runtime_error" or data["cause"] not in RUNTIME_FAILURE_CAUSES
     ):
         raise G1ContractError(f"{name}.cause is invalid")
+    diagnostic_fields = {"callbackPhase", "operationRefDigest"}
+    present_diagnostic_fields = diagnostic_fields.intersection(data)
+    if present_diagnostic_fields and present_diagnostic_fields != diagnostic_fields:
+        raise G1ContractError(f"{name} host diagnostic fields must be provided together")
+    if present_diagnostic_fields:
+        if data["callbackPhase"] not in {
+            "before_host_call",
+            "host_return",
+            "model_observation_emit",
+            "adapter_event",
+        }:
+            raise G1ContractError(f"{name}.callbackPhase is invalid")
+        operation_ref_digest = data["operationRefDigest"]
+        if (
+            not isinstance(operation_ref_digest, str)
+            or len(operation_ref_digest) != 64
+            or any(char not in "0123456789abcdef" for char in operation_ref_digest)
+        ):
+            raise G1ContractError(f"{name}.operationRefDigest is invalid")
     _text(data["message"], f"{name}.message")
     return data
 
