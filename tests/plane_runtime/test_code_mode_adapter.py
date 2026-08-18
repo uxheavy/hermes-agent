@@ -11,7 +11,9 @@ from plane_runtime.host_port import (
     PlaneHostBinding,
     PLANE_CODE_MODE_EXECUTE_OPERATION,
     PLANE_CODE_MODE_SCHEMA_VERSION,
+    PLANE_CODE_MODE_TOOL,
     PLANE_CODE_MODE_TOOLSET,
+    PLANE_OPERATION_TOOL,
     bind_plane_host,
     install_plane_tools,
 )
@@ -43,22 +45,59 @@ def _binding(rpc, *, cancellation=lambda: False) -> PlaneHostBinding:
 
 class CodeModeAdapterTests(unittest.TestCase):
     def setUp(self) -> None:
+        # Load Hermes's native Python tool separately. Plane's adapter must
+        # keep that registration intact while exposing only its namespaced
+        # Code Mode toolset.
+        import tools.code_execution_tool  # noqa: F401
+
         install_plane_tools()
 
-    def test_registration_precedes_python_and_retains_typescript_schema(self) -> None:
-        entry = registry.get_entry("execute_code")
+    def test_registration_is_unique_and_preserves_hermes_python_tool(self) -> None:
+        entry = registry.get_entry(PLANE_CODE_MODE_TOOL)
         self.assertIsNotNone(entry)
         self.assertEqual(entry.toolset, PLANE_CODE_MODE_TOOLSET)
         self.assertEqual(entry.handler.__name__, "_handle_plane_code_mode")
-        definitions = registry.get_definitions({"execute_code"})
+        python_entry = registry.get_entry("execute_code")
+        self.assertIsNotNone(python_entry)
+        self.assertEqual(python_entry.toolset, "code_execution")
+        self.assertNotEqual(entry.name, python_entry.name)
+        definitions = registry.get_definitions({PLANE_CODE_MODE_TOOL})
         schema = definitions[0]["function"]
         self.assertEqual(schema["parameters"]["properties"], {
-            "code": {
+            "typescript_source": {
                 "type": "string",
-                "description": "Bounded TypeScript source exporting a default function.",
+                "maxLength": 4096,
+                "description": "Complete bounded TypeScript module exporting default async function ({host,input}).",
             }
         })
-        self.assertIn("TypeScript", schema["description"])
+        self.assertEqual(schema["parameters"]["required"], ["typescript_source"])
+        description = schema["description"].lower()
+        for phrase in (
+            "what it does",
+            "when to use",
+            "typescript composition",
+            "default async function receiving {host,input}",
+            "bounded plane host result",
+            "validation errors",
+            "unknown outcomes",
+        ):
+            self.assertIn(phrase, description)
+        self.assertNotIn("execute_code", description)
+
+    def test_plane_operation_catalog_hides_internal_code_action(self) -> None:
+        definitions = registry.get_definitions({PLANE_OPERATION_TOOL})
+        schema = definitions[0]["function"]
+        self.assertEqual(
+            schema["parameters"]["properties"]["action"]["enum"],
+            ["discover", "read", "mutate"],
+        )
+
+    def test_plane_invocation_catalog_exposes_only_namespaced_code_mode(self) -> None:
+        definitions = registry.get_definitions({PLANE_CODE_MODE_TOOL})
+        names = {item["function"]["name"] for item in definitions}
+        self.assertEqual(names, {PLANE_CODE_MODE_TOOL})
+        self.assertNotIn("execute_code", names)
+        self.assertEqual(registry.get_entry("execute_code").toolset, "code_execution")
 
     def test_typescript_dispatch_uses_exact_bound_four_field_capsule(self) -> None:
         requests: list[dict] = []
@@ -69,7 +108,7 @@ class CodeModeAdapterTests(unittest.TestCase):
 
         source = "export default ({ input }) => ({ ok: true, input });"
         with bind_plane_host(_binding(rpc)):
-            result = registry.dispatch("execute_code", {"code": source})
+            result = registry.dispatch(PLANE_CODE_MODE_TOOL, {"typescript_source": source})
 
         self.assertEqual(len(requests), 1)
         request = requests[0]
@@ -93,7 +132,7 @@ class CodeModeAdapterTests(unittest.TestCase):
 
         python_source = "from hermes_tools import plane_operation\nprint('must not execute')"
         with bind_plane_host(_binding(rpc)):
-            result = registry.dispatch("execute_code", {"code": python_source})
+            result = registry.dispatch(PLANE_CODE_MODE_TOOL, {"typescript_source": python_source})
 
         self.assertEqual(requests[0]["input"]["source"], python_source)
         self.assertEqual(json.loads(result)["output"]["accepted"], False)
@@ -106,15 +145,18 @@ class CodeModeAdapterTests(unittest.TestCase):
             return _result(request)
 
         with bind_plane_host(_binding(rpc)):
-            empty = registry.dispatch("execute_code", {"code": "   "})
+            empty = registry.dispatch(PLANE_CODE_MODE_TOOL, {"typescript_source": "   "})
             oversized = registry.dispatch(
-                "execute_code", {"code": "x" * (MAX_CODE_MODE_SOURCE_BYTES + 1)}
+                PLANE_CODE_MODE_TOOL, {"typescript_source": "x" * (MAX_CODE_MODE_SOURCE_BYTES + 1)}
             )
-            unknown = registry.dispatch("execute_code", {"code": "ok", "input": {}})
+            unknown = registry.dispatch(PLANE_CODE_MODE_TOOL, {"typescript_source": "ok", "input": {}})
 
         self.assertEqual(requests, [])
         for result in (empty, oversized, unknown):
-            self.assertEqual(json.loads(result)["status"], "error")
+            payload = json.loads(result)
+            self.assertEqual(payload["status"], "error")
+            self.assertTrue(payload["error"]["message"])
+            self.assertIn("plane_execute_typescript", payload["error"]["message"])
 
     def test_denial_and_host_error_are_bounded_model_results(self) -> None:
         def denied(request: dict) -> dict:
@@ -128,7 +170,7 @@ class CodeModeAdapterTests(unittest.TestCase):
 
         denied_binding = _binding(denied)
         with bind_plane_host(denied_binding):
-            denied_result = registry.dispatch("execute_code", {"code": "export default () => 1;"})
+            denied_result = registry.dispatch(PLANE_CODE_MODE_TOOL, {"typescript_source": "export default () => 1;"})
         denied_payload = json.loads(denied_result)
         self.assertEqual(denied_payload["status"], "denied")
         self.assertEqual(denied_payload["errorCode"], "NOT_AUTHORIZED")
@@ -144,7 +186,7 @@ class CodeModeAdapterTests(unittest.TestCase):
 
         unavailable_binding = _binding(unavailable)
         with bind_plane_host(unavailable_binding):
-            unavailable_result = registry.dispatch("execute_code", {"code": "export default () => 1;"})
+            unavailable_result = registry.dispatch(PLANE_CODE_MODE_TOOL, {"typescript_source": "export default () => 1;"})
         unavailable_payload = json.loads(unavailable_result)
         self.assertEqual(unavailable_payload["status"], "unavailable")
         self.assertEqual(unavailable_payload["errorCode"], "OPERATION_UNAVAILABLE")
@@ -159,13 +201,13 @@ class CodeModeAdapterTests(unittest.TestCase):
 
         cancelled_binding = _binding(rpc, cancellation=lambda: True)
         with bind_plane_host(cancelled_binding):
-            cancelled = registry.dispatch("execute_code", {"code": "export default () => 1;"})
+            cancelled = registry.dispatch(PLANE_CODE_MODE_TOOL, {"typescript_source": "export default () => 1;"})
         self.assertEqual(json.loads(cancelled)["error"]["code"], "cancelled")
         self.assertEqual(requests, [])
 
         output_binding = _binding(rpc)
         with bind_plane_host(output_binding):
-            oversized = registry.dispatch("execute_code", {"code": "export default () => 1;"})
+            oversized = registry.dispatch(PLANE_CODE_MODE_TOOL, {"typescript_source": "export default () => 1;"})
         self.assertEqual(json.loads(oversized)["status"], "error")
         self.assertIn("host.modelResult", json.loads(oversized)["error"]["message"])
 

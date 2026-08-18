@@ -1812,7 +1812,7 @@ print("text_response")
                 "plane_operation",
                 {"action": "code", "operationRef": "operation:compose@1", "input": {}},
             )
-            self.assertIn("restricted to execute_code", rejected_code)
+            self.assertIn("restricted to plane_execute_typescript", rejected_code)
             self.assertEqual(len(requests), 0)
             with plane_code_mode():
                 code_result = registry.dispatch(
@@ -1909,9 +1909,9 @@ print("text_response")
                 elif self.calls == 3:
                     tool_calls = [
                         self.tool_call(
-                            "execute_code",
+                            "plane_execute_typescript",
                             {
-                                "code": (
+                                "typescript_source": (
                                     "export default ({ input }: { input: Record<string, unknown> }) => ({"
                                     " accepted: true, input"
                                     "});"
@@ -2025,7 +2025,7 @@ print("text_response")
             agent = AIAgent(**kwargs)
             client = DeterministicClient()
             # This replaces only the model/provider boundary. The real Hermes
-            # AIAgent constructor, tool loop, registry, and execute_code path
+            # AIAgent constructor, tool loop, registry, and Plane Code Mode path
             # remain active.
             agent._create_request_openai_client = lambda **_: client  # type: ignore[method-assign]
             return agent
@@ -2048,12 +2048,7 @@ print("text_response")
             )
 
         self.assertEqual(result.kind, "completed")
-        self.assertTrue(
-            any("execute_code" in names for names in model_tool_names),
-            "event=plane.code_mode.exposure actor=hermes operation=build_model_tools "
-            "risk=granted_code_mode_is_unavailable expected=execute_code_exposed "
-            "actual=execute_code_missing suggestion=inspect_snapshot_policy_mapping",
-        )
+        self.assertFalse(any("execute_code" in names for names in model_tool_names))
         self.assertEqual(
             [(request["action"], request["source"]) for request in requests],
             [
@@ -2685,7 +2680,7 @@ print("text_response")
             ["ordinary final evidence"],
         )
 
-    def test_ungranted_snapshot_cannot_enable_execute_code_from_adapter_override(self) -> None:
+    def test_ungranted_snapshot_cannot_enable_plane_code_mode_from_adapter_override(self) -> None:
         from tests.plane_runtime.test_g1_runtime_process import (
             G1InvocationEnvelope,
             G1RunSnapshot,

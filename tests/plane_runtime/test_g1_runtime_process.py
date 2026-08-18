@@ -369,7 +369,7 @@ class G1RuntimeProcessTests(unittest.TestCase):
                     elif stream_count[0] == 4:
                         # A model-controlled tool call cannot self-authorize
                         # Code Mode; the host must see no model-sourced code
-                        # action before the real execute_code callback.
+                        # action before the real plane_execute_typescript callback.
                         function_name = "tool_call"
                         arguments = {
                             "name": "plane_operation",
@@ -381,9 +381,9 @@ class G1RuntimeProcessTests(unittest.TestCase):
                         }
                         finish_reason = "tool_calls"
                     elif stream_count[0] == 5:
-                        function_name = "execute_code"
+                        function_name = "plane_execute_typescript"
                         arguments = {
-                            "code": (
+                            "typescript_source": (
                                 "export default ({ input }: { input: Record<string, unknown> }) => ({"
                                 " accepted: true, input"
                                 "});"
@@ -586,12 +586,7 @@ class G1RuntimeProcessTests(unittest.TestCase):
         self.assertTrue(any("tool_search" in names for names in model_tool_names))
         self.assertTrue(any("tool_describe" in names for names in model_tool_names))
         self.assertTrue(any("tool_call" in names for names in model_tool_names))
-        self.assertTrue(
-            any("execute_code" in names for names in model_tool_names),
-            "event=plane.code_mode.bootstrap_exposure actor=production-invocation "
-            "operation=model_tool_schema risk=granted_code_mode_missing expected=execute_code_exposed "
-            "actual=execute_code_missing suggestion=trace_three_frame_policy_to_agent_toolsets",
-        )
+        self.assertFalse(any("execute_code" in names for names in model_tool_names))
         self.assertNotIn(b"local-bootstrap-secret", completed.stdout + completed.stderr)
         self.assertNotIn(host_path.encode(), completed.stdout + completed.stderr)
         model_wire = json.dumps(model_requests, default=str)

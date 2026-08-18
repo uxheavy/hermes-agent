@@ -36,7 +36,7 @@ PLANE_RUNTIME_TOOLSET = "plane_runtime"
 PLANE_CODE_MODE_TOOLSET = "plane_runtime_code_mode"
 PLANE_OPERATION_TOOL = "plane_operation"
 PLANE_PUBLISH_TOOL = "plane_publish"
-PLANE_CODE_MODE_TOOL = "execute_code"
+PLANE_CODE_MODE_TOOL = "plane_execute_typescript"
 PLANE_CODE_MODE_SCHEMA_VERSION = "plane.code-mode/v1"
 PLANE_CODE_MODE_EXECUTE_OPERATION = "plane.code-mode.execute@1"
 PLANE_OUTCOME_PUBLISH_OPERATION = "operation:agent.outcome.publish"
@@ -1185,7 +1185,7 @@ def current_plane_host() -> PlaneHostBinding | None:
 
 @contextmanager
 def plane_code_mode() -> Iterator[None]:
-    """Mark one existing execute_code parent-RPC dispatch as Code Mode."""
+    """Mark one existing Hermes execute_code parent-RPC dispatch as Code Mode."""
 
     token = _PLANE_CODE_MODE.set(True)
     try:
@@ -1233,10 +1233,16 @@ def _handle_plane_code_mode(args: Mapping[str, Any], **_: Any) -> str:
 
     try:
         data = _object(args, PLANE_CODE_MODE_TOOL)
-        _reject_unknown(data, {"code"}, PLANE_CODE_MODE_TOOL)
-        source = _text(data.get("code"), f"{PLANE_CODE_MODE_TOOL}.code", MAX_CODE_MODE_SOURCE_BYTES)
+        _reject_unknown(data, {"typescript_source"}, PLANE_CODE_MODE_TOOL)
+        source = _text(
+            data.get("typescript_source"),
+            f"{PLANE_CODE_MODE_TOOL}.typescript_source",
+            MAX_CODE_MODE_SOURCE_BYTES,
+        )
         if not source.strip():
-            raise PlaneHostError(f"{PLANE_CODE_MODE_TOOL}.code must be non-empty TypeScript")
+            raise PlaneHostError(
+                f"{PLANE_CODE_MODE_TOOL}.typescript_source must be non-empty TypeScript"
+            )
         capsule = {
             "schemaVersion": PLANE_CODE_MODE_SCHEMA_VERSION,
             "entrypoint": "default",
@@ -1272,7 +1278,9 @@ def _handle_plane_operation(args: Mapping[str, Any], **_: Any) -> str:
         )
         input_value = _object(data.get("input", {}), "plane_operation.input")
         if action == "code" and not _PLANE_CODE_MODE.get():
-            raise PlaneHostError("plane_operation code action is restricted to execute_code")
+            raise PlaneHostError(
+                "plane_operation code action is restricted to plane_execute_typescript"
+            )
         result = _binding_or_error().call(
             action=action,
             operation_ref=operation_ref,
@@ -1338,26 +1346,39 @@ def install_plane_tools() -> None:
             {
                 "name": PLANE_CODE_MODE_TOOL,
                 "description": (
-                    "Run bounded TypeScript in Plane's credential-free Code Mode "
-                    "isolate. Export a default function receiving { host, input }; "
-                    "use only the typed host callbacks supplied by Plane."
+                    "what it does: run bounded TypeScript in Plane's credential-free "
+                    "Code Mode restricted isolate and return a bounded Plane host result. "
+                    "when to use: use this when the commission supplies or requires "
+                    "Plane Code Mode TypeScript composition. "
+                    "input contract: typescript_source must be a complete TypeScript "
+                    "module exporting default async function receiving {host,input} "
+                    "(written as ({host,input})); do not "
+                    "import modules or use network, filesystem, process, or credentials; "
+                    "use only the typed host callbacks supplied by Plane. "
+                    "returns: a bounded structured HostCallResult with status, replayed, "
+                    "output, and optional error or publication. "
+                    "errors/recovery: correct the source and call again only for "
+                    "validation errors; do not retry unknown outcomes."
                 ),
                 "parameters": {
                     "type": "object",
                     "additionalProperties": False,
                     "properties": {
-                        "code": {
+                        "typescript_source": {
                             "type": "string",
-                            "description": "Bounded TypeScript source exporting a default function.",
+                            "maxLength": 4096,
+                            "description": (
+                                "Complete bounded TypeScript module exporting default "
+                                "async function ({host,input})."
+                            ),
                         },
                     },
-                    "required": ["code"],
+                    "required": ["typescript_source"],
                 },
             },
             _handle_plane_code_mode,
             description="Bounded TypeScript Plane Code Mode execution",
             max_result_size_chars=MAX_HOST_RESULT_TEXT_BYTES,
-            override=True,
         )
         registry.register(
             PLANE_OPERATION_TOOL,
@@ -1374,7 +1395,7 @@ def install_plane_tools() -> None:
                     "properties": {
                         "action": {
                             "type": "string",
-                            "enum": ["discover", "read", "mutate", "code"],
+                            "enum": ["discover", "read", "mutate"],
                         },
                         "operationRef": {"type": "string"},
                         "input": {"type": "object"},

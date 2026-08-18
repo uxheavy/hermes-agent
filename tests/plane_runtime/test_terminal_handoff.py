@@ -34,7 +34,7 @@ def _tool_call(
     arguments: dict[str, object],
     call_id: str,
 ) -> SimpleNamespace:
-    if name == "execute_code":
+    if name == "plane_execute_typescript":
         function_name = name
         function_arguments = arguments
     else:
@@ -95,8 +95,8 @@ def test_real_hermes_long_route_preserves_applied_publication_after_observation_
             },
         ),
         (
-            "execute_code",
-            {"code": "export default ({ input }) => ({ ok: true, input });"},
+            "plane_execute_typescript",
+            {"typescript_source": "export default ({ input }) => ({ ok: true, input });"},
         ),
         (
             "plane_operation",

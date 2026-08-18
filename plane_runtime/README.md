@@ -132,9 +132,9 @@ attempts.
 
 The `HermesKernelAdapter` now exposes one optional, invocation-scoped
 `PlaneHostPort`.  Its dynamic `plane_runtime` toolset reuses Hermes' registry,
-tool dispatch, bounded result handling, and `execute_code` parent-RPC sandbox:
+tool dispatch, bounded result handling, and `plane_execute_typescript` restricted TypeScript host sandbox. Hermes's native `execute_code` remains a separate non-Plane tool:
 `plane_operation` covers discovery/read/mutation and the same callback from
-code execution, while `plane_publish` is the only explicit publication/outcome
+`plane_execute_typescript`, while `plane_publish` is the only explicit publication/outcome
 action.  The port accepts only the versioned, credential-free host request and
 result vocabulary; it derives correlation/idempotency references from the
 trusted invocation and fails closed on malformed, conflicting, unavailable,
