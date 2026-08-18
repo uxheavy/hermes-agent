@@ -27,6 +27,28 @@ from .host_port import PlaneHostPort
 
 
 _MODEL_USAGE_PROTOCOL = "plane.agent-runtime/internal-usage/v1"
+_HOST_CALLBACK_PHASES = frozenset(
+    {"before_host_call", "host_return", "model_observation_emit", "adapter_event"}
+)
+
+
+def _bounded_host_operation_diagnostic(
+    value: Mapping[str, Any] | None,
+) -> dict[str, str] | None:
+    """Project only the finite, digested host callback facts onto RuntimeExit."""
+
+    if not isinstance(value, Mapping) or set(value) != {"callbackPhase", "operationRefDigest"}:
+        return None
+    phase = value.get("callbackPhase")
+    operation_ref_digest = value.get("operationRefDigest")
+    if (
+        phase not in _HOST_CALLBACK_PHASES
+        or not isinstance(operation_ref_digest, str)
+        or len(operation_ref_digest) != 64
+        or any(char not in "0123456789abcdef" for char in operation_ref_digest)
+    ):
+        return None
+    return {"callbackPhase": phase, "operationRefDigest": operation_ref_digest}
 
 
 def _write_model_usage(diagnostics: TextIO | None, model_calls: int | None) -> None:
@@ -106,6 +128,9 @@ def _terminal_failure(
     }
     if result.failure_cause is not None:
         failure["cause"] = result.failure_cause
+    diagnostic = _bounded_host_operation_diagnostic(result.host_operation_diagnostic)
+    if diagnostic is not None:
+        failure.update(diagnostic)
     return build_exit(
         snapshot=snapshot,
         invocation=invocation,

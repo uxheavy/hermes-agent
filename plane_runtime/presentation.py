@@ -21,6 +21,14 @@ _RULES = (
     "Ordinary final text is not publication.",
 )
 
+_CODE_MODE_RULES = (
+    "Use plane_execute_typescript for the supplied Code Mode module; do not call plane_operation for this commission.",
+    "Use plane_publish explicitly for the terminal product publication; ordinary final text is not publication.",
+    "For an operation not listed under eagerOperations, call catalog.search once and then operation:catalog.describe once before invocation.",
+    "Never guess input field names.",
+    "Disclosure is not authorization.",
+)
+
 
 def _plain(value: Any) -> Any:
     if isinstance(value, Mapping):
@@ -63,7 +71,7 @@ def build_model_guidance(snapshot: G1RunSnapshot) -> str:
             "Plane invocation guidance:",
             compact_assignment,
             "Rules:",
-            *(f"- {rule}" for rule in _RULES),
+            *(f"- {rule}" for rule in (_CODE_MODE_RULES if snapshot.model_toolset == "code_mode_only" else _RULES)),
         )
     )
     if len(guidance.encode("utf-8")) > MAX_PROMPT_BYTES:

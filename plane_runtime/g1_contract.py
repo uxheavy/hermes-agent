@@ -32,13 +32,13 @@ MAX_EAGER_SCHEMA_PROPERTIES = 4096
 
 # Frozen bytes from the paired Plane G1 runtime contract manifest.
 G1_CONTRACT_DIGESTS = {
-    "runSnapshot": "308101c6a2c9f56e7deb5c6a07c8bc74b59831b92cbbb5b07c5a7eefc21f4947",
+    "runSnapshot": "1d04c2a36f07d0e8128c3616e7dcae29af104fe4aa44d71cb1b7f43e55c0869b",
     "invocationEnvelope": "b7a15d74406f1624cdb7cd95b42edfd1ffee596abe57e4f00ed60e2e23ded995",
     "runtimeEvent": "78da5ce9d112b6545ea471e5fcae25ff5dfeb2e5db74a8d5796d0ee026823a27",
-    "runtimeExit": "cb36a536fe2ddae8bd102d5abc33cb829c992366428362e5ec91707adcadc739",
+    "runtimeExit": "ed127d0ebec8f5d432ce87a6be1a8eb41b31caf808badc27ed23cd0ba9115a24",
     "runtimeDurableState": "444c944ec8a5054f33c8662470529a1f4565d42ff06138438beceeef7967a0da",
 }
-G1_MANIFEST_DIGEST = "0ebbaef00c56af0c7f35ff74c0fc711353fb1690e04b8df80a73d5f1ae651fd1"
+G1_MANIFEST_DIGEST = "bc45b732e691ca9650e2f741f91344ddaec41c92da63bdfeafd98ea184e1d73e"
 
 _ROLES = {"worker", "delegator", "gardener", "chief_of_staff", "hr", "evaluator", "custom"}
 _TRIGGERS = {"initial", "human_input", "recoverable_restart", "continuation"}
@@ -346,9 +346,11 @@ def _validate_snapshot(raw: Any) -> dict[str, Any]:
         _content_ref(item_data["contentDigest"], f"context[{index}].contentDigest")
 
     catalog = _object(data["toolCatalog"], "RunSnapshot.toolCatalog")
-    _reject_unknown(catalog, {"catalogDigest", "eagerOperations"}, "toolCatalog")
+    _reject_unknown(catalog, {"catalogDigest", "modelToolset", "eagerOperations"}, "toolCatalog")
     _required(catalog, {"catalogDigest", "eagerOperations"}, "toolCatalog")
     _content_ref(catalog["catalogDigest"], "toolCatalog.catalogDigest")
+    if "modelToolset" in catalog and catalog["modelToolset"] not in {"standard", "code_mode_only"}:
+        raise G1ContractError("toolCatalog.modelToolset is unsupported")
     operations = catalog["eagerOperations"]
     if not isinstance(operations, list) or len(operations) > MAX_EAGER_OPERATIONS:
         raise G1ContractError(
@@ -531,6 +533,10 @@ class G1RunSnapshot:
         return tuple(self.raw["toolCatalog"]["eagerOperations"])
 
     @property
+    def model_toolset(self) -> str:
+        return str(self.raw["toolCatalog"].get("modelToolset", "standard"))
+
+    @property
     def model_provider(self) -> str:
         return str(self.raw["runtimePolicy"]["model"]["provider"])
 
@@ -651,7 +657,11 @@ def _publication(
 
 def _validate_failure(value: Any, name: str = "failure") -> dict[str, Any]:
     data = _object(value, name)
-    _reject_unknown(data, {"code", "message", "retryable", "cause"}, name)
+    _reject_unknown(
+        data,
+        {"code", "message", "retryable", "cause", "callbackPhase", "operationRefDigest"},
+        name,
+    )
     _required(data, {"code", "message", "retryable"}, name)
     if data["code"] not in _FAILURE_CODES or not isinstance(data["retryable"], bool):
         raise G1ContractError(f"{name} is invalid")
@@ -659,6 +669,25 @@ def _validate_failure(value: Any, name: str = "failure") -> dict[str, Any]:
         data["code"] != "runtime_error" or data["cause"] not in RUNTIME_FAILURE_CAUSES
     ):
         raise G1ContractError(f"{name}.cause is invalid")
+    diagnostic_fields = {"callbackPhase", "operationRefDigest"}
+    present_diagnostic_fields = diagnostic_fields.intersection(data)
+    if present_diagnostic_fields and present_diagnostic_fields != diagnostic_fields:
+        raise G1ContractError(f"{name} host diagnostic fields must be provided together")
+    if present_diagnostic_fields:
+        if data["callbackPhase"] not in {
+            "before_host_call",
+            "host_return",
+            "model_observation_emit",
+            "adapter_event",
+        }:
+            raise G1ContractError(f"{name}.callbackPhase is invalid")
+        operation_ref_digest = data["operationRefDigest"]
+        if (
+            not isinstance(operation_ref_digest, str)
+            or len(operation_ref_digest) != 64
+            or any(char not in "0123456789abcdef" for char in operation_ref_digest)
+        ):
+            raise G1ContractError(f"{name}.operationRefDigest is invalid")
     _text(data["message"], f"{name}.message")
     return data
 
