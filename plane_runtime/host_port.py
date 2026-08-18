@@ -398,7 +398,7 @@ def _host_result_disposition(result: HostCallResult) -> HostResultDisposition:
     )
 
 
-def _prepared_read_ref_from_search_result(output: Any) -> str | None:
+def _prepared_read_refs_from_search_result(output: Any) -> tuple[str, ...]:
     """Return the one opaque read reference prepared for a model search.
 
     Plane owns the target behind the reference. Hermes only recognizes the
@@ -408,13 +408,13 @@ def _prepared_read_ref_from_search_result(output: Any) -> str | None:
     """
 
     if not isinstance(output, Mapping):
-        return None
+        return ()
     result = output.get("result")
     if not isinstance(result, Mapping):
-        return None
+        return ()
     items = result.get("results")
     if not isinstance(items, list):
-        return None
+        return ()
     prepared_refs: list[str] = []
     for item in items:
         if not isinstance(item, Mapping):
@@ -426,7 +426,7 @@ def _prepared_read_ref_from_search_result(output: Any) -> str | None:
             call.get("action") != "read"
             or call.get("operationRef") != "operation:work_item.read"
         ):
-            return None
+            return ()
         input_value = call.get("input")
         if (
             not isinstance(input_value, Mapping)
@@ -434,9 +434,16 @@ def _prepared_read_ref_from_search_result(output: Any) -> str | None:
             or not isinstance(input_value.get("preparedCallRef"), str)
             or not input_value["preparedCallRef"].startswith("prepared-call:")
         ):
-            return None
+            return ()
         prepared_refs.append(input_value["preparedCallRef"])
-    return prepared_refs[0] if len(prepared_refs) == 1 else None
+    return tuple(prepared_refs)
+
+
+def _prepared_read_ref_from_search_result(output: Any) -> str | None:
+    """Return a single prepared read ref for compatibility with callers."""
+
+    refs = _prepared_read_refs_from_search_result(output)
+    return refs[0] if len(refs) == 1 else None
 
 
 class UnixSocketPlaneHostPort:
@@ -631,6 +638,7 @@ class PlaneHostBinding:
     _terminal_action_reason: str | None = field(default=None, init=False, repr=False)
     _terminal_action_result: HostCallResult | None = field(default=None, init=False, repr=False)
     _terminal_action_request: HostCallRequest | None = field(default=None, init=False, repr=False)
+    _prepared_read_handoff_pending: bool = field(default=False, init=False, repr=False)
     _outcome_publication_metadata: dict[str, Any] | None = field(
         default=None, init=False, repr=False
     )
@@ -674,6 +682,12 @@ class PlaneHostBinding:
 
         with self._lock:
             return self._terminal_action_reason
+
+    def prepared_read_handoff_pending(self) -> bool:
+        """Return whether a search produced an unconsumed prepared read."""
+
+        with self._lock:
+            return self._prepared_read_handoff_pending
 
     def outcome_publication_metadata(self) -> dict[str, Any] | None:
         """Return the last validated outcome publication's bounded facts."""
@@ -845,11 +859,16 @@ class PlaneHostBinding:
             self._record_catalog_description(request, result)
             self._emit_call_observation(request, result)
             self._observe_publication(request, result)
+            prepared_ref: str | None = None
             if (
                 operation_ref == "operation:search_workspace"
                 and result.status in {"ok", "replayed"}
             ):
-                prepared_ref = _prepared_read_ref_from_search_result(result.output)
+                prepared_refs = _prepared_read_refs_from_search_result(result.output)
+                if prepared_refs:
+                    self._prepared_read_handoff_pending = True
+                if len(prepared_refs) == 1:
+                    prepared_ref = prepared_refs[0]
                 if prepared_ref is not None:
                     # The gateway has already prepared and authorized this
                     # opaque handoff. Consume it through the same binding
@@ -866,6 +885,12 @@ class PlaneHostBinding:
                     combined_output = dict(result.output) if isinstance(result.output, Mapping) else {}
                     combined_output["preparedReadResult"] = prepared_read.to_dict()
                     result = replace(result, output=combined_output)
+            if (
+                operation_ref == "operation:work_item.read"
+                and isinstance(input.get("preparedCallRef"), str)
+                and result.status in {"ok", "replayed"}
+            ):
+                self._prepared_read_handoff_pending = False
             if _host_result_disposition(result) == "poison_invocation":
                 self._fail(result.error_message or "Plane host rejected the callback")
             if self._is_cancelled():

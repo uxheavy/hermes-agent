@@ -6955,6 +6955,47 @@ def run_conversation(
                     final_response = None
                     continue
 
+                # A Plane search may return more than one authorized opaque
+                # work-item read call. Do not let ordinary prose terminate the
+                # invocation while that canonical handoff is still pending;
+                # the model must consume one prepared read first. This guard is
+                # separate from the terminal publication check: it advances
+                # the route without granting publication success.
+                try:
+                    _prepared_read_pending_check = getattr(
+                        agent, "_plane_runtime_prepared_read_pending_check", None
+                    )
+                    _prepared_read_pending = (
+                        _prepared_read_pending_check()
+                        if callable(_prepared_read_pending_check)
+                        else False
+                    )
+                except Exception:
+                    logger.debug("prepared Plane read guard failed", exc_info=True)
+                    _prepared_read_pending = False
+                if _prepared_read_pending:
+                    final_msg["finish_reason"] = "prepared_read_required"
+                    final_msg["_prepared_read_synthetic"] = True
+                    messages.append(final_msg)
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "A prepared Plane work-item read is pending. "
+                                "Continue with exactly one returned workItemReadCall "
+                                "before providing final text."
+                            ),
+                            "_prepared_read_synthetic": True,
+                        }
+                    )
+                    agent._session_messages = messages
+                    _pending_verification_response = final_response
+                    _pending_verification_response_previewed = (
+                        agent._interim_content_was_streamed(final_response or "")
+                    )
+                    final_response = None
+                    continue
+
                 # ── Kanban worker terminal-tool stop guard ─────────────
                 # Workers must end with kanban_complete / kanban_block.
                 # Models sometimes narrate the next step ("Let me write the

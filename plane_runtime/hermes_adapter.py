@@ -933,6 +933,11 @@ class HermesKernelAdapter:
             agent = self._agent_factory(**agent_kwargs)
             if host_binding is not None:
                 setattr(agent, "_terminal_action_check", host_binding.terminal_action_reason)
+                setattr(
+                    agent,
+                    "_plane_runtime_prepared_read_pending_check",
+                    host_binding.prepared_read_handoff_pending,
+                )
             # Plane's provider allowance is a hard invocation boundary. The
             # interactive Hermes summary fallback would spend an additional
             # provider call after that boundary, so return a finite budget

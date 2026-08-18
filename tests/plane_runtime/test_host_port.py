@@ -150,6 +150,73 @@ def _applied_outcome_publication(
 
 
 class HostPortTests(unittest.TestCase):
+    def test_ambiguous_prepared_search_handoff_stays_pending_until_read(self) -> None:
+        """A multi-result search cannot silently become an ordinary text exit."""
+
+        def respond(request: dict) -> bytes:
+            if request["operationRef"] == "operation:search_workspace":
+                output = {
+                    "ok": True,
+                    "result": {
+                        "results": [
+                            {
+                                "objectType": "work_item",
+                                "workItemReadCall": {
+                                    "action": "read",
+                                    "operationRef": "operation:work_item.read",
+                                    "input": {"preparedCallRef": "prepared-call:first"},
+                                },
+                            },
+                            {
+                                "objectType": "work_item",
+                                "workItemReadCall": {
+                                    "action": "read",
+                                    "operationRef": "operation:work_item.read",
+                                    "input": {"preparedCallRef": "prepared-call:second"},
+                                },
+                            },
+                        ]
+                    },
+                }
+            else:
+                self.assertEqual(request["operationRef"], "operation:work_item.read")
+                output = {"ok": True, "result": {"work_item": {"title": "assigned"}}}
+            return (
+                json.dumps(
+                    _result(request, output=output),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode()
+                + b"\n"
+            )
+
+        binding = PlaneHostBinding(
+            port=CallablePlaneHostPort(lambda request: json.loads(respond(request))),
+            run_id="run:ambiguous",
+            invocation_id="invocation:ambiguous",
+            correlation_id="correlation:ambiguous",
+            cancellation=lambda: False,
+        )
+        search = binding.call(
+            action="read",
+            operation_ref="operation:search_workspace",
+            input={"query": "assigned", "limit": 2},
+            source="model",
+        )
+
+        assert search.status == "ok"
+        assert binding.prepared_read_handoff_pending() is True
+
+        read = binding.call(
+            action="read",
+            operation_ref="operation:work_item.read",
+            input={"preparedCallRef": "prepared-call:first"},
+            source="model",
+        )
+        assert read.status == "ok"
+        assert binding.prepared_read_handoff_pending() is False
+
     def test_cross_process_model_search_consumes_prepared_read_before_text_exit(self) -> None:
         """A child using the real model-facing tool dispatch cannot exit after search."""
 

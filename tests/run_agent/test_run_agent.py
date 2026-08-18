@@ -2766,6 +2766,33 @@ class TestRunConversation:
         assert result["api_calls"] == 2
         assert agent.client.chat.completions.create.call_count == 2
 
+    def test_pending_prepared_read_cannot_exit_on_ordinary_text(self, agent):
+        self._setup_agent(agent)
+        tc = _mock_tool_call(name="plane_operation", arguments="{}", call_id="prepared")
+        agent.client.chat.completions.create.side_effect = [
+            _mock_response(content="", finish_reason="tool_calls", tool_calls=[tc]),
+            _mock_response(content="ordinary final", finish_reason="stop"),
+        ]
+        agent._plane_runtime_prepared_read_pending_check = lambda: True
+        agent._plane_runtime_terminal_budget_failure = True
+        agent.max_iterations = 2
+        with (
+            patch("run_agent.handle_function_call", return_value="search result"),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("read the assigned work item")
+
+        assert result["completed"] is False
+        assert result["turn_exit_reason"].startswith("max_iterations_reached")
+        assert any(
+            message.get("_prepared_read_synthetic")
+            for message in agent._session_messages
+            if isinstance(message, dict)
+        )
+        assert agent.client.chat.completions.create.call_count == 2
+
     def test_no_terminal_action_still_reaches_the_budget_failure(self, agent):
         from agent.iteration_budget import IterationBudget
 
