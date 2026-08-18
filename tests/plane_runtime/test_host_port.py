@@ -7,6 +7,8 @@ import json
 import io
 import os
 import socket
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -148,6 +150,90 @@ def _applied_outcome_publication(
 
 
 class HostPortTests(unittest.TestCase):
+    def test_cross_process_model_search_consumes_prepared_read_before_text_exit(self) -> None:
+        """A child using the real model-facing tool dispatch cannot exit after search."""
+
+        def respond(request: dict) -> bytes:
+            if request["operationRef"] == "operation:search_workspace":
+                output = {
+                    "ok": True,
+                    "result": {
+                        "results": [
+                            {
+                                "objectType": "work_item",
+                                "workItemReadCall": {
+                                    "action": "read",
+                                    "operationRef": "operation:work_item.read",
+                                    "input": {"preparedCallRef": "prepared-call:cross-process"},
+                                },
+                            }
+                        ]
+                    },
+                }
+            else:
+                self.assertEqual(request["operationRef"], "operation:work_item.read")
+                self.assertEqual(
+                    request["input"],
+                    {"preparedCallRef": "prepared-call:cross-process"},
+                )
+                output = {"ok": True, "result": {"work_item": {"title": "assigned"}}}
+            return (
+                json.dumps(
+                    _result(request, output=output),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode()
+                + b"\n"
+            )
+
+        child = """
+import json
+import sys
+from plane_runtime.host_port import (
+    PlaneHostBinding,
+    UnixSocketPlaneHostPort,
+    bind_plane_host,
+    install_plane_tools,
+)
+from tools.registry import registry
+
+binding = PlaneHostBinding(
+    port=UnixSocketPlaneHostPort(sys.argv[1], timeout_seconds=2),
+    run_id="run:cross-process",
+    invocation_id="invocation:cross-process",
+    correlation_id="correlation:cross-process",
+    cancellation=lambda: False,
+    eager_operation_refs=frozenset({"operation:search_workspace", "operation:work_item.read"}),
+)
+install_plane_tools()
+with bind_plane_host(binding):
+    result = registry.dispatch(
+        "plane_operation",
+        {
+            "action": "read",
+            "operationRef": "operation:search_workspace",
+            "input": {"query": "assigned", "limit": 1},
+        },
+    )
+    json.loads(result)
+print("text_response")
+"""
+
+        with _LocalHostServer(respond) as server:
+            completed = subprocess.run(
+                [sys.executable, "-c", child, server.path],
+                check=True,
+                capture_output=True,
+                text=True,
+                env={**os.environ, "PYTHONPATH": str(Path(__file__).parents[2])},
+            )
+            self.assertEqual(completed.stdout.strip(), "text_response")
+            self.assertEqual(
+                [request["operationRef"] for request in server.requests],
+                ["operation:search_workspace", "operation:work_item.read"],
+            )
+
     def test_production_one_shot_service_binds_socket_host_before_real_hermes_turn(self) -> None:
         from plane_runtime.hermes_adapter import HermesKernelAdapter
         from plane_runtime.g1_bootstrap_contract import G1BootstrapFrames
