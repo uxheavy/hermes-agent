@@ -53,9 +53,6 @@ class AdapterPresentationTests(unittest.TestCase):
         invocation = G1InvocationEnvelope.from_dict(make_invocation(snapshot.to_dict()))
         requests: list[dict] = []
 
-        project_id = "project-7f8e9d0c"
-        issue_id = "issue-1a2b3c4d"
-
         def rpc(request: dict) -> dict:
             requests.append(request)
             if request["operationRef"] == "operation:search_workspace":
@@ -67,19 +64,25 @@ class AdapterPresentationTests(unittest.TestCase):
                     "status": "ok",
                     "replayed": False,
                     "output": {
-                        "results": [
-                            {
-                                "objectType": "work_item",
-                                "project_id": project_id,
-                                "issue_id": issue_id,
-                            }
-                        ]
+                        "ok": True,
+                        "result": {
+                            "results": [
+                                {
+                                    "objectType": "work_item",
+                                    "workItemReadCall": {
+                                        "action": "read",
+                                        "operationRef": "operation:work_item.read",
+                                        "input": {"preparedCallRef": "prepared-call:opaque"},
+                                    },
+                                }
+                            ]
+                        },
                     },
                 }
             if request["operationRef"] == "operation:work_item.read":
                 self.assertEqual(
                     request["input"],
-                    {"project_id": project_id, "issue_id": issue_id},
+                    {"preparedCallRef": "prepared-call:opaque"},
                 )
                 return {
                     "protocol": "plane.agent-runtime/v1",
@@ -88,7 +91,7 @@ class AdapterPresentationTests(unittest.TestCase):
                     "idempotencyKey": request["idempotencyKey"],
                     "status": "ok",
                     "replayed": False,
-                    "output": {"work_item": {"project_id": project_id, "issue_id": issue_id}},
+                    "output": {"ok": True, "result": {"work_item": {"title": "assigned"}}},
                 }
             raise AssertionError(f"unexpected operation {request['operationRef']}")
 
@@ -114,19 +117,7 @@ class AdapterPresentationTests(unittest.TestCase):
                         },
                     )
                 )
-                found = search["output"]["results"][0]
-                read = registry.dispatch(
-                    "plane_operation",
-                    {
-                        "action": "read",
-                        "operationRef": "operation:work_item.read",
-                        "input": {
-                            "project_id": found["project_id"],
-                            "issue_id": found["issue_id"],
-                        },
-                    },
-                )
-                return {"final_response": read}
+                return {"final_response": search}
 
             @staticmethod
             def assert_binding(binding: object) -> None:

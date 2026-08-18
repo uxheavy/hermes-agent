@@ -34,6 +34,8 @@ from tools.registry import registry
 _RuntimePlaneHostBinding = PlaneHostBinding
 _TEST_EAGER_OPERATION_REFS = frozenset(
     {
+        "operation:search_workspace",
+        "operation:work_item.read",
         "operation:work-item-get@1",
         "operation:read@1",
         "operation:read@2",
@@ -166,6 +168,18 @@ class HostPortTests(unittest.TestCase):
             "provider": "test-provider",
             "model": "deterministic-local",
         }
+        snapshot_raw["toolCatalog"] = {
+            **snapshot_raw["toolCatalog"],  # type: ignore[index]
+            "eagerOperations": [
+                *snapshot_raw["toolCatalog"]["eagerOperations"],  # type: ignore[index]
+                {
+                    "operationRef": "operation:search_workspace",
+                    "schemaDigest": "content:" + "f" * 64,
+                    "inputSchema": {"type": "object"},
+                    "disclosure": "eager",
+                },
+            ],
+        }
         snapshot_raw["contentDigest"] = _digest(  # type: ignore[assignment]
             "snapshot",
             {key: value for key, value in snapshot_raw.items() if key != "contentDigest"},
@@ -192,7 +206,7 @@ class HostPortTests(unittest.TestCase):
                 self.calls += 1
                 if self.calls == 1:
                     call = SimpleNamespace(
-                        id="call-read",
+                        id="call-search",
                         function=SimpleNamespace(
                             name="tool_call",
                             arguments=json.dumps(
@@ -200,8 +214,8 @@ class HostPortTests(unittest.TestCase):
                                     "name": "plane_operation",
                                     "arguments": {
                                         "action": "read",
-                                        "operationRef": "operation:work-item-get",
-                                        "input": {"workItemRef": "work-item:test"},
+                                        "operationRef": "operation:search_workspace",
+                                        "input": {"query": "assigned", "limit": 1},
                                     },
                                 }
                             ),
@@ -253,17 +267,38 @@ class HostPortTests(unittest.TestCase):
         bootstrap_frames.clear()
 
         bodies: list[dict] = []
-        with _LocalHostServer(
-            lambda request: (
+        def respond(request: dict) -> bytes:
+            if request["operationRef"] == "operation:search_workspace":
+                output = {
+                    "ok": True,
+                    "result": {
+                        "results": [
+                            {
+                                "objectType": "work_item",
+                                "workItemReadCall": {
+                                    "action": "read",
+                                    "operationRef": "operation:work_item.read",
+                                    "input": {"preparedCallRef": "prepared-call:opaque"},
+                                },
+                            }
+                        ]
+                    },
+                }
+            else:
+                self.assertEqual(request["operationRef"], "operation:work_item.read")
+                self.assertEqual(request["input"], {"preparedCallRef": "prepared-call:opaque"})
+                output = {"ok": True, "result": {"work_item": {"title": "assigned"}}}
+            return (
                 json.dumps(
-                    _result(request, output={"read": True}),
+                    _result(request, output=output),
                     ensure_ascii=False,
                     sort_keys=True,
                     separators=(",", ":"),
                 ).encode()
                 + b"\n"
             )
-        ) as server:
+
+        with _LocalHostServer(respond) as server:
             output = io.StringIO()
             diagnostics = io.StringIO()
             import run_agent
@@ -291,7 +326,16 @@ class HostPortTests(unittest.TestCase):
                 )
 
             self.assertEqual(status, 0)
-            self.assertEqual([request["action"] for request in server.requests], ["read"])
+            self.assertEqual(
+                [request["action"] for request in server.requests], ["read", "read"]
+            )
+            self.assertEqual(
+                [request["operationRef"] for request in server.requests],
+                ["operation:search_workspace", "operation:work_item.read"],
+            )
+            self.assertEqual(
+                server.requests[1]["input"], {"preparedCallRef": "prepared-call:opaque"}
+            )
             self.assertNotIn(server.path, output.getvalue())
             self.assertIn('"modelCalls":2', diagnostics.getvalue())
             self.assertTrue(

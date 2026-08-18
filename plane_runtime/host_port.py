@@ -24,7 +24,7 @@ import socket
 import threading
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from types import MappingProxyType
 from typing import Any, Callable, Iterator, Literal, Mapping, Protocol
 
@@ -396,6 +396,47 @@ def _host_result_disposition(result: HostCallResult) -> HostResultDisposition:
     return _HOST_RESULT_DISPOSITIONS.get(
         (result.status, result.error_code), "poison_invocation"
     )
+
+
+def _prepared_read_ref_from_search_result(output: Any) -> str | None:
+    """Return the one opaque read reference prepared for a model search.
+
+    Plane owns the target behind the reference. Hermes only recognizes the
+    model-facing envelope and never reads or reconstructs target identifiers.
+    A search with more than one prepared item is intentionally left to the
+    model because there is no safe single handoff to choose.
+    """
+
+    if not isinstance(output, Mapping):
+        return None
+    result = output.get("result")
+    if not isinstance(result, Mapping):
+        return None
+    items = result.get("results")
+    if not isinstance(items, list):
+        return None
+    prepared_refs: list[str] = []
+    for item in items:
+        if not isinstance(item, Mapping):
+            continue
+        call = item.get("workItemReadCall")
+        if not isinstance(call, Mapping):
+            continue
+        if (
+            call.get("action") != "read"
+            or call.get("operationRef") != "operation:work_item.read"
+        ):
+            return None
+        input_value = call.get("input")
+        if (
+            not isinstance(input_value, Mapping)
+            or set(input_value) != {"preparedCallRef"}
+            or not isinstance(input_value.get("preparedCallRef"), str)
+            or not input_value["preparedCallRef"].startswith("prepared-call:")
+        ):
+            return None
+        prepared_refs.append(input_value["preparedCallRef"])
+    return prepared_refs[0] if len(prepared_refs) == 1 else None
 
 
 class UnixSocketPlaneHostPort:
@@ -804,6 +845,27 @@ class PlaneHostBinding:
             self._record_catalog_description(request, result)
             self._emit_call_observation(request, result)
             self._observe_publication(request, result)
+            if (
+                operation_ref == "operation:search_workspace"
+                and result.status in {"ok", "replayed"}
+            ):
+                prepared_ref = _prepared_read_ref_from_search_result(result.output)
+                if prepared_ref is not None:
+                    # The gateway has already prepared and authorized this
+                    # opaque handoff. Consume it through the same binding
+                    # and port before the model can terminate on ordinary
+                    # text. The bounded search result remains visible, with
+                    # the canonical read receipt attached for the next model
+                    # turn; no target identifier crosses this seam.
+                    prepared_read = self.call(
+                        action="read",
+                        operation_ref="operation:work_item.read",
+                        input={"preparedCallRef": prepared_ref},
+                        source="model",
+                    )
+                    combined_output = dict(result.output) if isinstance(result.output, Mapping) else {}
+                    combined_output["preparedReadResult"] = prepared_read.to_dict()
+                    result = replace(result, output=combined_output)
             if _host_result_disposition(result) == "poison_invocation":
                 self._fail(result.error_message or "Plane host rejected the callback")
             if self._is_cancelled():
