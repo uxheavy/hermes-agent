@@ -35,10 +35,10 @@ G1_CONTRACT_DIGESTS = {
     "runSnapshot": "308101c6a2c9f56e7deb5c6a07c8bc74b59831b92cbbb5b07c5a7eefc21f4947",
     "invocationEnvelope": "b7a15d74406f1624cdb7cd95b42edfd1ffee596abe57e4f00ed60e2e23ded995",
     "runtimeEvent": "78da5ce9d112b6545ea471e5fcae25ff5dfeb2e5db74a8d5796d0ee026823a27",
-    "runtimeExit": "86b5acaa14271b1c5f0f0fadc30f48bc5cd24ac8db0ff03ba8a91d02bceecf65",
+    "runtimeExit": "aa7aaf6e8b99e7001b87f02bec3cce206d83d585e1db40eaf7c810439f409d91",
     "runtimeDurableState": "444c944ec8a5054f33c8662470529a1f4565d42ff06138438beceeef7967a0da",
 }
-G1_MANIFEST_DIGEST = "714f63844ad84370e0ec467dac19fef3f79b3c47a3c4bae8493437f283913bc0"
+G1_MANIFEST_DIGEST = "d1a5b746d15b1e8cc64bd105b1e8440fc133b3d22608208256cbe0b409ae7d71"
 
 _ROLES = {"worker", "delegator", "gardener", "chief_of_staff", "hr", "evaluator", "custom"}
 _TRIGGERS = {"initial", "human_input", "recoverable_restart", "continuation"}
