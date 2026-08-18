@@ -1620,6 +1620,16 @@ class G1RuntimeProcessTests(unittest.TestCase):
         )
         self.assertIn("callbackPhase=host_return", host_result.failure_message)
         self.assertIn("operationRefDigest=", host_result.failure_message)
+        host_exit = _terminal_failure(snapshot, invocation, host_result, 0)
+        self.assertEqual(
+            host_exit["failure"]["callbackPhase"],
+            "host_return",
+        )
+        self.assertEqual(
+            host_exit["failure"]["operationRefDigest"],
+            hashlib.sha256("operation:work-item-read".encode("utf-8")).hexdigest(),
+        )
+        self.assertNotIn("input", json.dumps(host_exit))
 
         budget_result = HermesKernelAdapter(agent_factory=lambda **kwargs: object()).dispatch(
             snapshot, invocation, lambda: False, lambda body: None, model_call_allowance=0

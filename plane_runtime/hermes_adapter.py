@@ -32,6 +32,9 @@ from .host_port import (
     bind_plane_host,
     install_plane_tools,
     PLANE_CODE_MODE_TOOLSET,
+    PLANE_OPERATION_TOOLSET,
+    PLANE_PUBLICATION_TOOLSET,
+    PLANE_RUNTIME_TOOLSET,
 )
 from .presentation import PresentationBoundsError, build_model_guidance
 
@@ -466,8 +469,19 @@ def _code_mode_is_available(snapshot: G1RunSnapshot) -> bool:
     return all(policy.get(key, 0) > 0 for key in _CODE_MODE_RUNTIME_POLICY_FIELDS)
 
 
+def _plane_model_toolsets(snapshot: G1RunSnapshot) -> tuple[str, ...]:
+    """Resolve model-facing Plane toolsets from the immutable snapshot signal."""
+
+    if snapshot.model_toolset == "code_mode_only":
+        return (PLANE_PUBLICATION_TOOLSET, PLANE_CODE_MODE_TOOLSET)
+    if snapshot.model_toolset == "standard":
+        return (PLANE_OPERATION_TOOLSET, PLANE_PUBLICATION_TOOLSET, PLANE_CODE_MODE_TOOLSET)
+    raise G1ContractError("snapshot.modelToolset is unsupported")
+
+
 def _strict_json_object(raw: bytes, expected: set[str], name: str) -> dict[str, Any]:
     """Parse one canonical object and reject duplicate/unknown/trailing data."""
+
     if raw != raw.strip() or len(raw) > _MAX_CREDENTIAL_VALUE_BYTES:
         raise G1ContractError(f"{name} is not canonical")
 
@@ -1013,17 +1027,25 @@ class HermesKernelAdapter:
                     }
                 )
 
+        plane_toolsets = {
+            PLANE_RUNTIME_TOOLSET,
+            PLANE_OPERATION_TOOLSET,
+            PLANE_PUBLICATION_TOOLSET,
+            PLANE_CODE_MODE_TOOLSET,
+        }
         enabled_toolsets = [
             toolset
             for toolset in self._enabled_toolsets
-            if toolset != "code_execution"
+            if toolset not in plane_toolsets and toolset != "code_execution"
         ]
         if self._host_port is None and _code_mode_is_available(snapshot):
             enabled_toolsets.append("code_execution")
         if self._host_port is not None:
-            enabled_toolsets.append("plane_runtime")
-            if _code_mode_is_available(snapshot):
-                enabled_toolsets.append(PLANE_CODE_MODE_TOOLSET)
+            enabled_toolsets.extend(
+                toolset
+                for toolset in _plane_model_toolsets(snapshot)
+                if toolset != PLANE_CODE_MODE_TOOLSET or _code_mode_is_available(snapshot)
+            )
         # Preserve caller ordering while keeping adapter-added toolsets
         # idempotent when a compatibility caller already supplied one.
         enabled_toolsets = list(dict.fromkeys(enabled_toolsets))
