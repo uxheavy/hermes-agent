@@ -943,6 +943,47 @@ print("text_response")
         self.assertEqual(unknown_result.status, "unavailable")
         self.assertIsNotNone(unknown.fatal_error)
 
+    def test_code_mode_failure_is_bounded_and_corrected_call_can_continue(self) -> None:
+        calls = 0
+
+        def failed_then_ok(request: dict) -> dict:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return _result(
+                    request,
+                    status="invalid",
+                    errorCode="CODE_MODE_FAILED",
+                    errorMessage="Code Mode module failed in the restricted isolate",
+                )
+            return _result(request, output={"operationId": "work_item.rename"})
+
+        binding = PlaneHostBinding(
+            port=CallablePlaneHostPort(failed_then_ok),
+            run_id="run:test",
+            invocation_id="invocation:test",
+            correlation_id="correlation:test",
+            cancellation=lambda: False,
+        )
+        failed = binding.call(
+            action="code",
+            operation_ref="plane.code-mode.execute@1",
+            input={"source": "malformed-generated-module"},
+            source="code",
+        )
+        corrected = binding.call(
+            action="code",
+            operation_ref="plane.code-mode.execute@1",
+            input={"source": "corrected-generated-module"},
+            source="code",
+        )
+
+        self.assertEqual(failed.status, "invalid")
+        self.assertEqual(failed.error_code, "CODE_MODE_FAILED")
+        self.assertEqual(corrected.status, "ok")
+        self.assertEqual(corrected.output, {"operationId": "work_item.rename"})
+        self.assertIsNone(binding.fatal_error)
+
     def test_plane_conflict_is_model_observable_but_idempotency_conflict_stays_fatal(self) -> None:
         conflict = PlaneHostBinding(
             port=CallablePlaneHostPort(

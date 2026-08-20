@@ -85,6 +85,11 @@ _HOST_RESULT_DISPOSITIONS: Mapping[tuple[str, str | None], HostResultDisposition
         ("ok", None): "continue_with_tool_result",
         ("replayed", None): "continue_with_tool_result",
         ("invalid", "VALIDATION_ERROR"): "continue_with_tool_result",
+        # A generated Code Mode module may fail in the restricted isolate.
+        # Return that finite, bounded result to the model so it can correct
+        # the module in the same invocation; host/transport failures remain
+        # poison unless explicitly classified above.
+        ("invalid", "CODE_MODE_FAILED"): "continue_with_tool_result",
         ("denied", "NOT_AUTHORIZED"): "continue_with_tool_result",
         ("conflict", "PLANE_CONFLICT"): "continue_with_tool_result",
     }
