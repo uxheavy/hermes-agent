@@ -1958,6 +1958,77 @@ print("text_response")
         self.assertIn('"read":true', code_result)
         self.assertEqual(len(requests), 1)
 
+    def test_registry_normalizes_exact_ready_to_call_prepared_read_envelope(self) -> None:
+        install_plane_tools()
+        requests: list[dict] = []
+
+        def rpc(request: dict) -> dict:
+            requests.append(request)
+            return _result(request, output={"work_item": {"title": "assigned"}})
+
+        binding = PlaneHostBinding(
+            port=CallablePlaneHostPort(rpc),
+            run_id="run:prepared-envelope",
+            invocation_id="invocation:prepared-envelope",
+            correlation_id="correlation:prepared-envelope",
+            cancellation=lambda: False,
+        )
+        ready_to_call = {
+            "action": "read",
+            "operationRef": "operation:work_item.read",
+            "input": {"preparedCallRef": "prepared-call:opaque"},
+        }
+        with bind_plane_host(binding):
+            result = registry.dispatch(
+                "plane_operation",
+                {
+                    "action": "read",
+                    "operationRef": "operation:work_item.read",
+                    "input": ready_to_call,
+                },
+            )
+
+        self.assertIn('"status":"ok"', result)
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(requests[0]["input"], {"preparedCallRef": "prepared-call:opaque"})
+
+    def test_prepared_read_normalization_fails_closed_for_tampered_envelope(self) -> None:
+        install_plane_tools()
+        requests: list[dict] = []
+
+        def rpc(request: dict) -> dict:
+            requests.append(request)
+            return _result(request, output={"accepted": True})
+
+        binding = PlaneHostBinding(
+            port=CallablePlaneHostPort(rpc),
+            run_id="run:prepared-envelope-tamper",
+            invocation_id="invocation:prepared-envelope-tamper",
+            correlation_id="correlation:prepared-envelope-tamper",
+            cancellation=lambda: False,
+        )
+        tampered = {
+            "action": "read",
+            "operationRef": "operation:work_item.read",
+            "input": {
+                "preparedCallRef": "prepared-call:opaque",
+                "issue_id": "should-not-be-forwarded",
+            },
+        }
+        with bind_plane_host(binding):
+            result = registry.dispatch(
+                "plane_operation",
+                {
+                    "action": "read",
+                    "operationRef": "operation:work_item.read",
+                    "input": tampered,
+                },
+            )
+
+        self.assertIn('"status":"ok"', result)
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(requests[0]["input"], tampered)
+
     def test_real_aiagent_loop_reaches_read_mutation_code_and_explicit_publication(self) -> None:
         """Use a deterministic provider boundary, not a fake Hermes agent."""
 
