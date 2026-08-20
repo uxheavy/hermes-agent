@@ -32,13 +32,13 @@ MAX_EAGER_SCHEMA_PROPERTIES = 4096
 
 # Frozen bytes from the paired Plane G1 runtime contract manifest.
 G1_CONTRACT_DIGESTS = {
-    "runSnapshot": "1d04c2a36f07d0e8128c3616e7dcae29af104fe4aa44d71cb1b7f43e55c0869b",
+    "runSnapshot": "5836fdcf333eab9ada37bc7a3078ce5cf33a779dd4fcbadb1c3848d572339d37",
     "invocationEnvelope": "b7a15d74406f1624cdb7cd95b42edfd1ffee596abe57e4f00ed60e2e23ded995",
     "runtimeEvent": "d0fb1c67a7424f5359f9c09ff7206ef7d3d0d6e90e62b724c4a5e4e4bc13412d",
     "runtimeExit": "ed127d0ebec8f5d432ce87a6be1a8eb41b31caf808badc27ed23cd0ba9115a24",
     "runtimeDurableState": "444c944ec8a5054f33c8662470529a1f4565d42ff06138438beceeef7967a0da",
 }
-G1_MANIFEST_DIGEST = "c8eba371c5c4fc362fd799f68904c769817c233685e03c92b1dd501da2d6b939"
+G1_MANIFEST_DIGEST = "f3ca872bdd4ef53a102f72a2fb196ba974c80c163bc8479d5a8c0c707953d412"
 
 _ROLES = {"worker", "delegator", "gardener", "chief_of_staff", "hr", "evaluator", "custom"}
 _TRIGGERS = {"initial", "human_input", "recoverable_restart", "continuation"}
@@ -347,9 +347,9 @@ def _validate_snapshot(raw: Any) -> dict[str, Any]:
 
     catalog = _object(data["toolCatalog"], "RunSnapshot.toolCatalog")
     _reject_unknown(catalog, {"catalogDigest", "modelToolset", "eagerOperations"}, "toolCatalog")
-    _required(catalog, {"catalogDigest", "eagerOperations"}, "toolCatalog")
+    _required(catalog, {"catalogDigest", "modelToolset", "eagerOperations"}, "toolCatalog")
     _content_ref(catalog["catalogDigest"], "toolCatalog.catalogDigest")
-    if "modelToolset" in catalog and catalog["modelToolset"] not in {"standard", "code_mode_only"}:
+    if catalog["modelToolset"] not in {"standard", "code_mode_only"}:
         raise G1ContractError("toolCatalog.modelToolset is unsupported")
     operations = catalog["eagerOperations"]
     if not isinstance(operations, list) or len(operations) > MAX_EAGER_OPERATIONS:
@@ -534,7 +534,7 @@ class G1RunSnapshot:
 
     @property
     def model_toolset(self) -> str:
-        return str(self.raw["toolCatalog"].get("modelToolset", "standard"))
+        return str(self.raw["toolCatalog"]["modelToolset"])
 
     @property
     def model_provider(self) -> str:

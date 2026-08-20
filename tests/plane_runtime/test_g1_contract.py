@@ -34,7 +34,7 @@ class G1ContractTests(unittest.TestCase):
         )
         self.assertEqual(
             G1_CONTRACT_DIGESTS["runSnapshot"],
-            "1d04c2a36f07d0e8128c3616e7dcae29af104fe4aa44d71cb1b7f43e55c0869b",
+            "5836fdcf333eab9ada37bc7a3078ce5cf33a779dd4fcbadb1c3848d572339d37",
         )
         self.assertEqual(
             G1_CONTRACT_DIGESTS["runtimeEvent"],
@@ -46,7 +46,7 @@ class G1ContractTests(unittest.TestCase):
         )
         self.assertEqual(
             G1_MANIFEST_DIGEST,
-            "c8eba371c5c4fc362fd799f68904c769817c233685e03c92b1dd501da2d6b939",
+            "f3ca872bdd4ef53a102f72a2fb196ba974c80c163bc8479d5a8c0c707953d412",
         )
 
     def test_eager_presentation_fields_are_strict(self) -> None:
@@ -69,6 +69,12 @@ class G1ContractTests(unittest.TestCase):
             G1RunSnapshot.from_dict(progressive)
 
         self.assertIsNotNone(operation)
+
+    def test_model_toolset_is_required_at_the_g1_boundary(self) -> None:
+        missing = make_snapshot()
+        del missing["toolCatalog"]["modelToolset"]  # type: ignore[index]
+        with self.assertRaisesRegex(G1ContractError, "modelToolset"):
+            G1RunSnapshot.from_dict(missing)
 
     def test_snapshot_content_digest_authenticates_input_schema(self) -> None:
         raw = make_snapshot()

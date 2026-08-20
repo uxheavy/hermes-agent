@@ -6,7 +6,7 @@ import copy
 import json
 import unittest
 
-from plane_runtime.g1_contract import G1InvocationEnvelope, G1RunSnapshot
+from plane_runtime.g1_contract import G1ContractError, G1InvocationEnvelope, G1RunSnapshot
 from plane_runtime.hermes_adapter import HermesKernelAdapter
 from plane_runtime.host_port import CallablePlaneHostPort, current_plane_host
 from tests.plane_runtime.test_g1_runtime_process import _digest, make_invocation, make_snapshot
@@ -14,6 +14,49 @@ from tools.registry import registry
 
 
 class AdapterPresentationTests(unittest.TestCase):
+    def test_serialized_code_mode_snapshot_installs_first_tool_guard_before_final_text(self) -> None:
+        raw = copy.deepcopy(make_snapshot())
+        raw["toolCatalog"]["modelToolset"] = "code_mode_only"  # type: ignore[index]
+        raw["contentDigest"] = _digest(
+            "snapshot", {key: value for key, value in raw.items() if key != "contentDigest"}
+        )
+        serialized = json.loads(json.dumps(raw, sort_keys=True, separators=(",", ":")))
+        snapshot = G1RunSnapshot.from_dict(serialized)
+        invocation = G1InvocationEnvelope.from_dict(make_invocation(snapshot.to_dict()))
+        captured: dict[str, object] = {}
+
+        class FinalTextAgent:
+            session_api_calls = 1
+
+            def run_conversation(self, message: str, *, system_message: str) -> dict[str, str]:
+                del message, system_message
+                captured["first_required_tool"] = getattr(self, "_plane_first_required_tool", None)
+                return {"final_response": "ordinary final text"}
+
+        def factory(**kwargs: object) -> FinalTextAgent:
+            captured["enabled_toolsets"] = kwargs["enabled_toolsets"]
+            return FinalTextAgent()
+
+        class Credentials:
+            def resolve(self, provider: str) -> dict[str, str]:
+                del provider
+                return {"api_key": "provider-free-test-secret"}
+
+        missing = copy.deepcopy(serialized)
+        del missing["toolCatalog"]["modelToolset"]
+        with self.assertRaisesRegex(G1ContractError, "modelToolset"):
+            G1RunSnapshot.from_dict(missing)
+
+        result = HermesKernelAdapter(
+            agent_factory=factory,
+            credential_source=Credentials(),
+            host_port=CallablePlaneHostPort(lambda request: {}),
+        ).dispatch(snapshot, invocation, lambda: False, lambda body: None, model_call_allowance=1)
+
+        self.assertEqual(result.kind, "completed")
+        self.assertEqual(captured["first_required_tool"], "plane_execute_typescript")
+        self.assertNotIn("plane_operation", captured["enabled_toolsets"])
+
     def test_manager_route_uses_search_then_canonical_work_item_read_input(self) -> None:
         raw = copy.deepcopy(make_snapshot())
         raw["assignment"] = {
@@ -26,6 +69,7 @@ class AdapterPresentationTests(unittest.TestCase):
         raw["profile"]["role"] = "delegator"  # type: ignore[index]
         raw["toolCatalog"] = {
             "catalogDigest": "content:" + "c" * 64,
+            "modelToolset": "standard",
             "eagerOperations": [
                 {
                     "operationRef": "operation:catalog.search",
