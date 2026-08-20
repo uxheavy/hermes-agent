@@ -764,6 +764,29 @@ def _terminal_lifecycle_observation(
     return encoded
 
 
+def _emit_plane_runtime_diagnostics(
+    agent: Any,
+    emit_body: Callable[[Mapping[str, Any]], None],
+) -> None:
+    """Emit bounded Code Mode request/response facts before terminal failure."""
+
+    diagnostics = getattr(agent, "_plane_runtime_diagnostics", None)
+    if not isinstance(diagnostics, dict):
+        return
+    emit_body(
+        {
+            "kind": "progress_observed",
+            "payload": {
+                "kind": "runtime_diagnostics",
+                "version": 1,
+                "requests": list(diagnostics.get("requests", []))[:32],
+                "responses": list(diagnostics.get("responses", []))[:32],
+            },
+            "publication": {"action": "observation_only"},
+        }
+    )
+
+
 class NeverCancelled:
     """Explicit no-cancellation seam for callers that own no control signal."""
 
@@ -1190,6 +1213,7 @@ class HermesKernelAdapter:
                 and getattr(exc, "retryable", None) is False
                 and getattr(exc, "upstream_initiated", False) is True
             ):
+                _emit_plane_runtime_diagnostics(agent, emit_body)
                 return HermesKernelResult(
                     kind="failed",
                     failure_code="outcome_unknown",
@@ -1328,20 +1352,7 @@ class HermesKernelAdapter:
                     "publication": {"action": "observation_only"},
                 }
             )
-        runtime_diagnostics = getattr(agent, "_plane_runtime_diagnostics", None)
-        if isinstance(runtime_diagnostics, dict):
-            emit_body(
-                {
-                    "kind": "progress_observed",
-                    "payload": {
-                        "kind": "runtime_diagnostics",
-                        "version": 1,
-                        "requests": list(runtime_diagnostics.get("requests", []))[:32],
-                        "responses": list(runtime_diagnostics.get("responses", []))[:32],
-                    },
-                    "publication": {"action": "observation_only"},
-                }
-            )
+        _emit_plane_runtime_diagnostics(agent, emit_body)
         usage_values = (
             getattr(agent, "session_input_tokens", 0),
             getattr(agent, "session_output_tokens", 0),

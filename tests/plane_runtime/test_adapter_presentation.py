@@ -7,13 +7,81 @@ import json
 import unittest
 
 from plane_runtime.g1_contract import G1ContractError, G1InvocationEnvelope, G1RunSnapshot
-from plane_runtime.hermes_adapter import HermesKernelAdapter
+from plane_runtime.hermes_adapter import HermesKernelAdapter, ProviderOutcomeUnknownError
 from plane_runtime.host_port import CallablePlaneHostPort, current_plane_host
 from tests.plane_runtime.test_g1_runtime_process import _digest, make_invocation, make_snapshot
 from tools.registry import registry
 
 
 class AdapterPresentationTests(unittest.TestCase):
+    def test_transport_outcome_unknown_preserves_completed_code_mode_diagnostics(self) -> None:
+        raw = copy.deepcopy(make_snapshot())
+        raw["toolCatalog"]["modelToolset"] = "code_mode_only"  # type: ignore[index]
+        raw["runtimePolicy"]["adapter"] = "hermes"  # type: ignore[index]
+        raw["runtimePolicy"].update(  # type: ignore[union-attr]
+            {
+                "maxCodeModeInputBytes": 65_536,
+                "maxCodeModeOutputBytes": 65_536,
+                "maxCodeModeCalls": 4,
+            }
+        )
+        raw["contentDigest"] = _digest(
+            "snapshot", {key: value for key, value in raw.items() if key != "contentDigest"}
+        )
+        snapshot = G1RunSnapshot.from_dict(raw)
+        invocation = G1InvocationEnvelope.from_dict(make_invocation(snapshot.to_dict()))
+
+        class TransportClosingAgent:
+            session_api_calls = 6
+
+            def run_conversation(self, message: str, *, system_message: str) -> dict[str, str]:
+                del message, system_message
+                diagnostics = self._plane_runtime_diagnostics
+                for sequence in range(1, 6):
+                    diagnostics["requests"].append(
+                        {
+                            "sequence": sequence,
+                            "toolChoice": "required",
+                            "visibleToolset": "execute_only",
+                            "visibleToolCount": 1,
+                            "serialized": True,
+                        }
+                    )
+                    diagnostics["responses"].append(
+                        {
+                            "sequence": sequence,
+                            "responseClass": "tool_call",
+                            "toolCall": "execute",
+                        }
+                    )
+                raise ProviderOutcomeUnknownError(status_code=200)
+
+        class Credentials:
+            def resolve(self, provider: str) -> dict[str, str]:
+                del provider
+                return {"api_key": "provider-free-test-secret"}
+
+        bodies: list[dict[str, object]] = []
+        result = HermesKernelAdapter(
+            agent_factory=lambda **kwargs: TransportClosingAgent(),
+            credential_source=Credentials(),
+            host_port=CallablePlaneHostPort(lambda request: {}),
+        ).dispatch(snapshot, invocation, lambda: False, bodies.append, model_call_allowance=8)
+
+        self.assertEqual(result.failure_code, "outcome_unknown")
+        self.assertFalse(result.retryable)
+        diagnostics = [
+            body["payload"]
+            for body in bodies
+            if body.get("kind") == "progress_observed"
+            and isinstance(body.get("payload"), dict)
+            and body["payload"].get("kind") == "runtime_diagnostics"
+        ]
+        self.assertEqual(len(diagnostics), 1)
+        self.assertEqual(len(diagnostics[0]["requests"]), 5)  # type: ignore[index]
+        self.assertEqual(diagnostics[0]["requests"][0]["toolChoice"], "required")  # type: ignore[index]
+        self.assertEqual(diagnostics[0]["responses"][-1]["toolCall"], "execute")  # type: ignore[index]
+
     def test_serialized_code_mode_snapshot_installs_first_tool_guard_before_final_text(self) -> None:
         raw = copy.deepcopy(make_snapshot())
         raw["toolCatalog"]["modelToolset"] = "code_mode_only"  # type: ignore[index]
