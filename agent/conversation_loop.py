@@ -112,9 +112,11 @@ _API_CALL_MODULES = frozenset({
     "chat_completion_helpers",
 })
 
+_PLANE_FIRST_REQUIRED_TOOL_MAX_RECALLS = 2
+
 
 def _consume_plane_first_required_tool(agent: Any, tool_calls: Any) -> None:
-    """Release the adapter-owned first-tool choice after its valid call."""
+    """Release the finite Code Mode first-tool guard after its valid call."""
 
     required = getattr(agent, "_plane_first_required_tool", None)
     if not isinstance(required, str) or not required:
@@ -136,9 +138,6 @@ def _consume_plane_first_required_tool(agent: Any, tool_calls: Any) -> None:
     if not any(_name(call) == required for call in (tool_calls or [])):
         return
     setattr(agent, "_plane_first_required_tool", None)
-    request_overrides = dict(getattr(agent, "request_overrides", {}) or {})
-    request_overrides.pop("tool_choice", None)
-    agent.request_overrides = request_overrides
 
 
 def _apply_active_turn_redirect(agent: Any, messages: List[Dict[str, Any]], text: str) -> None:
@@ -6440,8 +6439,8 @@ def run_conversation(
                 required_first_tool = getattr(agent, "_plane_first_required_tool", None)
                 if isinstance(required_first_tool, str) and required_first_tool:
                     retries = int(getattr(agent, "_plane_first_required_tool_retries", 0))
-                    if retries == 0:
-                        agent._plane_first_required_tool_retries = 1
+                    if retries < _PLANE_FIRST_REQUIRED_TOOL_MAX_RECALLS:
+                        agent._plane_first_required_tool_retries = retries + 1
                         messages.append(
                             agent._build_assistant_message(assistant_message, finish_reason)
                         )
@@ -6456,12 +6455,9 @@ def run_conversation(
                         )
                         continue
                     agent._plane_first_required_tool = None
-                    request_overrides = dict(getattr(agent, "request_overrides", {}) or {})
-                    request_overrides.pop("tool_choice", None)
-                    agent.request_overrides = request_overrides
                     final_response = "Required Code Mode tool was not invoked."
                     failed = True
-                    _turn_exit_reason = "required_first_tool_not_invoked"
+                    _turn_exit_reason = "required_tool_not_used"
                     break
                 final_response = assistant_message.content or ""
                 

@@ -1139,12 +1139,6 @@ class HermesKernelAdapter:
                         retryable=False,
                         model_calls=0,
                     )
-                request_overrides = dict(getattr(agent, "request_overrides", {}) or {})
-                request_overrides["tool_choice"] = {
-                    "type": "function",
-                    "name": first_required_tool,
-                }
-                agent.request_overrides = request_overrides
                 setattr(agent, "_plane_first_required_tool", first_required_tool)
                 setattr(agent, "_plane_first_required_tool_retries", 0)
             if host_binding is not None:

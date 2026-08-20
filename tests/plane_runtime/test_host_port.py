@@ -3016,7 +3016,7 @@ print("text_response")
         )
         self.assertFalse(any(body["kind"] == "transcript_evidence_observed" for body in bodies))
 
-    def test_code_mode_requires_first_tool_after_final_text_and_releases_choice(self) -> None:
+    def test_code_mode_requires_first_tool_after_final_text_and_releases_guard(self) -> None:
         """A final-text first response is recalled before Code Mode can publish."""
 
         from tests.plane_runtime.test_g1_runtime_process import (
@@ -3186,13 +3186,7 @@ print("text_response")
         self.assertEqual(
             [request["action"] for request in requests], ["code", "publish"]
         )
-        self.assertEqual(completions.tool_choices[0], {
-            "type": "function", "name": "plane_execute_typescript"
-        })
-        self.assertEqual(completions.tool_choices[1], {
-            "type": "function", "name": "plane_execute_typescript"
-        })
-        self.assertIsNone(completions.tool_choices[2])
+        self.assertEqual(completions.tool_choices, [None, None, None, None])
 
     def test_code_mode_fails_closed_when_first_tool_is_not_registered(self) -> None:
         from tests.plane_runtime.test_g1_runtime_process import (
