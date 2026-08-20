@@ -1123,6 +1123,8 @@ class HermesKernelAdapter:
         try:
             agent = self._agent_factory(**agent_kwargs)
             first_required_tool = _plane_first_required_tool(snapshot)
+            if first_required_tool == _CODE_MODE_FIRST_REQUIRED_TOOL:
+                setattr(agent, "_plane_runtime_diagnostics", {"requests": [], "responses": []})
             if first_required_tool is not None:
                 try:
                     from tools.registry import registry
@@ -1322,6 +1324,20 @@ class HermesKernelAdapter:
                         "kind": "inline_text",
                         "contentType": "text/plain",
                         "text": lifecycle_observation,
+                    },
+                    "publication": {"action": "observation_only"},
+                }
+            )
+        runtime_diagnostics = getattr(agent, "_plane_runtime_diagnostics", None)
+        if isinstance(runtime_diagnostics, dict):
+            emit_body(
+                {
+                    "kind": "progress_observed",
+                    "payload": {
+                        "kind": "runtime_diagnostics",
+                        "version": 1,
+                        "requests": list(runtime_diagnostics.get("requests", []))[:32],
+                        "responses": list(runtime_diagnostics.get("responses", []))[:32],
                     },
                     "publication": {"action": "observation_only"},
                 }

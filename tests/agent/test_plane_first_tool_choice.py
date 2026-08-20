@@ -6,6 +6,10 @@ from agent.chat_completion_helpers import (
     _plane_codex_request_overrides,
     _plane_first_tool_tools,
 )
+from agent.conversation_loop import (
+    _record_plane_runtime_request,
+    _record_plane_runtime_response,
+)
 from agent.transports import get_transport
 
 
@@ -95,3 +99,37 @@ def test_invalid_or_absent_required_tool_hint_never_forces_a_choice():
         "plane_execute_typescript",
         "plane_publish",
     ]
+
+
+def test_code_mode_diagnostic_records_serialized_choice_and_response_class_only():
+    agent = SimpleNamespace(
+        _plane_runtime_diagnostics={"requests": [], "responses": []},
+    )
+
+    _record_plane_runtime_request(
+        agent,
+        {
+            "tool_choice": "required",
+            "tools": [_PLANE_TOOL],
+        },
+    )
+    _record_plane_runtime_response(agent, SimpleNamespace(tool_calls=[], content="redacted"))
+
+    assert agent._plane_runtime_diagnostics == {
+        "requests": [
+            {
+                "sequence": 1,
+                "toolChoice": "required",
+                "visibleToolset": "execute_only",
+                "visibleToolCount": 1,
+                "serialized": True,
+            }
+        ],
+        "responses": [
+            {
+                "sequence": 1,
+                "responseClass": "text_response",
+                "toolCall": "none",
+            }
+        ],
+    }

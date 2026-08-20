@@ -113,6 +113,101 @@ _API_CALL_MODULES = frozenset({
 })
 
 _PLANE_FIRST_REQUIRED_TOOL_MAX_RECALLS = 2
+_PLANE_RUNTIME_DIAGNOSTIC_TOOL_NAMES = frozenset(
+    {"plane_execute_typescript", "plane_publish"}
+)
+
+
+def _plane_runtime_toolset_class(tools: Any) -> str:
+    """Return a finite, non-sensitive projection of provider-visible tools."""
+
+    names = set()
+    if isinstance(tools, list):
+        for tool in tools:
+            if not isinstance(tool, dict):
+                continue
+            function = tool.get("function")
+            name = tool.get("name")
+            if not isinstance(name, str) and isinstance(function, dict):
+                name = function.get("name")
+            if name in _PLANE_RUNTIME_DIAGNOSTIC_TOOL_NAMES:
+                names.add(name)
+            elif isinstance(name, str):
+                names.add("other")
+    if names == {"plane_execute_typescript"}:
+        return "execute_only"
+    if names == _PLANE_RUNTIME_DIAGNOSTIC_TOOL_NAMES:
+        return "execute_and_publish"
+    if not names:
+        return "empty"
+    return "other"
+
+
+def _plane_runtime_tool_call_class(tool_calls: Any) -> str:
+    """Return a finite, non-sensitive projection of model tool selection."""
+
+    names = set()
+    for call in tool_calls or []:
+        function = getattr(call, "function", None)
+        name = getattr(function, "name", None)
+        if name == "plane_execute_typescript":
+            names.add("execute")
+        elif name == "plane_publish":
+            names.add("publish")
+        elif isinstance(name, str):
+            names.add("other")
+    if not names:
+        return "none"
+    if names == {"execute"}:
+        return "execute"
+    if names == {"publish"}:
+        return "publish"
+    if names == {"other"}:
+        return "other"
+    return "multiple"
+
+
+def _record_plane_runtime_request(agent: Any, api_kwargs: Any) -> None:
+    """Retain only bounded request-choice metadata for Code Mode diagnosis."""
+
+    diagnostics = getattr(agent, "_plane_runtime_diagnostics", None)
+    if not isinstance(diagnostics, dict):
+        return
+    requests = diagnostics.setdefault("requests", [])
+    if len(requests) >= 32 or not isinstance(api_kwargs, dict):
+        return
+    choice = api_kwargs.get("tool_choice")
+    if choice not in {"required", "auto"}:
+        choice = "absent"
+    tools = api_kwargs.get("tools")
+    requests.append(
+        {
+            "sequence": len(requests) + 1,
+            "toolChoice": choice,
+            "visibleToolset": _plane_runtime_toolset_class(tools),
+            "visibleToolCount": min(len(tools), 64) if isinstance(tools, list) else 0,
+            "serialized": True,
+        }
+    )
+
+
+def _record_plane_runtime_response(agent: Any, assistant_message: Any) -> None:
+    """Retain only bounded response-class metadata; never retain model text."""
+
+    diagnostics = getattr(agent, "_plane_runtime_diagnostics", None)
+    if not isinstance(diagnostics, dict):
+        return
+    responses = diagnostics.setdefault("responses", [])
+    if len(responses) >= 32:
+        return
+    tool_calls = getattr(assistant_message, "tool_calls", None) or []
+    responses.append(
+        {
+            "sequence": len(responses) + 1,
+            "responseClass": "tool_call" if tool_calls else "text_response",
+            "toolCall": _plane_runtime_tool_call_class(tool_calls),
+        }
+    )
 
 
 def _consume_plane_first_required_tool(agent: Any, tool_calls: Any) -> None:
@@ -2160,6 +2255,8 @@ def run_conversation(
                 except Exception:
                     _original_api_kwargs = dict(api_kwargs)
                     _llm_middleware_trace = []
+
+                _record_plane_runtime_request(agent, api_kwargs)
 
                 try:
                     from hermes_cli.lifecycle import (
@@ -5548,6 +5645,7 @@ def run_conversation(
             normalized = _transport.normalize_response(response, **_normalize_kwargs)
             assistant_message = normalized
             finish_reason = normalized.finish_reason
+            _record_plane_runtime_response(agent, assistant_message)
             
             # Normalize content to string — some OpenAI-compatible servers
             # (llama-server, etc.) return content as a dict or list instead
