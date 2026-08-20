@@ -67,6 +67,31 @@ _FALLBACK_EXHAUSTED_COOLDOWN_S = 5.0
 _PLANE_FIRST_REQUIRED_TOOL = "plane_execute_typescript"
 
 
+def _plane_tool_name(tool):
+    if not isinstance(tool, dict):
+        return None
+    if tool.get("name") == _PLANE_FIRST_REQUIRED_TOOL:
+        return tool["name"]
+    function = tool.get("function")
+    if isinstance(function, dict) and function.get("name") == _PLANE_FIRST_REQUIRED_TOOL:
+        return function["name"]
+    return None
+
+
+def _plane_first_tool_available(agent, tools):
+    return (
+        getattr(agent, "_plane_first_required_tool", None) == _PLANE_FIRST_REQUIRED_TOOL
+        and any(_plane_tool_name(tool) == _PLANE_FIRST_REQUIRED_TOOL for tool in (tools or []))
+    )
+
+
+def _plane_first_tool_tools(agent, tools):
+    """Expose only the finite first tool without changing the registry."""
+    if not _plane_first_tool_available(agent, tools):
+        return tools
+    return [tool for tool in tools if _plane_tool_name(tool) == _PLANE_FIRST_REQUIRED_TOOL]
+
+
 def _plane_codex_request_overrides(agent, tools):
     """Return request overrides with Plane's bounded first-tool choice.
 
@@ -79,17 +104,7 @@ def _plane_codex_request_overrides(agent, tools):
     if getattr(agent, "_plane_first_required_tool", None) != _PLANE_FIRST_REQUIRED_TOOL:
         return overrides
 
-    def _tool_name(tool):
-        if not isinstance(tool, dict):
-            return None
-        if tool.get("name") == _PLANE_FIRST_REQUIRED_TOOL:
-            return tool["name"]
-        function = tool.get("function")
-        if isinstance(function, dict) and function.get("name") == _PLANE_FIRST_REQUIRED_TOOL:
-            return function["name"]
-        return None
-
-    if any(_tool_name(tool) == _PLANE_FIRST_REQUIRED_TOOL for tool in (tools or [])):
+    if _plane_first_tool_available(agent, tools):
         overrides["tool_choice"] = "required"
     return overrides
 
@@ -1250,6 +1265,8 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
                     "%s⚠️ Failed to sanitize tool schemas for xAI: %s",
                     getattr(agent, "log_prefix", ""), exc,
                 )
+
+        tools_for_api = _plane_first_tool_tools(agent, tools_for_api)
 
         return _ct.build_kwargs(
             model=agent.model,
