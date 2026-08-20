@@ -24,7 +24,7 @@ def test_code_mode_snapshot_selects_only_code_and_publication_tools():
     standard_tools = set(resolve_multiple_toolsets(list(_plane_model_toolsets(standard))))
     code_mode_tools = set(resolve_multiple_toolsets(list(_plane_model_toolsets(code_mode))))
     assert {PLANE_OPERATION_TOOL, PLANE_PUBLISH_TOOL}.issubset(standard_tools)
-    assert {PLANE_CODE_MODE_TOOL, PLANE_PUBLISH_TOOL}.issubset(code_mode_tools)
+    assert code_mode_tools == {PLANE_CODE_MODE_TOOL, PLANE_PUBLISH_TOOL}
     assert PLANE_OPERATION_TOOL not in code_mode_tools
     assert registry.get_entry(PLANE_OPERATION_TOOL).toolset == PLANE_OPERATION_TOOLSET
     assert registry.get_entry(PLANE_PUBLISH_TOOL).toolset == PLANE_PUBLICATION_TOOLSET

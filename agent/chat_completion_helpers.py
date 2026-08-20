@@ -60,9 +60,10 @@ _FALLBACK_EXHAUSTED_COOLDOWN_S = 5.0
 # Plane's Code Mode contract uses one finite, trusted first-action hint.  It
 # is presentation state installed by the Plane runtime adapter, not a caller
 # supplied provider override.  Keep the transport override derived here so
-# the existing Codex Responses path emits a named choice for only the first
-# productive request; once the adapter consumes the hint, the transport's
-# normal ``auto`` default resumes.
+# the existing Codex Responses path requires a tool for only the first
+# productive request. Code Mode exposes exactly one model tool, so the
+# Responses ``required`` mode selects it without provider-specific function
+# object syntax; once the adapter consumes the hint, normal ``auto`` resumes.
 _PLANE_FIRST_REQUIRED_TOOL = "plane_execute_typescript"
 
 
@@ -89,10 +90,7 @@ def _plane_codex_request_overrides(agent, tools):
         return None
 
     if any(_tool_name(tool) == _PLANE_FIRST_REQUIRED_TOOL for tool in (tools or [])):
-        overrides["tool_choice"] = {
-            "type": "function",
-            "name": _PLANE_FIRST_REQUIRED_TOOL,
-        }
+        overrides["tool_choice"] = "required"
     return overrides
 
 

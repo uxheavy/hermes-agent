@@ -35,17 +35,14 @@ def _request(agent, tools):
     )
 
 
-def test_code_mode_first_request_is_named_then_returns_to_auto():
+def test_code_mode_first_request_requires_a_tool_then_returns_to_auto():
     agent = SimpleNamespace(
         request_overrides={},
         _plane_first_required_tool="plane_execute_typescript",
     )
 
     first = _request(agent, [_PLANE_TOOL])
-    assert first["tool_choice"] == {
-        "type": "function",
-        "name": "plane_execute_typescript",
-    }
+    assert first["tool_choice"] == "required"
 
     # The conversation loop clears the finite hint after the first matching
     # tool invocation. The same transport path then uses its normal auto mode.
@@ -66,4 +63,3 @@ def test_invalid_or_absent_required_tool_hint_never_forces_a_choice():
         _plane_first_required_tool="plane_execute_typescript",
     )
     assert _request(absent, [_OTHER_TOOL])["tool_choice"] == "auto"
-
