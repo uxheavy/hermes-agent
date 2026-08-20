@@ -2104,6 +2104,44 @@ print("text_response")
         self.assertEqual(len(requests), 1)
         self.assertEqual(requests[0]["input"], {"preparedCallRef": "prepared-call:opaque"})
 
+    def test_registry_normalizes_bare_and_input_wrapped_prepared_read_refs(self) -> None:
+        install_plane_tools()
+        requests: list[dict] = []
+
+        def rpc(request: dict) -> dict:
+            requests.append(request)
+            return _result(request, output={"work_item": {"title": "assigned"}})
+
+        binding = PlaneHostBinding(
+            port=CallablePlaneHostPort(rpc),
+            run_id="run:bare-prepared-envelope",
+            invocation_id="invocation:bare-prepared-envelope",
+            correlation_id="correlation:bare-prepared-envelope",
+            cancellation=lambda: False,
+        )
+        with bind_plane_host(binding):
+            for input_value in (
+                {"preparedCallRef": "prepared-call:bare"},
+                {"input": {"preparedCallRef": "prepared-call:input-wrapper"}},
+            ):
+                result = registry.dispatch(
+                    "plane_operation",
+                    {
+                        "action": "read",
+                        "operationRef": "operation:work_item.read",
+                        "input": input_value,
+                    },
+                )
+                self.assertIn('"status":"ok"', result)
+
+        self.assertEqual(
+            [request["input"] for request in requests],
+            [
+                {"preparedCallRef": "prepared-call:bare"},
+                {"preparedCallRef": "prepared-call:input-wrapper"},
+            ],
+        )
+
     def test_named_prepared_read_wrapper_rejects_tamper_shapes(self) -> None:
         install_plane_tools()
         requests: list[dict] = []
@@ -2143,6 +2181,51 @@ print("text_response")
                     "operationRef": "operation:work_item.read",
                     "input": {"preparedCallRef": "prepared-call:" + "x" * 256},
                 }
+            },
+        )
+        with bind_plane_host(binding):
+            for shape in shapes:
+                result = registry.dispatch(
+                    "plane_operation",
+                    {
+                        "action": "read",
+                        "operationRef": "operation:work_item.read",
+                        "input": shape,
+                    },
+                )
+                self.assertIn('"status":"ok"', result)
+
+        self.assertEqual([request["input"] for request in requests], list(shapes))
+
+    def test_prepared_read_unwrap_rejects_extra_and_deep_wrappers(self) -> None:
+        install_plane_tools()
+        requests: list[dict] = []
+
+        def rpc(request: dict) -> dict:
+            requests.append(request)
+            return _result(request, output={"accepted": True})
+
+        binding = PlaneHostBinding(
+            port=CallablePlaneHostPort(rpc),
+            run_id="run:prepared-envelope-depth",
+            invocation_id="invocation:prepared-envelope-depth",
+            correlation_id="correlation:prepared-envelope-depth",
+            cancellation=lambda: False,
+        )
+        shapes = (
+            {"preparedCallRef": "prepared-call:opaque", "extra": True},
+            {"preparedCallRef": "not-a-prepared-call"},
+            {"preparedCallRef": "prepared-call:" + "x" * 256},
+            {"input": {"input": {"preparedCallRef": "prepared-call:opaque"}}},
+            {"workItemReadCall": {"preparedCallRef": "prepared-call:opaque"}},
+            {
+                "action": "read",
+                "operationRef": "operation:work_item.read",
+                "input": {
+                    "action": "mutate",
+                    "operationRef": "operation:work_item.read",
+                    "input": {"preparedCallRef": "prepared-call:opaque"},
+                },
             },
         )
         with bind_plane_host(binding):

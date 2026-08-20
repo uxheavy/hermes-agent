@@ -469,41 +469,53 @@ def _prepared_read_ref_from_search_result(output: Any) -> str | None:
 def _normalize_prepared_read_input(
     action: str, operation_ref: str, input_value: Mapping[str, Any]
 ) -> Mapping[str, Any]:
-    """Accept the exact ready-to-call read envelope without widening the port.
+    """Accept only finite, lossless shapes of the prepared read handoff.
 
-    ``search_workspace`` returns a complete ``workItemReadCall`` object. A
-    model can reasonably copy that object into ``plane_operation.input`` even
-    though the host callback already receives ``action`` and ``operationRef``
-    at the top level. Only that exact, operation-bound shape is collapsed to
-    the canonical opaque reference input; all other shapes remain untouched
-    and are rejected by the trusted Plane host.
+    The model-facing search result can reach the host callback as the opaque
+    reference itself, one ``input`` wrapper, the complete ready-to-call
+    envelope, or one named ``workItemReadCall`` wrapper around that envelope.
+    These branches are deliberately explicit rather than recursive: only the
+    exact read binding and one bounded opaque reference are collapsed to the
+    canonical input; every other shape remains untouched for Plane to reject.
     """
 
     if action != "read" or operation_ref != "operation:work_item.read":
         return input_value
-    candidate = input_value
-    if set(candidate) == {"workItemReadCall"}:
-        wrapped = candidate.get("workItemReadCall")
-        if not isinstance(wrapped, Mapping):
-            return input_value
-        candidate = wrapped
-    if set(candidate) != {"action", "operationRef", "input"}:
-        return input_value
-    if (
-        candidate.get("action") != "read"
-        or candidate.get("operationRef") != operation_ref
-    ):
-        return input_value
-    nested_input = candidate.get("input")
-    if (
-        not isinstance(nested_input, Mapping)
-        or set(nested_input) != {"preparedCallRef"}
-        or not isinstance(nested_input.get("preparedCallRef"), str)
-        or not nested_input["preparedCallRef"].startswith("prepared-call:")
-        or len(nested_input["preparedCallRef"].encode("utf-8")) > 256
-    ):
-        return input_value
-    return {"preparedCallRef": nested_input["preparedCallRef"]}
+
+    def canonical_ref(candidate: Any) -> Mapping[str, Any] | None:
+        if (
+            not isinstance(candidate, Mapping)
+            or set(candidate) != {"preparedCallRef"}
+            or not isinstance(candidate.get("preparedCallRef"), str)
+            or not candidate["preparedCallRef"].startswith("prepared-call:")
+            or len(candidate["preparedCallRef"].encode("utf-8")) > 256
+        ):
+            return None
+        return {"preparedCallRef": candidate["preparedCallRef"]}
+
+    def ready_envelope(candidate: Any) -> Mapping[str, Any] | None:
+        if (
+            not isinstance(candidate, Mapping)
+            or set(candidate) != {"action", "operationRef", "input"}
+            or candidate.get("action") != "read"
+            or candidate.get("operationRef") != operation_ref
+        ):
+            return None
+        return canonical_ref(candidate.get("input"))
+
+    # The four accepted forms are intentionally enumerated.  In particular,
+    # a named wrapper may contain only the ready envelope, not another wrapper.
+    if set(input_value) == {"preparedCallRef"}:
+        normalized = canonical_ref(input_value)
+    elif set(input_value) == {"input"}:
+        normalized = canonical_ref(input_value.get("input"))
+    elif set(input_value) == {"action", "operationRef", "input"}:
+        normalized = ready_envelope(input_value)
+    elif set(input_value) == {"workItemReadCall"}:
+        normalized = ready_envelope(input_value.get("workItemReadCall"))
+    else:
+        normalized = None
+    return normalized if normalized is not None else input_value
 
 
 class UnixSocketPlaneHostPort:
