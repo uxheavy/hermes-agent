@@ -2070,6 +2070,95 @@ print("text_response")
         self.assertEqual(len(requests), 1)
         self.assertEqual(requests[0]["input"], tampered)
 
+    def test_registry_normalizes_named_ready_to_call_prepared_read_wrapper(self) -> None:
+        install_plane_tools()
+        requests: list[dict] = []
+
+        def rpc(request: dict) -> dict:
+            requests.append(request)
+            return _result(request, output={"work_item": {"title": "assigned"}})
+
+        binding = PlaneHostBinding(
+            port=CallablePlaneHostPort(rpc),
+            run_id="run:named-prepared-envelope",
+            invocation_id="invocation:named-prepared-envelope",
+            correlation_id="correlation:named-prepared-envelope",
+            cancellation=lambda: False,
+        )
+        ready_to_call = {
+            "action": "read",
+            "operationRef": "operation:work_item.read",
+            "input": {"preparedCallRef": "prepared-call:opaque"},
+        }
+        with bind_plane_host(binding):
+            result = registry.dispatch(
+                "plane_operation",
+                {
+                    "action": "read",
+                    "operationRef": "operation:work_item.read",
+                    "input": {"workItemReadCall": ready_to_call},
+                },
+            )
+
+        self.assertIn('"status":"ok"', result)
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(requests[0]["input"], {"preparedCallRef": "prepared-call:opaque"})
+
+    def test_named_prepared_read_wrapper_rejects_tamper_shapes(self) -> None:
+        install_plane_tools()
+        requests: list[dict] = []
+
+        def rpc(request: dict) -> dict:
+            requests.append(request)
+            return _result(request, output={"accepted": True})
+
+        binding = PlaneHostBinding(
+            port=CallablePlaneHostPort(rpc),
+            run_id="run:named-prepared-envelope-tamper",
+            invocation_id="invocation:named-prepared-envelope-tamper",
+            correlation_id="correlation:named-prepared-envelope-tamper",
+            cancellation=lambda: False,
+        )
+        shapes = (
+            {
+                "workItemReadCall": {
+                    "action": "read",
+                    "operationRef": "operation:work_item.read",
+                    "input": {
+                        "preparedCallRef": "prepared-call:opaque",
+                        "issue_id": "should-not-be-forwarded",
+                    },
+                }
+            },
+            {
+                "workItemReadCall": {
+                    "action": "read",
+                    "operationRef": "operation:work_item.rename",
+                    "input": {"preparedCallRef": "prepared-call:opaque"},
+                }
+            },
+            {
+                "workItemReadCall": {
+                    "action": "read",
+                    "operationRef": "operation:work_item.read",
+                    "input": {"preparedCallRef": "prepared-call:" + "x" * 256},
+                }
+            },
+        )
+        with bind_plane_host(binding):
+            for shape in shapes:
+                result = registry.dispatch(
+                    "plane_operation",
+                    {
+                        "action": "read",
+                        "operationRef": "operation:work_item.read",
+                        "input": shape,
+                    },
+                )
+                self.assertIn('"status":"ok"', result)
+
+        self.assertEqual([request["input"] for request in requests], list(shapes))
+
     def test_real_aiagent_loop_reaches_read_mutation_code_and_explicit_publication(self) -> None:
         """Use a deterministic provider boundary, not a fake Hermes agent."""
 

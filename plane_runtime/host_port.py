@@ -479,22 +479,22 @@ def _normalize_prepared_read_input(
     and are rejected by the trusted Plane host.
     """
 
-    if (
-        action != "read"
-        or operation_ref != "operation:work_item.read"
-        or set(input_value) != {
-            "action",
-            "operationRef",
-            "input",
-        }
-    ):
+    if action != "read" or operation_ref != "operation:work_item.read":
+        return input_value
+    candidate = input_value
+    if set(candidate) == {"workItemReadCall"}:
+        wrapped = candidate.get("workItemReadCall")
+        if not isinstance(wrapped, Mapping):
+            return input_value
+        candidate = wrapped
+    if set(candidate) != {"action", "operationRef", "input"}:
         return input_value
     if (
-        input_value.get("action") != "read"
-        or input_value.get("operationRef") != operation_ref
+        candidate.get("action") != "read"
+        or candidate.get("operationRef") != operation_ref
     ):
         return input_value
-    nested_input = input_value.get("input")
+    nested_input = candidate.get("input")
     if (
         not isinstance(nested_input, Mapping)
         or set(nested_input) != {"preparedCallRef"}
