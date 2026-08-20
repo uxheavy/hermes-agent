@@ -2816,6 +2816,206 @@ print("text_response")
             ["ordinary final evidence"],
         )
 
+    def test_real_hermes_adapter_recovers_from_early_publish_before_code_mode(self) -> None:
+        """A validation result must let the model correct its publish ordering."""
+
+        from tests.plane_runtime.test_g1_runtime_process import (
+            G1InvocationEnvelope,
+            G1RunSnapshot,
+            _digest,
+            make_invocation,
+            make_snapshot,
+        )
+        from plane_runtime.hermes_adapter import HermesKernelAdapter
+        from run_agent import AIAgent
+
+        snapshot_raw = make_snapshot()
+        snapshot_raw["runtimePolicy"] = dict(snapshot_raw["runtimePolicy"])  # type: ignore[index]
+        snapshot_raw["runtimePolicy"]["adapter"] = "hermes"  # type: ignore[index]
+        snapshot_raw["runtimePolicy"]["model"] = {  # type: ignore[index]
+            "provider": "openai",
+            "model": "deterministic-local",
+        }
+        snapshot_raw["runtimePolicy"].update(  # type: ignore[union-attr]
+            {
+                "maxCodeModeInputBytes": 65_536,
+                "maxCodeModeOutputBytes": 65_536,
+                "maxCodeModeCalls": 4,
+            }
+        )
+        snapshot_raw["contentDigest"] = _digest(  # type: ignore[assignment]
+            "snapshot",
+            {key: value for key, value in snapshot_raw.items() if key != "contentDigest"},
+        )
+        snapshot = G1RunSnapshot.from_dict(snapshot_raw)
+        invocation = G1InvocationEnvelope.from_dict(make_invocation(snapshot.to_dict()))
+
+        class Completions:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            @staticmethod
+            def tool_call(name: str, arguments: dict[str, object], call_id: str):
+                return SimpleNamespace(
+                    id=call_id,
+                    function=SimpleNamespace(
+                        name=name,
+                        arguments=json.dumps(arguments),
+                    ),
+                    extra_content=None,
+                )
+
+            def create(self, **_kwargs: object):
+                self.calls += 1
+                if self.calls == 1:
+                    tool_calls = [
+                        self.tool_call(
+                            "tool_call",
+                            {
+                                "name": "plane_publish",
+                                "arguments": {
+                                    "kind": "outcome",
+                                    "operationRef": PLANE_OUTCOME_PUBLISH_OPERATION,
+                                    "resourceRef": "outcome-submission:test",
+                                    "content": "premature publication",
+                                },
+                            },
+                            "call-early-publish",
+                        )
+                    ]
+                elif self.calls == 2:
+                    tool_calls = [
+                        self.tool_call(
+                            "tool_call",
+                            {
+                                "name": "plane_execute_typescript",
+                                "arguments": {
+                                    "typescript_source": (
+                                        "export default async ({ host, input }) => ({"
+                                        " accepted: true, input"
+                                        "});"
+                                    )
+                                },
+                            },
+                            "call-code-mode",
+                        )
+                    ]
+                elif self.calls == 3:
+                    tool_calls = [
+                        self.tool_call(
+                            "tool_call",
+                            {
+                                "name": "plane_publish",
+                                "arguments": {
+                                    "kind": "outcome",
+                                    "operationRef": PLANE_OUTCOME_PUBLISH_OPERATION,
+                                    "resourceRef": "outcome-submission:test",
+                                    "content": "corrected publication",
+                                },
+                            },
+                            "call-corrected-publish",
+                        )
+                    ]
+                else:
+                    tool_calls = []
+                if tool_calls:
+                    message = SimpleNamespace(
+                        content=None,
+                        tool_calls=tool_calls,
+                        reasoning=None,
+                        reasoning_content=None,
+                        refusal=None,
+                    )
+                    finish_reason = "tool_calls"
+                else:
+                    message = SimpleNamespace(
+                        content="ordinary final evidence",
+                        tool_calls=None,
+                        reasoning=None,
+                        reasoning_content=None,
+                        refusal=None,
+                    )
+                    finish_reason = "stop"
+                return SimpleNamespace(
+                    choices=[SimpleNamespace(finish_reason=finish_reason, message=message)],
+                    usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+                )
+
+        completions = Completions()
+
+        class Client:
+            chat = SimpleNamespace(completions=completions)
+
+        class Credentials:
+            def resolve(self, provider: str) -> dict[str, str]:
+                del provider
+                return {"api_key": "model-only-secret", "base_url": "http://127.0.0.1"}
+
+        def agent_factory(**kwargs: object) -> AIAgent:
+            agent = AIAgent(**kwargs)
+            agent._create_request_openai_client = lambda **_: Client()  # type: ignore[method-assign]
+            return agent
+
+        requests: list[dict] = []
+        code_completed = False
+
+        def rpc(request: dict) -> dict:
+            nonlocal code_completed
+            requests.append(request)
+            if request["action"] == "publish" and not code_completed:
+                return _result(
+                    request,
+                    status="invalid",
+                    output={"error": "bounded validation result"},
+                    errorCode="VALIDATION_ERROR",
+                    errorMessage="outcome publication requires the code-mode step",
+                )
+            if request["action"] == "code":
+                code_completed = True
+                return _result(request, output={"accepted": True})
+            if request["action"] == "publish":
+                return _result(
+                    request,
+                    publication=_applied_outcome_publication(),
+                    output={"published": True},
+                )
+            raise AssertionError(
+                "event=plane_publish_order expected=publish_or_code "
+                f"actual={request['action']}"
+            )
+
+        bodies: list[dict] = []
+        with mock.patch.dict(os.environ, {"HERMES_HOME": _TEST_HERMES_HOME.name}):
+            import run_agent
+
+            run_agent._hermes_home = Path(_TEST_HERMES_HOME.name)
+            result = HermesKernelAdapter(
+                agent_factory=agent_factory,
+                credential_source=Credentials(),
+                host_port=CallablePlaneHostPort(rpc),
+            ).dispatch(
+                snapshot,
+                invocation,
+                lambda: False,
+                bodies.append,
+                model_call_allowance=4,
+            )
+
+        self.assertEqual(result.kind, "completed")
+        self.assertIsNone(result.failure_code)
+        self.assertEqual(completions.calls, 3)
+        self.assertEqual(
+            [(request["action"], request["source"]) for request in requests],
+            [("publish", "model"), ("code", "code"), ("publish", "model")],
+            json.dumps({"requests": requests, "bodies": bodies}),
+        )
+        self.assertTrue(code_completed)
+        self.assertEqual(
+            sum(body["kind"] == "outcome_submission_observed" for body in bodies),
+            1,
+        )
+        self.assertFalse(any(body["kind"] == "transcript_evidence_observed" for body in bodies))
+
     def test_ungranted_snapshot_cannot_enable_plane_code_mode_from_adapter_override(self) -> None:
         from tests.plane_runtime.test_g1_runtime_process import (
             G1InvocationEnvelope,

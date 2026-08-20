@@ -980,7 +980,10 @@ class PlaneHostBinding:
             source="model",
         )
         if result.status not in {"ok", "replayed"}:
-            if result.status == "conflict" and result.error_code == "PLANE_CONFLICT":
+            if (
+                _host_result_disposition(result) == "continue_with_tool_result"
+                and result.status in {"invalid", "conflict"}
+            ):
                 return result
             self._fail("explicit publication was not authorized by the Plane host")
             return result
