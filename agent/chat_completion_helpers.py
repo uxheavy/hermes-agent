@@ -57,6 +57,44 @@ _OPENROUTER_PROVIDER_SORT_VALUES = {"throughput", "latency", "price"}
 # narrower non-rate-limit case.  See issue #24996.
 _FALLBACK_EXHAUSTED_COOLDOWN_S = 5.0
 
+# Plane's Code Mode contract uses one finite, trusted first-action hint.  It
+# is presentation state installed by the Plane runtime adapter, not a caller
+# supplied provider override.  Keep the transport override derived here so
+# the existing Codex Responses path emits a named choice for only the first
+# productive request; once the adapter consumes the hint, the transport's
+# normal ``auto`` default resumes.
+_PLANE_FIRST_REQUIRED_TOOL = "plane_execute_typescript"
+
+
+def _plane_codex_request_overrides(agent, tools):
+    """Return request overrides with Plane's bounded first-tool choice.
+
+    Only the finite adapter-owned hint can add this override.  In particular,
+    a missing/unknown hint or an exposed toolset without the required tool
+    leaves the existing request-overrides and transport defaults unchanged.
+    """
+    configured = getattr(agent, "request_overrides", None)
+    overrides = dict(configured) if isinstance(configured, dict) else {}
+    if getattr(agent, "_plane_first_required_tool", None) != _PLANE_FIRST_REQUIRED_TOOL:
+        return overrides
+
+    def _tool_name(tool):
+        if not isinstance(tool, dict):
+            return None
+        if tool.get("name") == _PLANE_FIRST_REQUIRED_TOOL:
+            return tool["name"]
+        function = tool.get("function")
+        if isinstance(function, dict) and function.get("name") == _PLANE_FIRST_REQUIRED_TOOL:
+            return function["name"]
+        return None
+
+    if any(_tool_name(tool) == _PLANE_FIRST_REQUIRED_TOOL for tool in (tools or [])):
+        overrides["tool_choice"] = {
+            "type": "function",
+            "name": _PLANE_FIRST_REQUIRED_TOOL,
+        }
+    return overrides
+
 
 def _context_thread_target(callback):
     """Bind a no-argument thread target to the caller's ContextVars."""
@@ -1224,7 +1262,7 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
             base_url=agent.base_url,
             max_tokens=agent.max_tokens,
             timeout=agent._resolved_api_call_timeout(),
-            request_overrides=agent.request_overrides,
+            request_overrides=_plane_codex_request_overrides(agent, tools_for_api),
             is_github_responses=is_github_responses,
             is_codex_backend=is_codex_backend,
             is_xai_responses=is_xai_responses,
