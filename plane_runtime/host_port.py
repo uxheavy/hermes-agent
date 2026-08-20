@@ -466,6 +466,46 @@ def _prepared_read_ref_from_search_result(output: Any) -> str | None:
     return refs[0] if len(refs) == 1 else None
 
 
+def _normalize_prepared_read_input(
+    action: str, operation_ref: str, input_value: Mapping[str, Any]
+) -> Mapping[str, Any]:
+    """Accept the exact ready-to-call read envelope without widening the port.
+
+    ``search_workspace`` returns a complete ``workItemReadCall`` object. A
+    model can reasonably copy that object into ``plane_operation.input`` even
+    though the host callback already receives ``action`` and ``operationRef``
+    at the top level. Only that exact, operation-bound shape is collapsed to
+    the canonical opaque reference input; all other shapes remain untouched
+    and are rejected by the trusted Plane host.
+    """
+
+    if (
+        action != "read"
+        or operation_ref != "operation:work_item.read"
+        or set(input_value) != {
+            "action",
+            "operationRef",
+            "input",
+        }
+    ):
+        return input_value
+    if (
+        input_value.get("action") != "read"
+        or input_value.get("operationRef") != operation_ref
+    ):
+        return input_value
+    nested_input = input_value.get("input")
+    if (
+        not isinstance(nested_input, Mapping)
+        or set(nested_input) != {"preparedCallRef"}
+        or not isinstance(nested_input.get("preparedCallRef"), str)
+        or not nested_input["preparedCallRef"].startswith("prepared-call:")
+        or len(nested_input["preparedCallRef"].encode("utf-8")) > 256
+    ):
+        return input_value
+    return {"preparedCallRef": nested_input["preparedCallRef"]}
+
+
 class UnixSocketPlaneHostPort:
     """Invocation-scoped canonical JSONL client for the trusted Plane host.
 
@@ -1340,6 +1380,9 @@ def _handle_plane_operation(args: Mapping[str, Any], **_: Any) -> str:
             operation_ref, "plane_operation.operationRef", MAX_HOST_OPERATION_REF_BYTES
         )
         input_value = _object(data.get("input", {}), "plane_operation.input")
+        input_value = dict(
+            _normalize_prepared_read_input(action, operation_ref, input_value)
+        )
         if action == "code" and not _PLANE_CODE_MODE.get():
             raise PlaneHostError(
                 "plane_operation code action is restricted to plane_execute_typescript"
