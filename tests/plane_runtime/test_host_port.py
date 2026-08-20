@@ -3016,6 +3016,225 @@ print("text_response")
         )
         self.assertFalse(any(body["kind"] == "transcript_evidence_observed" for body in bodies))
 
+    def test_code_mode_requires_first_tool_after_final_text_and_releases_choice(self) -> None:
+        """A final-text first response is recalled before Code Mode can publish."""
+
+        from tests.plane_runtime.test_g1_runtime_process import (
+            G1InvocationEnvelope,
+            G1RunSnapshot,
+            _digest,
+            make_invocation,
+            make_snapshot,
+        )
+        from plane_runtime.hermes_adapter import HermesKernelAdapter
+        from run_agent import AIAgent
+
+        snapshot_raw = make_snapshot()
+        snapshot_raw["toolCatalog"] = dict(snapshot_raw["toolCatalog"])  # type: ignore[index]
+        snapshot_raw["toolCatalog"]["modelToolset"] = "code_mode_only"  # type: ignore[index]
+        snapshot_raw["runtimePolicy"] = dict(snapshot_raw["runtimePolicy"])  # type: ignore[index]
+        snapshot_raw["runtimePolicy"].update(  # type: ignore[union-attr]
+            {
+                "adapter": "hermes",
+                "model": {"provider": "openai", "model": "deterministic-local"},
+                "maxCodeModeInputBytes": 65_536,
+                "maxCodeModeOutputBytes": 65_536,
+                "maxCodeModeCalls": 4,
+            }
+        )
+        snapshot_raw["contentDigest"] = _digest(
+            "snapshot",
+            {key: value for key, value in snapshot_raw.items() if key != "contentDigest"},
+        )
+        snapshot = G1RunSnapshot.from_dict(snapshot_raw)
+        invocation = G1InvocationEnvelope.from_dict(make_invocation(snapshot.to_dict()))
+
+        class Completions:
+            def __init__(self) -> None:
+                self.calls = 0
+                self.tool_choices: list[object] = []
+
+            @staticmethod
+            def tool_call(arguments: dict[str, object], call_id: str):
+                return SimpleNamespace(
+                    id=call_id,
+                    function=SimpleNamespace(
+                        name="tool_call", arguments=json.dumps(arguments)
+                    ),
+                    extra_content=None,
+                )
+
+            def create(self, **kwargs: object):
+                self.calls += 1
+                self.tool_choices.append(kwargs.get("tool_choice"))
+                if self.calls == 1:
+                    message = SimpleNamespace(
+                        content="ordinary final text before the required action",
+                        tool_calls=None,
+                        reasoning=None,
+                        reasoning_content=None,
+                        refusal=None,
+                    )
+                    finish_reason = "stop"
+                elif self.calls == 2:
+                    tool_calls = [
+                        self.tool_call(
+                            {
+                                "name": "plane_execute_typescript",
+                                "arguments": {
+                                    "typescript_source": "export default async ({ host }) => ({ accepted: true });"
+                                },
+                            },
+                            "call-code-mode",
+                        )
+                    ]
+                    message = SimpleNamespace(
+                        content=None,
+                        tool_calls=tool_calls,
+                        reasoning=None,
+                        reasoning_content=None,
+                        refusal=None,
+                    )
+                    finish_reason = "tool_calls"
+                elif self.calls == 3:
+                    tool_calls = [
+                        self.tool_call(
+                            {
+                                "name": "plane_publish",
+                                "arguments": {
+                                    "kind": "conversation",
+                                    "operationRef": "operation:conversation-publish",
+                                    "resourceRef": "conversation:test",
+                                    "content": "explicit publication",
+                                },
+                            },
+                            "call-publish",
+                        )
+                    ]
+                    message = SimpleNamespace(
+                        content=None,
+                        tool_calls=tool_calls,
+                        reasoning=None,
+                        reasoning_content=None,
+                        refusal=None,
+                    )
+                    finish_reason = "tool_calls"
+                else:
+                    message = SimpleNamespace(
+                        content="ordinary final evidence",
+                        tool_calls=None,
+                        reasoning=None,
+                        reasoning_content=None,
+                        refusal=None,
+                    )
+                    finish_reason = "stop"
+                return SimpleNamespace(
+                    choices=[SimpleNamespace(finish_reason=finish_reason, message=message)],
+                    usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+                )
+
+        completions = Completions()
+
+        class Client:
+            chat = SimpleNamespace(completions=completions)
+
+        class Credentials:
+            def resolve(self, provider: str) -> dict[str, str]:
+                del provider
+                return {
+                    "api_key": "model-only-secret",
+                    "base_url": "http://127.0.0.1",
+                    "api_mode": "chat_completions",
+                }
+
+        def agent_factory(**kwargs: object) -> AIAgent:
+            agent = AIAgent(**kwargs)
+            agent._create_request_openai_client = lambda **_: Client()  # type: ignore[method-assign]
+            return agent
+
+        requests: list[dict] = []
+
+        def rpc(request: dict) -> dict:
+            requests.append(request)
+            if request["action"] == "publish":
+                publication = _applied_outcome_publication(
+                    operation_ref="operation:conversation-publish"
+                )
+                publication.update(
+                    productKind="conversation", productRef="conversation:test"
+                )
+                return _result(request, output={"published": True}, publication=publication)
+            return _result(request, output={"accepted": True})
+
+        with mock.patch.dict(os.environ, {"HERMES_HOME": _TEST_HERMES_HOME.name}):
+            import run_agent
+
+            run_agent._hermes_home = Path(_TEST_HERMES_HOME.name)
+            result = HermesKernelAdapter(
+                agent_factory=agent_factory,
+                credential_source=Credentials(),
+                host_port=CallablePlaneHostPort(rpc),
+            ).dispatch(
+                snapshot,
+                invocation,
+                lambda: False,
+                lambda body: None,
+                model_call_allowance=4,
+            )
+
+        self.assertEqual(result.kind, "completed", result)
+        self.assertEqual(
+            [request["action"] for request in requests], ["code", "publish"]
+        )
+        self.assertEqual(completions.tool_choices[0], {
+            "type": "function", "name": "plane_execute_typescript"
+        })
+        self.assertEqual(completions.tool_choices[1], {
+            "type": "function", "name": "plane_execute_typescript"
+        })
+        self.assertIsNone(completions.tool_choices[2])
+
+    def test_code_mode_fails_closed_when_first_tool_is_not_registered(self) -> None:
+        from tests.plane_runtime.test_g1_runtime_process import (
+            G1InvocationEnvelope,
+            G1RunSnapshot,
+            _digest,
+            make_invocation,
+            make_snapshot,
+        )
+        from plane_runtime.hermes_adapter import HermesKernelAdapter
+
+        raw = make_snapshot()
+        raw["toolCatalog"] = dict(raw["toolCatalog"])  # type: ignore[index]
+        raw["toolCatalog"]["modelToolset"] = "code_mode_only"  # type: ignore[index]
+        raw["contentDigest"] = _digest(
+            "snapshot", {key: value for key, value in raw.items() if key != "contentDigest"}
+        )
+        snapshot = G1RunSnapshot.from_dict(raw)
+        invocation = G1InvocationEnvelope.from_dict(make_invocation(snapshot.to_dict()))
+
+        class Agent:
+            valid_tool_names = {"plane_publish"}
+            request_overrides: dict[str, object] = {}
+
+            def run_conversation(self, *args: object, **kwargs: object) -> dict[str, object]:
+                raise AssertionError("agent must not run without the required tool")
+
+        class Credentials:
+            def resolve(self, provider: str) -> dict[str, str]:
+                del provider
+                return {"api_key": "secret"}
+
+        with mock.patch.object(registry, "get_entry", return_value=None):
+            result = HermesKernelAdapter(
+                agent_factory=lambda **kwargs: Agent(),
+                credential_source=Credentials(),
+                host_port=CallablePlaneHostPort(lambda request: _result(request)),
+            ).dispatch(snapshot, invocation, lambda: False, lambda body: None, model_call_allowance=1)
+
+        self.assertEqual(result.kind, "failed")
+        self.assertEqual(result.failure_cause, "static_configuration_failure")
+
     def test_ungranted_snapshot_cannot_enable_plane_code_mode_from_adapter_override(self) -> None:
         from tests.plane_runtime.test_g1_runtime_process import (
             G1InvocationEnvelope,

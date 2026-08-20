@@ -113,6 +113,34 @@ _API_CALL_MODULES = frozenset({
 })
 
 
+def _consume_plane_first_required_tool(agent: Any, tool_calls: Any) -> None:
+    """Release the adapter-owned first-tool choice after its valid call."""
+
+    required = getattr(agent, "_plane_first_required_tool", None)
+    if not isinstance(required, str) or not required:
+        return
+    def _name(call: Any) -> str | None:
+        function = getattr(call, "function", None)
+        name = getattr(function, "name", None)
+        if name == required:
+            return name
+        if name != "tool_call":
+            return None
+        try:
+            arguments = json.loads(getattr(function, "arguments", "{}"))
+        except (TypeError, json.JSONDecodeError):
+            return None
+        nested = arguments.get("name") if isinstance(arguments, dict) else None
+        return nested if isinstance(nested, str) else None
+
+    if not any(_name(call) == required for call in (tool_calls or [])):
+        return
+    setattr(agent, "_plane_first_required_tool", None)
+    request_overrides = dict(getattr(agent, "request_overrides", {}) or {})
+    request_overrides.pop("tool_choice", None)
+    agent.request_overrides = request_overrides
+
+
 def _apply_active_turn_redirect(agent: Any, messages: List[Dict[str, Any]], text: str) -> None:
     """Append a provider-safe checkpoint and correction to the live turn.
 
@@ -5989,6 +6017,8 @@ def run_conversation(
                 # Reset retry counter on successful JSON validation
                 agent._invalid_json_retries = 0
 
+                _consume_plane_first_required_tool(agent, assistant_message.tool_calls)
+
                 # ── Post-call guardrails ──────────────────────────
                 assistant_message.tool_calls = agent._cap_delegate_task_calls(
                     assistant_message.tool_calls
@@ -6407,6 +6437,32 @@ def run_conversation(
                 # an empty tool_calls array — is handled at the finalization
                 # chokepoint below, after final_msg is built, so it catches
                 # every path that reaches turn finalization, not just this one.)
+                required_first_tool = getattr(agent, "_plane_first_required_tool", None)
+                if isinstance(required_first_tool, str) and required_first_tool:
+                    retries = int(getattr(agent, "_plane_first_required_tool_retries", 0))
+                    if retries == 0:
+                        agent._plane_first_required_tool_retries = 1
+                        messages.append(
+                            agent._build_assistant_message(assistant_message, finish_reason)
+                        )
+                        messages.append(
+                            {
+                                "role": "user",
+                                "content": (
+                                    "The first productive action must use the required "
+                                    f"tool {required_first_tool}. Invoke it now."
+                                ),
+                            }
+                        )
+                        continue
+                    agent._plane_first_required_tool = None
+                    request_overrides = dict(getattr(agent, "request_overrides", {}) or {})
+                    request_overrides.pop("tool_choice", None)
+                    agent.request_overrides = request_overrides
+                    final_response = "Required Code Mode tool was not invoked."
+                    failed = True
+                    _turn_exit_reason = "required_first_tool_not_invoked"
+                    break
                 final_response = assistant_message.content or ""
                 
                 # Fix: unmute output when entering the no-tool-call branch

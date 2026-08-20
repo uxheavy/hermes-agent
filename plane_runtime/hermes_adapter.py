@@ -55,6 +55,7 @@ _CODE_MODE_RUNTIME_POLICY_FIELDS = (
     "maxCodeModeOutputBytes",
     "maxCodeModeCalls",
 )
+_CODE_MODE_FIRST_REQUIRED_TOOL = "plane_execute_typescript"
 _OUTCOME_UNKNOWN_RUNTIME_MESSAGE = (
     "Provider outcome is unknown; Plane reconciliation is required before retrying."
 )
@@ -477,6 +478,14 @@ def _plane_model_toolsets(snapshot: G1RunSnapshot) -> tuple[str, ...]:
     if snapshot.model_toolset == "standard":
         return (PLANE_OPERATION_TOOLSET, PLANE_PUBLICATION_TOOLSET, PLANE_CODE_MODE_TOOLSET)
     raise G1ContractError("snapshot.modelToolset is unsupported")
+
+
+def _plane_first_required_tool(snapshot: G1RunSnapshot) -> str | None:
+    """Return the finite first-tool requirement for Code Mode-only runs."""
+
+    if snapshot.model_toolset == "code_mode_only":
+        return _CODE_MODE_FIRST_REQUIRED_TOOL
+    return None
 
 
 def _strict_json_object(raw: bytes, expected: set[str], name: str) -> dict[str, Any]:
@@ -1113,6 +1122,31 @@ class HermesKernelAdapter:
         )
         try:
             agent = self._agent_factory(**agent_kwargs)
+            first_required_tool = _plane_first_required_tool(snapshot)
+            if first_required_tool is not None:
+                try:
+                    from tools.registry import registry
+
+                    first_tool_registered = registry.get_entry(first_required_tool) is not None
+                except Exception:
+                    first_tool_registered = False
+                if not first_tool_registered:
+                    return HermesKernelResult(
+                        kind="failed",
+                        failure_code="runtime_error",
+                        failure_message="Code Mode first tool registry is unavailable",
+                        failure_cause="static_configuration_failure",
+                        retryable=False,
+                        model_calls=0,
+                    )
+                request_overrides = dict(getattr(agent, "request_overrides", {}) or {})
+                request_overrides["tool_choice"] = {
+                    "type": "function",
+                    "name": first_required_tool,
+                }
+                agent.request_overrides = request_overrides
+                setattr(agent, "_plane_first_required_tool", first_required_tool)
+                setattr(agent, "_plane_first_required_tool_retries", 0)
             if host_binding is not None:
                 setattr(agent, "_terminal_action_check", host_binding.terminal_action_reason)
                 setattr(
