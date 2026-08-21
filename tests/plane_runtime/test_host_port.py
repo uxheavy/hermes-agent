@@ -1025,6 +1025,49 @@ print("text_response")
         self.assertEqual(binding.take_code_mode_phase_hint(), "post_search")
         self.assertIsNone(binding.take_code_mode_phase_hint())
 
+    def test_code_mode_multi_prepared_reads_stay_pending_before_text_exit(self) -> None:
+        output = {
+            "result": {
+                "ok": True,
+                "result": {
+                    "results": [
+                        {"objectType": "work_item", "workItemReadCall": "prepared-call:first"},
+                        {"objectType": "work_item", "workItemReadCall": "prepared-call:second"},
+                    ]
+                },
+            },
+            "observations": [
+                {
+                    "source": "code",
+                    "action": "code",
+                    "operationRef": "operation:search_workspace",
+                    "status": "ok",
+                }
+            ],
+        }
+        requests: list[dict] = []
+        binding = PlaneHostBinding(
+            port=CallablePlaneHostPort(
+                lambda request: requests.append(request) or _result(request, output=output)
+            ),
+            run_id="run:code-search-multi",
+            invocation_id="invocation:code-search-multi",
+            correlation_id="correlation:code-search-multi",
+            cancellation=lambda: False,
+            code_mode_phase="post_search",
+        )
+
+        binding.call(
+            action="code",
+            operation_ref="plane.code-mode.execute@1",
+            input={"source": "export default async () => ({})"},
+            source="code",
+        )
+
+        self.assertEqual(len(requests), 1)
+        self.assertTrue(binding.prepared_read_handoff_pending())
+        self.assertEqual(binding.take_code_mode_phase_hint(), "post_search")
+
     def test_non_execute_outer_code_operation_does_not_arm_continuation(self) -> None:
         output = {
             "result": {

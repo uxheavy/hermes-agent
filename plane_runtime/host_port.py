@@ -1257,6 +1257,8 @@ class PlaneHostBinding:
                     prepared_refs = _prepared_read_refs_from_code_mode_result(
                         result.output
                     )
+                    if prepared_refs:
+                        self._prepared_read_handoff_pending = True
                     if len(prepared_refs) == 1:
                         # The Plane host prepared this exact capability during
                         # the Code Mode search. Consume it here through the
