@@ -601,10 +601,11 @@ def _normalize_prepared_read_input(
     The model-facing search result can reach the host callback as the opaque
     reference itself, one ``input`` wrapper, the complete ready-to-call
     envelope, one named ``workItemReadCall`` wrapper, or that exact envelope
-    wrapped under ``preparedCallRef`` as an object or JSON string. These
-    branches are deliberately explicit rather than recursive: only the exact
-    read binding and one bounded opaque reference are collapsed to the
-    canonical input; every other shape remains untouched for Plane to reject.
+    wrapped under ``preparedCallRef`` as an object or JSON string. V84 also
+    emits one sparse wrapper with a nested canonical reference. These branches
+    are deliberately explicit rather than recursive: only the exact read
+    binding and one bounded opaque reference are collapsed to the canonical
+    input; every other shape remains untouched for Plane to reject.
     """
 
     if action != "read" or operation_ref != "operation:work_item.read":
@@ -634,10 +635,24 @@ def _normalize_prepared_read_input(
         prepared_ref = _wrapped_ready_to_call_prepared_ref(candidate)
         return canonical_ref({"preparedCallRef": prepared_ref}) if prepared_ref else None
 
+    def nested_canonical_ref(candidate: Any) -> Mapping[str, Any] | None:
+        if (
+            not isinstance(candidate, Mapping)
+            or set(candidate) != {"preparedCallRef"}
+            or not isinstance(candidate.get("preparedCallRef"), Mapping)
+        ):
+            return None
+        nested = candidate["preparedCallRef"]
+        if set(nested) != {"preparedCallRef"}:
+            return None
+        return canonical_ref(nested)
+
     # The accepted forms are intentionally enumerated. In particular, a named
     # wrapper may contain only the ready envelope, not another wrapper.
     if set(input_value) == {"preparedCallRef"}:
         normalized = canonical_ref(input_value)
+        if normalized is None:
+            normalized = nested_canonical_ref(input_value)
         if normalized is None:
             normalized = wrapped_ready_envelope(input_value["preparedCallRef"])
     elif set(input_value) == {"input"}:
