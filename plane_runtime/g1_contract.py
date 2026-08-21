@@ -30,16 +30,52 @@ MAX_EAGER_INPUT_SCHEMA_BYTES = 16 * 1024
 MAX_EAGER_PRESENTATION_BYTES = 512 * 1024
 MAX_EAGER_SCHEMA_PROPERTIES = 4096
 CODE_MODE_PHASES = frozenset({"none", "post_search"})
+RUNTIME_FAILURE_PHASES = frozenset(
+    {"agent_initialization", "tool_configuration", "conversation", "unknown"}
+)
+RUNTIME_FAILURE_EXCEPTION_CLASSES = frozenset(
+    {
+        "ModuleNotFoundError",
+        "ImportError",
+        "PermissionError",
+        "MemoryError",
+        "TimeoutError",
+        "OSError",
+        "RuntimeError",
+        "ValueError",
+        "TypeError",
+        "KeyError",
+        "AttributeError",
+        "APIConnectionError",
+        "APIError",
+        "APIResponseValidationError",
+        "APIStatusError",
+        "APITimeoutError",
+        "AuthenticationError",
+        "BadRequestError",
+        "ConflictError",
+        "InternalServerError",
+        "NotFoundError",
+        "PermissionDeniedError",
+        "RateLimitError",
+        "UnprocessableEntityError",
+        "ConnectTimeout",
+        "PoolTimeout",
+        "ReadTimeout",
+        "WriteTimeout",
+        "Unknown",
+    }
+)
 
 # Frozen bytes from the paired Plane G1 runtime contract manifest.
 G1_CONTRACT_DIGESTS = {
     "runSnapshot": "0e72f04579f8cebd00b7afee1885d0ff68ee04ee30dfd7ff3e74e9ca05cddaed",
     "invocationEnvelope": "b7a15d74406f1624cdb7cd95b42edfd1ffee596abe57e4f00ed60e2e23ded995",
     "runtimeEvent": "d0fb1c67a7424f5359f9c09ff7206ef7d3d0d6e90e62b724c4a5e4e4bc13412d",
-    "runtimeExit": "7b8fcefc9600eb1b4f8f0d4a383587489558b32ac27fa8a5d81bdf3e9443cf0b",
+    "runtimeExit": "f596e131d3d1bf94c52352fa2156d6dedf4c793f1b31d3fbd6b7a478f4401df9",
     "runtimeDurableState": "444c944ec8a5054f33c8662470529a1f4565d42ff06138438beceeef7967a0da",
 }
-G1_MANIFEST_DIGEST = "b9977eb93b0c521cba3047f96de790cd472181caaab6473440148f4797f5583d"
+G1_MANIFEST_DIGEST = "36ef7172057f3ccec5cca8a15a763ee8b933ea0500dc0609fc604ceabb9f36c0"
 
 _ROLES = {"worker", "delegator", "gardener", "chief_of_staff", "hr", "evaluator", "custom"}
 _TRIGGERS = {"initial", "human_input", "recoverable_restart", "continuation"}
@@ -676,6 +712,8 @@ def _validate_failure(value: Any, name: str = "failure") -> dict[str, Any]:
             "operationRefDigest",
             "codeModeHostStatus",
             "codeModeFailureClass",
+            "runtimePhase",
+            "exceptionClass",
         },
         name,
     )
@@ -716,6 +754,15 @@ def _validate_failure(value: Any, name: str = "failure") -> dict[str, Any]:
             "code_mode", "callback", "transport", "contract", "unknown"
         }:
             raise G1ContractError(f"{name} Code Mode diagnostic fields are invalid")
+    runtime_diagnostic_fields = {"runtimePhase", "exceptionClass"}
+    present_runtime_diagnostic_fields = runtime_diagnostic_fields.intersection(data)
+    if present_runtime_diagnostic_fields and present_runtime_diagnostic_fields != runtime_diagnostic_fields:
+        raise G1ContractError(f"{name} runtime diagnostic fields must be provided together")
+    if present_runtime_diagnostic_fields and (
+        data["runtimePhase"] not in RUNTIME_FAILURE_PHASES
+        or data["exceptionClass"] not in RUNTIME_FAILURE_EXCEPTION_CLASSES
+    ):
+        raise G1ContractError(f"{name} runtime diagnostic fields are invalid")
     _text(data["message"], f"{name}.message")
     return data
 

@@ -23,6 +23,8 @@ from .g1_contract import (
     G1RunSnapshot,
     MAX_PROMPT_BYTES,
     MAX_TEXT_BYTES,
+    RUNTIME_FAILURE_EXCEPTION_CLASSES,
+    RUNTIME_FAILURE_PHASES,
     RUNTIME_FAILURE_CAUSES,
 )
 from .host_port import (
@@ -196,6 +198,13 @@ def _classify_runtime_exception(exception: BaseException) -> str:
     if (module, name) in _PROVIDER_CLIENT_EXCEPTION_TYPES:
         return "provider_client_failure"
     return "runtime_unknown_failure"
+
+
+def _runtime_exception_class(exception: BaseException) -> str:
+    """Return an allowlisted exception class without exposing exception text."""
+
+    name = type(exception).__name__
+    return name if name in RUNTIME_FAILURE_EXCEPTION_CLASSES else "Unknown"
 
 
 class ProviderOutcomeUnknownError(RuntimeError):
@@ -660,6 +669,8 @@ class HermesKernelResult:
     model_calls: int | None = None
     failure_cause: str | None = None
     host_operation_diagnostic: Mapping[str, Any] | None = None
+    runtime_phase: str | None = None
+    exception_class: str | None = None
 
 
 def _host_operation_failure_message(
@@ -1181,6 +1192,7 @@ class HermesKernelAdapter:
         started_at = time.monotonic()
         agent: Any | None = None
         cancellation_monitor: _CancellationMonitor | None = None
+        runtime_phase = "agent_initialization"
 
         def record_host_callback(diagnostic: Mapping[str, str]) -> None:
             if agent is not None:
@@ -1210,6 +1222,7 @@ class HermesKernelAdapter:
         )
         try:
             agent = self._agent_factory(**agent_kwargs)
+            runtime_phase = "tool_configuration"
             _restrict_plane_code_mode_tools(agent, snapshot)
             first_required_tool = _plane_first_required_tool(snapshot)
             if host_binding is not None:
@@ -1266,9 +1279,11 @@ class HermesKernelAdapter:
             cancellation_monitor = _CancellationMonitor(cancellation, agent)
             cancellation_monitor.start()
             if host_binding is None:
+                runtime_phase = "conversation"
                 with contextlib.redirect_stdout(io.StringIO()):
                     result = agent.run_conversation(snapshot.objective, system_message=prompt)
             else:
+                runtime_phase = "conversation"
                 with bind_plane_host(host_binding):
                     with contextlib.redirect_stdout(io.StringIO()):
                         result = agent.run_conversation(snapshot.objective, system_message=prompt)
@@ -1375,6 +1390,12 @@ class HermesKernelAdapter:
                 retryable=True,
                 failure_cause=_classify_runtime_exception(exc),
                 model_calls=self._observed_model_calls(agent, None),
+                runtime_phase=(
+                    runtime_phase
+                    if runtime_phase in RUNTIME_FAILURE_PHASES
+                    else "unknown"
+                ),
+                exception_class=_runtime_exception_class(exc),
             )
 
         if cancellation_monitor is not None:

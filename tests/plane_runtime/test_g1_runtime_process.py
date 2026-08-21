@@ -1725,12 +1725,27 @@ class G1RuntimeProcessTests(unittest.TestCase):
             self.assertTrue(result.retryable)
             self.assertEqual(result.failure_cause, cause)
             self.assertEqual(result.failure_message, "Hermes invocation failed")
+            expected_exception_class = type(exception).__name__
+            if expected_exception_class not in {
+                "ModuleNotFoundError",
+                "ImportError",
+                "PermissionError",
+                "MemoryError",
+                "TimeoutError",
+                "RuntimeError",
+                "APIConnectionError",
+            }:
+                expected_exception_class = "Unknown"
+            self.assertEqual(result.runtime_phase, "agent_initialization")
+            self.assertEqual(result.exception_class, expected_exception_class)
             serialized = json.dumps(result.__dict__)
             for secret in ("secret", "path", "prompt", "token"):
                 self.assertNotIn(secret, serialized)
 
             exit_frame = _terminal_failure(snapshot, invocation, result, 0)
             self.assertEqual(exit_frame["failure"]["cause"], cause)
+            self.assertEqual(exit_frame["failure"]["runtimePhase"], "agent_initialization")
+            self.assertEqual(exit_frame["failure"]["exceptionClass"], expected_exception_class)
             self.assertNotIn("secret", json.dumps(exit_frame))
 
     def test_approved_checkpoint_is_loaded_once_and_prefilled_before_hermes(self) -> None:
