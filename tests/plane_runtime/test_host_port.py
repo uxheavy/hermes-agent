@@ -570,6 +570,142 @@ print("text_response")
                 ["operation:search_workspace", "operation:work_item.read"],
             )
 
+    def test_direct_search_auto_reads_opaque_ref_without_schema_redisclosure(self) -> None:
+        """The trusted prepared continuation reaches the gateway before text exit."""
+
+        requests: list[dict] = []
+
+        def respond(request: dict) -> dict:
+            requests.append(request)
+            if request["operationRef"] == "operation:search_workspace":
+                output = {
+                    "ok": True,
+                    "result": {
+                        "results": [
+                            {
+                                "objectType": "work_item",
+                                "workItemReadCall": {
+                                    "action": "read",
+                                    "operationRef": "operation:work_item.read",
+                                    "input": {"preparedCallRef": "prepared-call:opaque"},
+                                },
+                            }
+                        ]
+                    },
+                }
+            else:
+                self.assertEqual(request["operationRef"], "operation:work_item.read")
+                self.assertEqual(
+                    request["input"], {"preparedCallRef": "prepared-call:opaque"}
+                )
+                output = {"ok": True, "result": {"work_item": {"title": "assigned"}}}
+            return _result(request, output=output)
+
+        binding = _RuntimePlaneHostBinding(
+            port=CallablePlaneHostPort(respond),
+            run_id="run:direct-search",
+            invocation_id="invocation:direct-search",
+            correlation_id="correlation:direct-search",
+            cancellation=lambda: False,
+            eager_operation_refs=frozenset({"operation:search_workspace"}),
+        )
+
+        search = binding.call(
+            action="read",
+            operation_ref="operation:search_workspace",
+            input={"query": "assigned", "limit": 1},
+            source="model",
+        )
+
+        self.assertEqual(search.status, "ok")
+        self.assertEqual(
+            [request["operationRef"] for request in requests],
+            ["operation:search_workspace", "operation:work_item.read"],
+        )
+        self.assertFalse(binding.prepared_read_handoff_pending())
+        self.assertEqual(
+            search.output["preparedReadResult"]["output"]["result"]["work_item"]["title"],
+            "assigned",
+        )
+
+    def test_prepared_search_handoff_is_fail_closed_for_no_multiple_or_tampered_refs(self) -> None:
+        def search_output(items: list[dict]) -> dict:
+            return {
+                "ok": True,
+                "result": {"results": items},
+            }
+
+        self.assertEqual(
+            _prepared_read_refs_from_code_mode_result(
+                {
+                    "result": search_output([]),
+                    "observations": [
+                        {
+                            "source": "code",
+                            "action": "code",
+                            "operationRef": "operation:search_workspace",
+                            "status": "ok",
+                        }
+                    ],
+                }
+            ),
+            (),
+        )
+        self.assertEqual(
+            _prepared_read_refs_from_code_mode_result(
+                {
+                    "result": search_output(
+                        [
+                            {
+                                "objectType": "work_item",
+                                "workItemReadCall": "prepared-call:first",
+                            },
+                            {
+                                "objectType": "work_item",
+                                "workItemReadCall": "prepared-call:second",
+                            },
+                        ]
+                    ),
+                    "observations": [
+                        {
+                            "source": "code",
+                            "action": "code",
+                            "operationRef": "operation:search_workspace",
+                            "status": "ok",
+                        }
+                    ],
+                }
+            ),
+            ("prepared-call:first", "prepared-call:second"),
+        )
+        self.assertEqual(
+            _prepared_read_refs_from_code_mode_result(
+                {
+                    "result": search_output(
+                        [
+                            {
+                                "objectType": "work_item",
+                                "workItemReadCall": {
+                                    "preparedCallRef": {
+                                        "preparedCallRef": "prepared-call:tampered"
+                                    }
+                                },
+                            }
+                        ]
+                    ),
+                    "observations": [
+                        {
+                            "source": "code",
+                            "action": "code",
+                            "operationRef": "operation:search_workspace",
+                            "status": "ok",
+                        }
+                    ],
+                }
+            ),
+            (),
+        )
+
     def test_production_one_shot_service_binds_socket_host_before_real_hermes_turn(self) -> None:
         from plane_runtime.hermes_adapter import HermesKernelAdapter
         from plane_runtime.g1_bootstrap_contract import G1BootstrapFrames
@@ -3602,6 +3738,167 @@ print("text_response")
         self.assertEqual(
             [body["payload"]["text"] for body in bodies if body["kind"] == "transcript_evidence_observed"],
             ["ordinary final evidence"],
+        )
+
+    def test_real_hermes_route_reads_search_ref_before_ordinary_final_text(self) -> None:
+        """The actual model turn cannot finish before its opaque read continuation."""
+
+        from tests.plane_runtime.test_g1_runtime_process import (
+            G1InvocationEnvelope,
+            G1RunSnapshot,
+            _digest,
+            make_invocation,
+            make_snapshot,
+        )
+        from plane_runtime.hermes_adapter import HermesKernelAdapter
+        from run_agent import AIAgent
+
+        snapshot_raw = make_snapshot()
+        snapshot_raw["runtimePolicy"] = dict(snapshot_raw["runtimePolicy"])  # type: ignore[index]
+        snapshot_raw["runtimePolicy"].update(  # type: ignore[union-attr]
+            {
+                "adapter": "hermes",
+                "model": {"provider": "openai", "model": "deterministic-local"},
+            }
+        )
+        snapshot_raw["toolCatalog"] = {  # type: ignore[index]
+            "catalogDigest": "content:" + "c" * 64,
+            "modelToolset": "standard",
+            "eagerOperations": [
+                {
+                    "operationRef": "operation:search_workspace",
+                    "schemaDigest": "content:" + "d" * 64,
+                    "inputSchema": {"type": "object"},
+                    "disclosure": "eager",
+                }
+            ],
+        }
+        snapshot_raw["contentDigest"] = _digest(  # type: ignore[assignment]
+            "snapshot",
+            {key: value for key, value in snapshot_raw.items() if key != "contentDigest"},
+        )
+        snapshot = G1RunSnapshot.from_dict(snapshot_raw)
+        invocation = G1InvocationEnvelope.from_dict(make_invocation(snapshot.to_dict()))
+
+        class Completions:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            @staticmethod
+            def tool_call(arguments: dict[str, object], call_id: str):
+                return SimpleNamespace(
+                    id=call_id,
+                    function=SimpleNamespace(
+                        name="tool_call",
+                        arguments=json.dumps(
+                            {"name": "plane_operation", "arguments": arguments}
+                        ),
+                    ),
+                    extra_content=None,
+                )
+
+            def create(self, **_kwargs: object):
+                self.calls += 1
+                if self.calls == 1:
+                    message = SimpleNamespace(
+                        content=None,
+                        tool_calls=[
+                            self.tool_call(
+                                {
+                                    "action": "read",
+                                    "operationRef": "operation:search_workspace",
+                                    "input": {"query": "assigned", "limit": 1},
+                                },
+                                "call-search",
+                            )
+                        ],
+                        reasoning=None,
+                        reasoning_content=None,
+                        refusal=None,
+                    )
+                    finish_reason = "tool_calls"
+                else:
+                    message = SimpleNamespace(
+                        content="ordinary final evidence",
+                        tool_calls=None,
+                        reasoning=None,
+                        reasoning_content=None,
+                        refusal=None,
+                    )
+                    finish_reason = "stop"
+                return SimpleNamespace(
+                    choices=[SimpleNamespace(finish_reason=finish_reason, message=message)],
+                    usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+                )
+
+        class Client:
+            def __init__(self) -> None:
+                self.completions = Completions()
+                self.chat = SimpleNamespace(completions=self.completions)
+
+        class Credentials:
+            def resolve(self, provider: str) -> dict[str, str]:
+                del provider
+                return {"api_key": "model-only-secret", "base_url": "http://127.0.0.1"}
+
+        client = Client()
+
+        def agent_factory(**kwargs: object) -> AIAgent:
+            agent = AIAgent(**kwargs)
+            agent._create_request_openai_client = lambda **_: client  # type: ignore[method-assign]
+            return agent
+
+        requests: list[dict] = []
+
+        def rpc(request: dict) -> dict:
+            requests.append(request)
+            if request["operationRef"] == "operation:search_workspace":
+                output = {
+                    "ok": True,
+                    "result": {
+                        "results": [
+                            {
+                                "objectType": "work_item",
+                                "workItemReadCall": {
+                                    "action": "read",
+                                    "operationRef": "operation:work_item.read",
+                                    "input": {"preparedCallRef": "prepared-call:opaque"},
+                                },
+                            }
+                        ]
+                    },
+                }
+            else:
+                self.assertEqual(request["operationRef"], "operation:work_item.read")
+                self.assertEqual(
+                    request["input"], {"preparedCallRef": "prepared-call:opaque"}
+                )
+                output = {"ok": True, "result": {"work_item": {"title": "assigned"}}}
+            return _result(request, output=output)
+
+        bodies: list[dict] = []
+        with mock.patch.dict(os.environ, {"HERMES_HOME": _TEST_HERMES_HOME.name}):
+            import run_agent
+
+            run_agent._hermes_home = Path(_TEST_HERMES_HOME.name)
+            result = HermesKernelAdapter(
+                agent_factory=agent_factory,
+                credential_source=Credentials(),
+                host_port=CallablePlaneHostPort(rpc),
+            ).dispatch(
+                snapshot,
+                invocation,
+                lambda: False,
+                bodies.append,
+                model_call_allowance=2,
+            )
+
+        self.assertEqual(result.kind, "completed")
+        self.assertEqual(result.output_text, "ordinary final evidence")
+        self.assertEqual(client.completions.calls, 2)
+        self.assertEqual(
+            [request["operationRef"] for request in requests],
+            ["operation:search_workspace", "operation:work_item.read"],
         )
 
     def test_real_hermes_adapter_recovers_from_early_publish_before_code_mode(self) -> None:

@@ -1006,10 +1006,27 @@ class PlaneHostBinding:
     def _schema_is_disclosed(self, operation_ref: str) -> bool:
         return operation_ref in self.eager_operation_refs or operation_ref in self.described_operation_refs
 
-    def _require_schema_disclosure(self, *, action: str, operation_ref: str) -> None:
+    def _require_schema_disclosure(
+        self,
+        *,
+        action: str,
+        operation_ref: str,
+        input_value: Mapping[str, Any],
+    ) -> None:
         if action == "discover":
             return
         if action == "code" and operation_ref == PLANE_CODE_MODE_EXECUTE_OPERATION:
+            return
+        # A successful workspace search prepares this exact opaque read shape.
+        # The host binding already owns the trusted reference handoff, and the
+        # Plane gateway still resolves and authorizes it. Do not require a
+        # second model-facing schema disclosure before that bounded continuation.
+        if (
+            action == "read"
+            and operation_ref == "operation:work_item.read"
+            and set(input_value) == {"preparedCallRef"}
+            and _opaque_prepared_ref(input_value.get("preparedCallRef")) is not None
+        ):
             return
         if operation_ref in {
             PLANE_CATALOG_SEARCH_OPERATION,
@@ -1127,7 +1144,11 @@ class PlaneHostBinding:
             if self._is_cancelled():
                 self._fail("Plane host callback cancelled")
                 raise PlaneHostCancelled("Plane host callback cancelled")
-            self._require_schema_disclosure(action=action, operation_ref=operation_ref)
+            self._require_schema_disclosure(
+                action=action,
+                operation_ref=operation_ref,
+                input_value=input,
+            )
             try:
                 request = HostCallRequest(
                     run_id=self.run_id,
