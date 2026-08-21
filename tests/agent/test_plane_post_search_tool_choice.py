@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from agent.chat_completion_helpers import (
     _plane_codex_request_overrides,
     _plane_first_tool_tools,
+    _plane_standard_request_overrides,
 )
 from agent.transports import get_transport
 
@@ -24,6 +25,15 @@ _PUBLISH_TOOL = {
     },
 }
 
+_PLANE_OPERATION_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "plane_operation",
+        "description": "Call one Plane operation.",
+        "parameters": {"type": "object"},
+    },
+}
+
 
 def _request(agent, tools):
     return get_transport("codex_responses").build_kwargs(
@@ -33,6 +43,51 @@ def _request(agent, tools):
         request_overrides=_plane_codex_request_overrides(agent, tools),
         is_codex_backend=True,
     )
+
+
+def test_standard_route_pending_prepared_read_requires_existing_plane_operation_tool():
+    agent = SimpleNamespace(
+        request_overrides={"temperature": 0},
+        _plane_runtime_prepared_read_pending_check=lambda: True,
+    )
+
+    overrides = _plane_standard_request_overrides(
+        agent, [_PLANE_OPERATION_TOOL, _PUBLISH_TOOL]
+    )
+
+    assert overrides == {
+        "temperature": 0,
+        "tool_choice": {
+            "type": "function",
+            "function": {"name": "plane_operation"},
+        },
+    }
+
+
+def test_standard_route_pending_prepared_read_fails_closed_for_invalid_signals():
+    for pending in (
+        False,
+        None,
+        {"preparedCallRef": "prepared-call:tampered", "extra": True},
+        "x" * 257,
+    ):
+        agent = SimpleNamespace(
+            request_overrides={"temperature": 0},
+            _plane_runtime_prepared_read_pending_check=lambda pending=pending: pending,
+        )
+
+        assert _plane_standard_request_overrides(
+            agent, [_PLANE_OPERATION_TOOL]
+        ) == {"temperature": 0}
+
+
+def test_standard_route_pending_prepared_read_does_not_create_a_tool_path():
+    agent = SimpleNamespace(
+        request_overrides={},
+        _plane_runtime_prepared_read_pending_check=lambda: True,
+    )
+
+    assert _plane_standard_request_overrides(agent, [_PUBLISH_TOOL]) == {}
 
 
 def test_post_search_phase_selects_named_code_mode_tool():

@@ -34,6 +34,7 @@ from plane_runtime.host_port import (
     install_plane_tools,
     plane_code_mode,
     _normalize_prepared_read_input,
+    _prepared_read_refs_from_search_result,
     _prepared_read_refs_from_code_mode_result,
 )
 from tools.registry import registry
@@ -828,6 +829,57 @@ print("text_response")
             "assigned",
         )
 
+    def test_direct_search_auto_reads_bare_opaque_ref_before_text_exit(self) -> None:
+        requests: list[dict] = []
+
+        def respond(request: dict) -> dict:
+            requests.append(request)
+            if request["operationRef"] == "operation:search_workspace":
+                output = {
+                    "ok": True,
+                    "result": {
+                        "results": [
+                            {
+                                "objectType": "work_item",
+                                "workItemReadCall": "prepared-call:bare",
+                            }
+                        ]
+                    },
+                }
+            else:
+                self.assertEqual(request["operationRef"], "operation:work_item.read")
+                self.assertEqual(
+                    request["input"], {"preparedCallRef": "prepared-call:bare"}
+                )
+                output = {"ok": True, "result": {"work_item": {"title": "assigned"}}}
+            return _result(request, output=output)
+
+        binding = _RuntimePlaneHostBinding(
+            port=CallablePlaneHostPort(respond),
+            run_id="run:bare-search",
+            invocation_id="invocation:bare-search",
+            correlation_id="correlation:bare-search",
+            cancellation=lambda: False,
+            eager_operation_refs=frozenset({"operation:search_workspace"}),
+        )
+
+        search = binding.call(
+            action="read",
+            operation_ref="operation:search_workspace",
+            input={"query": "assigned", "limit": 1},
+            source="model",
+        )
+
+        self.assertEqual(
+            [request["operationRef"] for request in requests],
+            ["operation:search_workspace", "operation:work_item.read"],
+        )
+        self.assertFalse(binding.prepared_read_handoff_pending())
+        self.assertEqual(
+            search.output["preparedReadResult"]["output"]["result"]["work_item"]["title"],
+            "assigned",
+        )
+
     def test_prepared_search_handoff_is_fail_closed_for_no_multiple_or_tampered_refs(self) -> None:
         def search_output(items: list[dict]) -> dict:
             return {
@@ -851,6 +903,7 @@ print("text_response")
             ),
             (),
         )
+
         self.assertEqual(
             _prepared_read_refs_from_code_mode_result(
                 {
@@ -905,6 +958,25 @@ print("text_response")
             ),
             (),
         )
+
+    def test_direct_search_handoff_rejects_extra_invalid_and_oversized_refs(self) -> None:
+        for work_item_read_call in (
+            {"preparedCallRef": "prepared-call:opaque", "extra": True},
+            "not-a-prepared-call",
+            "prepared-call:" + ("x" * 256),
+        ):
+            output = {
+                "ok": True,
+                "result": {
+                    "results": [
+                        {
+                            "objectType": "work_item",
+                            "workItemReadCall": work_item_read_call,
+                        }
+                    ]
+                },
+            }
+            self.assertEqual(_prepared_read_refs_from_search_result(output), ())
 
     def test_production_one_shot_service_binds_socket_host_before_real_hermes_turn(self) -> None:
         from plane_runtime.hermes_adapter import HermesKernelAdapter

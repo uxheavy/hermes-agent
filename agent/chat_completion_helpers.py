@@ -66,6 +66,7 @@ _FALLBACK_EXHAUSTED_COOLDOWN_S = 5.0
 # object syntax; once the adapter consumes the hint, normal ``auto`` resumes.
 _PLANE_FIRST_REQUIRED_TOOL = "plane_execute_typescript"
 _PLANE_CODE_MODE_TOOL = "plane_execute_typescript"
+_PLANE_PREPARED_READ_TOOL = "plane_operation"
 
 
 def _plane_tool_name(tool):
@@ -151,6 +152,31 @@ def _plane_codex_request_overrides(agent, tools):
             "type": "function",
             "name": _PLANE_CODE_MODE_TOOL,
         }
+    return overrides
+
+
+def _plane_standard_request_overrides(agent, tools):
+    """Require the existing Plane operation tool for one pending read."""
+    configured = getattr(agent, "request_overrides", None)
+    overrides = dict(configured) if isinstance(configured, dict) else {}
+    pending_check = getattr(
+        agent, "_plane_runtime_prepared_read_pending_check", None
+    )
+    if not callable(pending_check):
+        return overrides
+    try:
+        pending = pending_check()
+    except Exception:
+        return overrides
+    if pending is not True or not any(
+        _plane_tool_name(tool) == _PLANE_PREPARED_READ_TOOL
+        for tool in (tools or [])
+    ):
+        return overrides
+    overrides["tool_choice"] = {
+        "type": "function",
+        "function": {"name": _PLANE_PREPARED_READ_TOOL},
+    }
     return overrides
 
 
@@ -1424,7 +1450,9 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
             ephemeral_max_output_tokens=_ephemeral_out,
             max_tokens_param_fn=agent._max_tokens_param,
             reasoning_config=agent.reasoning_config,
-            request_overrides=agent.request_overrides,
+            request_overrides=_plane_standard_request_overrides(
+                agent, tools_for_api
+            ),
             session_id=getattr(agent, "session_id", None),
             provider_profile=_profile,
             ollama_num_ctx=agent._ollama_num_ctx,
@@ -1456,7 +1484,9 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
         ephemeral_max_output_tokens=_ephemeral_out,
         max_tokens_param_fn=agent._max_tokens_param,
         reasoning_config=agent.reasoning_config,
-        request_overrides=agent.request_overrides,
+        request_overrides=_plane_standard_request_overrides(
+            agent, tools_for_api
+        ),
         session_id=getattr(agent, "session_id", None),
         model_lower=(agent.model or "").lower(),
         is_openrouter=_is_or,
