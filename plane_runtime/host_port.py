@@ -440,6 +440,8 @@ def _prepared_read_refs_from_search_result(output: Any) -> tuple[str, ...]:
     if not isinstance(output, Mapping):
         return ()
     result = output.get("result")
+    if isinstance(output.get("results"), list):
+        result = output
     if not isinstance(result, Mapping):
         return ()
     items = result.get("results")
@@ -451,6 +453,10 @@ def _prepared_read_refs_from_search_result(output: Any) -> tuple[str, ...]:
             continue
         call = item.get("workItemReadCall")
         if not isinstance(call, Mapping):
+            prepared_ref = _opaque_prepared_ref(call)
+            if prepared_ref is None:
+                return ()
+            prepared_refs.append(prepared_ref)
             continue
         if (
             call.get("action") != "read"
@@ -474,6 +480,39 @@ def _prepared_read_ref_from_search_result(output: Any) -> str | None:
 
     refs = _prepared_read_refs_from_search_result(output)
     return refs[0] if len(refs) == 1 else None
+
+
+def _prepared_read_refs_from_code_mode_result(output: Any) -> tuple[str, ...]:
+    """Return prepared reads left unconsumed by one trusted Code Mode result.
+
+    Plane's Code Mode envelope carries the module result separately from its
+    bounded operation observations.  Require both pieces before arming the
+    Hermes continuation: a search observation proves which operation produced
+    the result, while the absence of a successful read observation proves the
+    opaque prepared call was not consumed by that same Code Mode turn.
+    """
+
+    if not isinstance(output, Mapping):
+        return ()
+    observations = output.get("observations")
+    if not isinstance(observations, list):
+        return ()
+    search_observed = False
+    read_consumed = False
+    for observation in observations:
+        if not isinstance(observation, Mapping):
+            return ()
+        if observation.get("source") != "code" or observation.get("action") != "code":
+            return ()
+        operation_ref = observation.get("operationRef")
+        status = observation.get("status")
+        if operation_ref == "operation:search_workspace" and status in {"ok", "replayed"}:
+            search_observed = True
+        elif operation_ref == "operation:work_item.read" and status in {"ok", "replayed"}:
+            read_consumed = True
+    if not search_observed or read_consumed:
+        return ()
+    return _prepared_read_refs_from_search_result(output.get("result"))
 
 
 def _opaque_prepared_ref(value: Any) -> str | None:
@@ -771,6 +810,7 @@ class PlaneHostBinding:
     _terminal_action_request: HostCallRequest | None = field(default=None, init=False, repr=False)
     _prepared_read_handoff_pending: bool = field(default=False, init=False, repr=False)
     _code_mode_phase_hint: str | None = field(default=None, init=False, repr=False)
+    _code_mode_continuation_used: bool = field(default=False, init=False, repr=False)
     _outcome_publication_metadata: dict[str, Any] | None = field(
         default=None, init=False, repr=False
     )
@@ -837,6 +877,16 @@ class PlaneHostBinding:
 
         with self._lock:
             return self._code_mode_phase_hint
+
+    def take_code_mode_phase_hint(self) -> str | None:
+        """Consume the finite Code Mode continuation hint once."""
+
+        with self._lock:
+            phase = self._code_mode_phase_hint
+            if phase is not None:
+                self._code_mode_phase_hint = None
+                self._code_mode_continuation_used = True
+            return phase
 
     def outcome_publication_metadata(self) -> dict[str, Any] | None:
         """Return the last validated outcome publication's bounded facts."""
@@ -1121,6 +1171,15 @@ class PlaneHostBinding:
             if action == "code":
                 with self._lock:
                     self._code_mode_phase_hint = None
+                    should_arm = (
+                        result.status in {"ok", "replayed"}
+                        and self.code_mode_phase == "post_search"
+                        and not self._code_mode_continuation_used
+                    )
+                if should_arm and _prepared_read_refs_from_code_mode_result(result.output):
+                    with self._lock:
+                        if not self._code_mode_continuation_used:
+                            self._code_mode_phase_hint = "post_search"
             if _host_result_disposition(result) == "poison_invocation":
                 self._fail(result.error_message or "Plane host rejected the callback")
             if self._is_cancelled():

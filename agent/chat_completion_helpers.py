@@ -121,6 +121,12 @@ def _plane_codex_request_overrides(agent, tools):
     if phase == "post_search" and any(
         _plane_tool_name(tool) == _PLANE_CODE_MODE_TOOL for tool in (tools or [])
     ):
+        consume_phase = getattr(agent, "_plane_runtime_code_mode_phase_consume", None)
+        if callable(consume_phase):
+            try:
+                consume_phase()
+            except Exception:
+                return overrides
         overrides["tool_choice"] = {
             "type": "function",
             "name": _PLANE_CODE_MODE_TOOL,

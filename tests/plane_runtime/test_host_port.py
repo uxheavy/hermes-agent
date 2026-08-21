@@ -32,6 +32,7 @@ from plane_runtime.host_port import (
     bind_plane_host,
     install_plane_tools,
     plane_code_mode,
+    _prepared_read_refs_from_code_mode_result,
 )
 from tools.registry import registry
 
@@ -682,6 +683,124 @@ print("text_response")
             input={"source": "export default async () => ({})"},
             source="code",
         )
+        self.assertIsNone(binding.code_mode_phase_hint())
+
+    def test_code_mode_search_result_arms_one_shot_continuation_without_read(self) -> None:
+        def respond(request: dict) -> dict:
+            if request["action"] == "code":
+                output = {
+                    "schemaVersion": "plane.code-mode/v1",
+                    "result": {
+                        "ok": True,
+                        "result": {
+                            "results": [
+                                {
+                                    "objectType": "work_item",
+                                    "workItemReadCall": {
+                                        "action": "read",
+                                        "operationRef": "operation:work_item.read",
+                                        "input": {"preparedCallRef": "prepared-call:code-search"},
+                                    },
+                                }
+                            ]
+                        },
+                    },
+                    "observations": [
+                        {
+                            "source": "code",
+                            "action": "code",
+                            "operationRef": "operation:search_workspace",
+                            "status": "ok",
+                        }
+                    ],
+                }
+                return _result(request, output=output)
+            return _result(request, output={"unexpected": True})
+
+        binding = PlaneHostBinding(
+            port=CallablePlaneHostPort(respond),
+            run_id="run:code-search",
+            invocation_id="invocation:code-search",
+            correlation_id="correlation:code-search",
+            cancellation=lambda: False,
+            code_mode_phase="post_search",
+        )
+        binding.call(
+            action="code",
+            operation_ref="plane.code-mode.execute@1",
+            input={"source": "export default async () => ({})"},
+            source="code",
+        )
+
+        self.assertEqual(binding.code_mode_phase_hint(), "post_search")
+        self.assertEqual(binding.take_code_mode_phase_hint(), "post_search")
+        self.assertIsNone(binding.take_code_mode_phase_hint())
+
+        binding.call(
+            action="code",
+            operation_ref="plane.code-mode.execute@1",
+            input={"source": "export default async () => ({})"},
+            source="code",
+        )
+        self.assertIsNone(binding.code_mode_phase_hint())
+
+    def test_code_mode_search_result_accepts_v72_opaque_read_call(self) -> None:
+        output = {
+            "result": {
+                "ok": True,
+                "result": {
+                    "results": [
+                        {
+                            "objectType": "work_item",
+                            "workItemReadCall": "prepared-call:v72",
+                        }
+                    ]
+                },
+            },
+            "observations": [
+                {
+                    "source": "code",
+                    "action": "code",
+                    "operationRef": "operation:search_workspace",
+                    "status": "ok",
+                }
+            ],
+        }
+        self.assertEqual(
+            _prepared_read_refs_from_code_mode_result(output),
+            ("prepared-call:v72",),
+        )
+
+    def test_code_mode_read_consumption_and_non_code_operations_do_not_arm(self) -> None:
+        def respond(request: dict) -> dict:
+            return _result(request, output={"accepted": True})
+
+        binding = PlaneHostBinding(
+            port=CallablePlaneHostPort(respond),
+            run_id="run:no-arm",
+            invocation_id="invocation:no-arm",
+            correlation_id="correlation:no-arm",
+            cancellation=lambda: False,
+            code_mode_phase="post_search",
+            eager_operation_refs=frozenset(
+                {
+                    "operation:work_item.read",
+                    "operation:work_item.rename",
+                    "operation:agent.outcome.submit",
+                }
+            ),
+        )
+        for action, operation_ref in (
+            ("read", "operation:work_item.read"),
+            ("mutate", "operation:work_item.rename"),
+            ("mutate", "operation:agent.outcome.submit"),
+        ):
+            binding.call(
+                action=action,
+                operation_ref=operation_ref,
+                input={},
+                source="model",
+            )
         self.assertIsNone(binding.code_mode_phase_hint())
 
     def test_unix_socket_client_round_trips_exact_canonical_contract(self) -> None:
