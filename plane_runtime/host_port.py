@@ -445,13 +445,7 @@ def _recoverable_outcome_publication_rejection(
 
 
 def _prepared_read_refs_from_search_result(output: Any) -> tuple[str, ...]:
-    """Return the one opaque read reference prepared for a model search.
-
-    Plane owns the target behind the reference. Hermes only recognizes the
-    model-facing envelope and never reads or reconstructs target identifiers.
-    A search with more than one prepared item is intentionally left to the
-    model because there is no safe single handoff to choose.
-    """
+    """Return only Plane's top-level assignment-scoped opaque handoff."""
 
     if not isinstance(output, Mapping) or "preparedReadResult" in output:
         return ()
@@ -460,42 +454,49 @@ def _prepared_read_refs_from_search_result(output: Any) -> tuple[str, ...]:
         result = output
     if not isinstance(result, Mapping):
         return ()
-    items = result.get("results")
-    if not isinstance(items, list):
+    decision = result.get("assignmentWorkItemReadDecision")
+    if decision is not None and not _bounded_assignment_read_decision(decision):
         return ()
-    prepared_refs: list[str] = []
-    for item in items:
-        if not isinstance(item, Mapping):
-            continue
-        object_type = item.get("objectType")
-        if object_type is not None and object_type != "work_item":
-            continue
-        call = item.get("workItemReadCall")
-        if not isinstance(call, Mapping):
-            prepared_ref = _opaque_prepared_ref(call)
-            if prepared_ref is None:
-                return ()
-            prepared_refs.append(prepared_ref)
-            continue
-        if set(call) == {"preparedCallRef"}:
-            prepared_ref = _opaque_prepared_ref(call.get("preparedCallRef"))
-        elif (
-            call.get("action") == "read"
-            and call.get("operationRef") == "operation:work_item.read"
-        ):
-            input_value = call.get("input")
-            prepared_ref = (
-                _opaque_prepared_ref(input_value.get("preparedCallRef"))
-                if isinstance(input_value, Mapping)
-                and set(input_value) == {"preparedCallRef"}
-                else None
-            )
-        else:
-            prepared_ref = None
-        if prepared_ref is None:
-            return ()
-        prepared_refs.append(prepared_ref)
-    return tuple(prepared_refs)
+    prepared_ref = _opaque_prepared_ref(result.get("assignmentWorkItemReadCall"))
+    return (prepared_ref,) if prepared_ref is not None else ()
+
+
+def _bounded_assignment_read_decision(value: Any) -> bool:
+    if not isinstance(value, Mapping) or set(value) != {
+        "schemaVersion",
+        "recognizedCount",
+        "acceptedForm",
+        "failureClass",
+        "shape",
+    }:
+        return False
+    shape = value.get("shape")
+    return (
+        value.get("schemaVersion") == "plane.assignment-read-handoff/v1"
+        and type(value.get("recognizedCount")) is int
+        and 0 <= value["recognizedCount"] <= 2
+        and value.get("acceptedForm") in {"canonical_ref", "unrecognized"}
+        and value.get("failureClass") in {"none", "zero", "multiple", "invalid"}
+        and isinstance(shape, Mapping)
+        and set(shape) == {"nestingDepth", "sizeClass"}
+        and type(shape.get("nestingDepth")) is int
+        and 0 <= shape["nestingDepth"] <= 8
+        and shape.get("sizeClass") in {"small", "medium", "large"}
+    )
+
+
+def _assignment_read_decision_requires_followup(output: Any) -> bool:
+    if not isinstance(output, Mapping):
+        return False
+    result = output.get("result")
+    if isinstance(output.get("results"), list):
+        result = output
+    if not isinstance(result, Mapping) or "assignmentWorkItemReadDecision" not in result:
+        return False
+    decision = result.get("assignmentWorkItemReadDecision")
+    if not _bounded_assignment_read_decision(decision):
+        return True
+    return decision["recognizedCount"] != 1 or decision["failureClass"] != "none"
 
 
 def _outcome_ref_from_operation_result(value: Any) -> str | None:
@@ -1289,7 +1290,7 @@ class PlaneHostBinding:
                 and result.status in {"ok", "replayed"}
             ):
                 prepared_refs = _prepared_read_refs_from_search_result(result.output)
-                if prepared_refs:
+                if prepared_refs or _assignment_read_decision_requires_followup(result.output):
                     self._prepared_read_handoff_pending = True
                 if len(prepared_refs) == 1:
                     prepared_ref = prepared_refs[0]
@@ -1328,7 +1329,7 @@ class PlaneHostBinding:
                     prepared_refs = _prepared_read_refs_from_code_mode_result(
                         result.output
                     )
-                    if prepared_refs:
+                    if prepared_refs or _assignment_read_decision_requires_followup(result.output):
                         self._prepared_read_handoff_pending = True
                     if len(prepared_refs) == 1:
                         # The Plane host prepared this exact capability during

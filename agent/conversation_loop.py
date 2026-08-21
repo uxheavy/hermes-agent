@@ -7132,7 +7132,7 @@ def run_conversation(
                             "role": "user",
                             "content": (
                                 "A prepared Plane work-item read is pending. "
-                                "Continue with exactly one returned workItemReadCall "
+                                "Continue with exactly one returned assignmentWorkItemReadCall "
                                 "before providing final text."
                             ),
                             "_prepared_read_synthetic": True,

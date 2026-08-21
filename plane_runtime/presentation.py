@@ -16,7 +16,7 @@ _RULES = (
     "Call plane_operation directly with the listed exact input shape for every eager operation; eager operations are already disclosed and must not be rediscovered.",
     "For an operation not listed under eagerOperations, call catalog.search once and then operation:catalog.describe once before invocation.",
     "For an assigned work-item route, make operation:search_workspace the first Plane call and use its prepared typed references; do not begin with catalog.search or catalog.describe.",
-    "After search_workspace returns a work item, copy its opaque workItemReadCall string into plane_operation input {\"preparedCallRef\":\"<the returned prepared-call:...>\"}; do not construct an action/operationRef/input envelope, nest an object under preparedCallRef, or use project_id/issue_id.",
+    "After search_workspace returns the assigned work item, copy the opaque assignmentWorkItemReadCall string into plane_operation input {\"preparedCallRef\":\"<the returned prepared-call:...>\"}; do not construct an action/operationRef/input envelope, nest an object under preparedCallRef, or use project_id/issue_id.",
     "Never guess input field names.",
     "Disclosure is not authorization.",
     "Ordinary final text is not publication.",
