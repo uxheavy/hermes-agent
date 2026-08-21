@@ -140,6 +140,8 @@ def _failure_result(
     *,
     retryable: bool = False,
     failure_cause: str | None = None,
+    runtime_phase: str | None = None,
+    exception_class: str | None = None,
 ) -> HermesKernelResult:
     return HermesKernelResult(
         kind="failed",
@@ -147,6 +149,8 @@ def _failure_result(
         failure_message=message,
         failure_cause=failure_cause,
         retryable=retryable,
+        runtime_phase=runtime_phase,
+        exception_class=exception_class,
     )
 
 
@@ -267,8 +271,19 @@ def serve_once_g1(
                 emit_body,
                 model_call_allowance=model_call_allowance,
             )
-    except Exception:
-        result = _failure_result("runtime_error", "Hermes runtime execution failed", retryable=True)
+    except Exception as exc:
+        exception_class = type(exc).__name__
+        result = _failure_result(
+            "runtime_error",
+            "Hermes runtime execution failed",
+            retryable=True,
+            runtime_phase="unknown",
+            exception_class=(
+                exception_class
+                if exception_class in RUNTIME_FAILURE_EXCEPTION_CLASSES
+                else "Unknown"
+            ),
+        )
 
     if result.kind == "completed":
         exit_frame = build_exit(

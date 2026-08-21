@@ -40,7 +40,7 @@ from plane_runtime.host_port import (
     PLANE_PUBLICATION_TOOLSET,
     current_plane_host,
 )
-from plane_runtime.g1_service import _terminal_failure
+from plane_runtime.g1_service import _terminal_failure, serve_once_g1
 from plane_runtime.invocation_supervisor import (
     G1InvocationSupervisor,
     G1LocalTestRunner,
@@ -315,6 +315,62 @@ class G1RuntimeProcessTests(unittest.TestCase):
         self.assertEqual(validate_g1_frames(frames, snapshot, invocation)[-1]["kind"], "completed")
         with mock.patch("sys.stdin", io.StringIO(request)), mock.patch("sys.stdout", io.StringIO()):
             self.assertEqual(service_main(["--once", "--g1-production"]), 2)
+
+    def test_g1_service_preserves_bounded_diagnostics_for_post_adapter_failure(self) -> None:
+        snapshot = make_snapshot()
+        snapshot["runtimePolicy"] = dict(snapshot["runtimePolicy"])  # type: ignore[arg-type]
+        snapshot["runtimePolicy"]["adapter"] = "hermes"  # type: ignore[index]
+        snapshot["contentDigest"] = _digest(
+            "snapshot", {key: value for key, value in snapshot.items() if key != "contentDigest"}
+        )
+        invocation = make_invocation(snapshot)
+        invocation["lease"] = dict(invocation["lease"])  # type: ignore[arg-type]
+        invocation["lease"]["expiresAt"] = "2099-01-01T00:00:00Z"  # type: ignore[index]
+
+        with mock.patch("plane_runtime.g1_service.HermesKernelAdapter") as adapter:
+            def dispatch_result(_snapshot, _invocation, _cancellation, emit_body, **kwargs):
+                del kwargs
+                for text in ("started", "advanced"):
+                    emit_body(
+                        {
+                            "kind": "progress_observed",
+                            "payload": {
+                                "kind": "inline_text",
+                                "contentType": "text/plain",
+                                "text": text,
+                            },
+                            "publication": {"action": "observation_only"},
+                        }
+                    )
+                raise TypeError("private post-processing failure")
+
+            adapter.return_value.dispatch.side_effect = dispatch_result
+            output = io.StringIO()
+            status = serve_once_g1(
+                json.dumps({"run": snapshot, "invocation": invocation}),
+                output,
+                production=True,
+                credential_source=InlineCredentialSource({"api_key": "synthetic"}, "test-provider"),
+                model_call_allowance=2,
+            )
+
+        frames = validate_g1_frames(
+            [json.loads(line) for line in output.getvalue().splitlines()], snapshot, invocation
+        )
+        self.assertEqual(status, 0)
+        self.assertEqual(sum(frame.get("body", {}).get("kind") == "progress_observed" for frame in frames), 2)
+        self.assertEqual(frames[-1]["finalSequence"], 1)
+        self.assertEqual(
+            frames[-1]["failure"],
+            {
+                "code": "runtime_error",
+                "message": "Hermes runtime execution failed",
+                "retryable": True,
+                "runtimePhase": "unknown",
+                "exceptionClass": "TypeError",
+            },
+        )
+        self.assertNotIn("private post-processing failure", output.getvalue())
 
     def test_exact_g1_snapshot_and_envelope_are_immutable_and_bound(self) -> None:
         snapshot = G1RunSnapshot.from_dict(make_snapshot())
