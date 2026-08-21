@@ -46,6 +46,7 @@ _TEST_EAGER_OPERATION_REFS = frozenset(
         "operation:read@2",
         "operation:mutate@1",
         "operation:work-item-update@1",
+        "operation:agent.outcome.submit",
         "operation:conversation-publish@1",
         PLANE_OUTCOME_PUBLISH_OPERATION,
         "operation:compose@1",
@@ -161,6 +162,8 @@ class HostPortTests(unittest.TestCase):
                     output={
                         "observations": [
                             {
+                                "source": "code",
+                                "action": "code",
                                 "operationRef": "operation:agent.outcome.submit",
                                 "status": "ok",
                             }
@@ -176,7 +179,7 @@ class HostPortTests(unittest.TestCase):
             correlation_id="correlation:publication-continuation",
             cancellation=lambda: False,
         )
-        binding.call(
+        result = binding.call(
             action="code",
             operation_ref="plane.code-mode.execute@1",
             input={"source": "export default async () => ({})"},
@@ -214,6 +217,73 @@ class HostPortTests(unittest.TestCase):
         )
         self.assertEqual(result.status, "invalid")
         self.assertIsNone(rejected.fatal_error)
+
+        native = PlaneHostBinding(
+            port=CallablePlaneHostPort(lambda request: _result(request)),
+            run_id="run:native-submit",
+            invocation_id="invocation:native-submit",
+            correlation_id="correlation:native-submit",
+            cancellation=lambda: False,
+        )
+        native.call(
+            action="mutate",
+            operation_ref="operation:agent.outcome.submit",
+            input={"summary": "bounded"},
+            source="model",
+        )
+        self.assertTrue(native.outcome_submission_pending())
+
+        unrelated = PlaneHostBinding(
+            port=CallablePlaneHostPort(
+                lambda request: _result(
+                    request,
+                    status="invalid",
+                    errorCode="OPERATION_REJECTED",
+                    errorMessage="unrelated mutation rejected",
+                )
+            ),
+            run_id="run:unrelated-rejection",
+            invocation_id="invocation:unrelated-rejection",
+            correlation_id="correlation:unrelated-rejection",
+            cancellation=lambda: False,
+        )
+        unrelated.call(
+            action="mutate",
+            operation_ref="operation:mutate@1",
+            input={"name": "not applied"},
+            source="model",
+        )
+        self.assertEqual(unrelated.fatal_error, "unrelated mutation rejected")
+
+    def test_untrusted_submit_observation_does_not_arm_publication(self) -> None:
+        binding = PlaneHostBinding(
+            port=CallablePlaneHostPort(
+                lambda request: _result(
+                    request,
+                    output={
+                        "observations": [
+                            {
+                                "source": "model",
+                                "action": "mutate",
+                                "operationRef": "operation:agent.outcome.submit",
+                                "status": "ok",
+                            }
+                        ]
+                    },
+                )
+            ),
+            run_id="run:untrusted-submit",
+            invocation_id="invocation:untrusted-submit",
+            correlation_id="correlation:untrusted-submit",
+            cancellation=lambda: False,
+        )
+        binding.call(
+            action="code",
+            operation_ref="plane.code-mode.execute@1",
+            input={"source": "export default async () => ({})"},
+            source="code",
+        )
+        self.assertFalse(binding.outcome_submission_pending())
 
     def test_host_operation_diagnostic_is_bounded_and_phase_exact(self) -> None:
         operation_ref = "operation:work-item-get@1"
@@ -794,7 +864,7 @@ print("text_response")
             cancellation=lambda: False,
             code_mode_phase="post_search",
         )
-        binding.call(
+        result = binding.call(
             action="code",
             operation_ref="plane.code-mode.execute@1",
             input={"source": "export default async () => ({})"},
@@ -907,6 +977,30 @@ print("text_response")
             _prepared_read_refs_from_code_mode_result(output),
             ("prepared-call:object",),
         )
+
+    def test_code_mode_search_result_ignores_prepared_ref_on_non_work_item(self) -> None:
+        output = {
+            "result": {
+                "ok": True,
+                "result": {
+                    "results": [
+                        {
+                            "objectType": "project",
+                            "workItemReadCall": "prepared-call:not-a-work-item",
+                        }
+                    ]
+                },
+            },
+            "observations": [
+                {
+                    "source": "code",
+                    "action": "code",
+                    "operationRef": "operation:search_workspace",
+                    "status": "ok",
+                }
+            ],
+        }
+        self.assertEqual(_prepared_read_refs_from_code_mode_result(output), ())
 
     def test_code_mode_malformed_prepared_search_result_stays_fail_closed(self) -> None:
         requests: list[dict] = []

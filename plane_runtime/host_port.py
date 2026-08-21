@@ -95,10 +95,6 @@ _HOST_RESULT_DISPOSITIONS: Mapping[tuple[str, str | None], HostResultDisposition
         ("ok", None): "continue_with_tool_result",
         ("replayed", None): "continue_with_tool_result",
         ("invalid", "VALIDATION_ERROR"): "continue_with_tool_result",
-        # A publication attempted before its submitted outcome exists is a
-        # recoverable product rejection; the model may still submit first.
-        ("invalid", "OPERATION_REJECTED"): "continue_with_tool_result",
-        ("invalid", "OUTCOME_SUBMISSION_REQUIRED"): "continue_with_tool_result",
         # A generated Code Mode module may fail in the restricted isolate.
         # Return that finite, bounded result to the model so it can correct
         # the module in the same invocation; host/transport failures remain
@@ -432,6 +428,21 @@ def _host_result_disposition(result: HostCallResult) -> HostResultDisposition:
     )
 
 
+def _recoverable_outcome_publication_rejection(
+    request: HostCallRequest, result: HostCallResult
+) -> bool:
+    """Keep only an early explicit outcome publication recoverable."""
+
+    return (
+        request.action == "publish"
+        and request.operation_ref == PLANE_OUTCOME_PUBLISH_OPERATION
+        and request.input.get("kind") == "outcome"
+        and result.status == "invalid"
+        and result.error_code
+        in {"OPERATION_REJECTED", "OUTCOME_SUBMISSION_REQUIRED"}
+    )
+
+
 def _prepared_read_refs_from_search_result(output: Any) -> tuple[str, ...]:
     """Return the one opaque read reference prepared for a model search.
 
@@ -454,6 +465,8 @@ def _prepared_read_refs_from_search_result(output: Any) -> tuple[str, ...]:
     prepared_refs: list[str] = []
     for item in items:
         if not isinstance(item, Mapping):
+            continue
+        if item.get("objectType") != "work_item":
             continue
         call = item.get("workItemReadCall")
         if not isinstance(call, Mapping):
@@ -493,6 +506,8 @@ def _successful_outcome_submit_from_code_mode_result(output: Any) -> bool:
         return False
     return any(
         isinstance(observation, Mapping)
+        and observation.get("source") == "code"
+        and observation.get("action") == "code"
         and observation.get("operationRef") == "operation:agent.outcome.submit"
         and observation.get("status") in {"ok", "replayed"}
         for observation in observations
@@ -1165,6 +1180,11 @@ class PlaneHostBinding:
                 self._set_callback_phase("adapter_event")
                 raise
             if (
+                request.operation_ref == "operation:agent.outcome.submit"
+                and result.status in {"ok", "replayed"}
+            ):
+                self._outcome_submission_pending = True
+            if (
                 request.action == "code"
                 and result.status in {"ok", "replayed"}
                 and _successful_outcome_submit_from_code_mode_result(result.output)
@@ -1253,7 +1273,10 @@ class PlaneHostBinding:
                     with self._lock:
                         if not self._code_mode_continuation_used:
                             self._code_mode_phase_hint = "post_search"
-            if _host_result_disposition(result) == "poison_invocation":
+            if (
+                _host_result_disposition(result) == "poison_invocation"
+                and not _recoverable_outcome_publication_rejection(request, result)
+            ):
                 self._fail(result.error_message or "Plane host rejected the callback")
             if self._is_cancelled():
                 self._set_callback_phase("adapter_event")
@@ -1289,6 +1312,10 @@ class PlaneHostBinding:
             source="model",
         )
         if result.status not in {"ok", "replayed"}:
+            if _recoverable_outcome_publication_rejection(
+                self.records[-1].request, result
+            ):
+                return result
             if (
                 _host_result_disposition(result) == "continue_with_tool_result"
                 and result.status in {"invalid", "conflict"}
