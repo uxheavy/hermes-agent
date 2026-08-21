@@ -33,7 +33,13 @@ from plane_runtime.g1_bootstrap_contract import G1BootstrapFrames
 from plane_runtime.g1_ledger import G1RuntimeLedger
 from plane_runtime.g1_runtime_image import bootstrap
 from plane_runtime.hermes_adapter import HermesKernelAdapter, HermesKernelResult, InlineCredentialSource, UnixSocketCredentialSource
-from plane_runtime.host_port import CallablePlaneHostPort, current_plane_host
+from plane_runtime.host_port import (
+    CallablePlaneHostPort,
+    PLANE_CODE_MODE_TOOLSET,
+    PLANE_OPERATION_TOOLSET,
+    PLANE_PUBLICATION_TOOLSET,
+    current_plane_host,
+)
 from plane_runtime.g1_service import _terminal_failure
 from plane_runtime.invocation_supervisor import (
     G1InvocationSupervisor,
@@ -1206,6 +1212,10 @@ class G1RuntimeProcessTests(unittest.TestCase):
 
     def test_hermes_adapter_uses_existing_agent_loop_and_redacts_host_credentials(self) -> None:
         snapshot_raw = make_snapshot()
+        snapshot_raw["toolCatalog"] = {
+            **snapshot_raw["toolCatalog"],  # type: ignore[misc]
+            "modelToolset": "code_mode_only",
+        }
         snapshot_raw["runtimePolicy"] = dict(snapshot_raw["runtimePolicy"])  # type: ignore[arg-type]
         snapshot_raw["runtimePolicy"]["adapter"] = "hermes"  # type: ignore[index]
         snapshot_raw["contentDigest"] = _digest(
@@ -1236,7 +1246,12 @@ class G1RuntimeProcessTests(unittest.TestCase):
         result = HermesKernelAdapter(
             agent_factory=factory,
             credential_source=Credentials(),
-            enabled_toolsets=("safe",),
+            enabled_toolsets=(
+                "safe",
+                PLANE_OPERATION_TOOLSET,
+                PLANE_PUBLICATION_TOOLSET,
+                PLANE_CODE_MODE_TOOLSET,
+            ),
         ).dispatch(snapshot, invocation, lambda: False, bodies.append, model_call_allowance=3)
 
         self.assertEqual(result.kind, "completed")

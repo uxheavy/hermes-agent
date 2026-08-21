@@ -1025,10 +1025,15 @@ class HermesKernelAdapter:
                     }
                 )
 
+        plane_toolsets = {
+            PLANE_OPERATION_TOOLSET,
+            PLANE_PUBLICATION_TOOLSET,
+            PLANE_CODE_MODE_TOOLSET,
+        }
         enabled_toolsets = [
             toolset
             for toolset in self._enabled_toolsets
-            if toolset != "code_execution"
+            if toolset not in plane_toolsets and toolset != "code_execution"
         ]
         if self._host_port is None and _code_mode_is_available(snapshot):
             enabled_toolsets.append("code_execution")
