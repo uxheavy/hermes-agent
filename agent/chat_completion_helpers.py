@@ -71,26 +71,46 @@ _PLANE_CODE_MODE_TOOL = "plane_execute_typescript"
 def _plane_tool_name(tool):
     if not isinstance(tool, dict):
         return None
-    if tool.get("name") == _PLANE_FIRST_REQUIRED_TOOL:
+    if isinstance(tool.get("name"), str):
         return tool["name"]
     function = tool.get("function")
-    if isinstance(function, dict) and function.get("name") == _PLANE_FIRST_REQUIRED_TOOL:
+    if isinstance(function, dict) and isinstance(function.get("name"), str):
         return function["name"]
     return None
 
 
+def _plane_required_tool(agent):
+    required = getattr(agent, "_plane_first_required_tool", None)
+    if isinstance(required, str) and required:
+        return required
+    pending_check = getattr(
+        agent, "_plane_runtime_outcome_submission_pending_check", None
+    )
+    if callable(pending_check):
+        try:
+            if pending_check():
+                setattr(agent, "_plane_first_required_tool", "plane_publish")
+                setattr(agent, "_plane_first_required_tool_retries", 0)
+                return "plane_publish"
+        except Exception:
+            pass
+    return None
+
+
 def _plane_first_tool_available(agent, tools):
+    required = _plane_required_tool(agent)
     return (
-        getattr(agent, "_plane_first_required_tool", None) == _PLANE_FIRST_REQUIRED_TOOL
-        and any(_plane_tool_name(tool) == _PLANE_FIRST_REQUIRED_TOOL for tool in (tools or []))
+        isinstance(required, str)
+        and any(_plane_tool_name(tool) == required for tool in (tools or []))
     )
 
 
 def _plane_first_tool_tools(agent, tools):
     """Expose only the finite first tool without changing the registry."""
+    required = _plane_required_tool(agent)
     if not _plane_first_tool_available(agent, tools):
         return tools
-    return [tool for tool in tools if _plane_tool_name(tool) == _PLANE_FIRST_REQUIRED_TOOL]
+    return [tool for tool in tools if _plane_tool_name(tool) == required]
 
 
 def _plane_codex_request_overrides(agent, tools):
@@ -102,7 +122,7 @@ def _plane_codex_request_overrides(agent, tools):
     """
     configured = getattr(agent, "request_overrides", None)
     overrides = dict(configured) if isinstance(configured, dict) else {}
-    if getattr(agent, "_plane_first_required_tool", None) == _PLANE_FIRST_REQUIRED_TOOL:
+    if _plane_required_tool(agent) is not None:
         if _plane_first_tool_available(agent, tools):
             overrides["tool_choice"] = "required"
         return overrides

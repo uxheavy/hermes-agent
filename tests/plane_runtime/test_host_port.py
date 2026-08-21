@@ -153,6 +153,68 @@ def _applied_outcome_publication(
 
 
 class HostPortTests(unittest.TestCase):
+    def test_submit_arms_explicit_publish_and_rejected_publish_stays_recoverable(self) -> None:
+        def submitted_port(request: dict) -> dict:
+            if request["action"] == "code":
+                return _result(
+                    request,
+                    output={
+                        "observations": [
+                            {
+                                "operationRef": "operation:agent.outcome.submit",
+                                "status": "ok",
+                            }
+                        ]
+                    },
+                )
+            return _result(request, publication=_applied_outcome_publication())
+
+        binding = PlaneHostBinding(
+            port=CallablePlaneHostPort(submitted_port),
+            run_id="run:publication-continuation",
+            invocation_id="invocation:publication-continuation",
+            correlation_id="correlation:publication-continuation",
+            cancellation=lambda: False,
+        )
+        binding.call(
+            action="code",
+            operation_ref="plane.code-mode.execute@1",
+            input={"source": "export default async () => ({})"},
+            source="code",
+        )
+        self.assertTrue(binding.outcome_submission_pending())
+
+        binding.publish(
+            kind="outcome",
+            operation_ref=PLANE_OUTCOME_PUBLISH_OPERATION,
+            resource_ref="outcome-submission:test",
+            content="explicit publication",
+        )
+        self.assertFalse(binding.outcome_submission_pending())
+
+        rejected = PlaneHostBinding(
+            port=CallablePlaneHostPort(
+                lambda request: _result(
+                    request,
+                    status="invalid",
+                    errorCode="OPERATION_REJECTED",
+                    errorMessage="submit the outcome first",
+                )
+            ),
+            run_id="run:publication-recoverable",
+            invocation_id="invocation:publication-recoverable",
+            correlation_id="correlation:publication-recoverable",
+            cancellation=lambda: False,
+        )
+        result = rejected.publish(
+            kind="outcome",
+            operation_ref=PLANE_OUTCOME_PUBLISH_OPERATION,
+            resource_ref="outcome-submission:missing",
+            content="too early",
+        )
+        self.assertEqual(result.status, "invalid")
+        self.assertIsNone(rejected.fatal_error)
+
     def test_host_operation_diagnostic_is_bounded_and_phase_exact(self) -> None:
         operation_ref = "operation:work-item-get@1"
         operation_ref_digest = hashlib.sha256(operation_ref.encode("utf-8")).hexdigest()

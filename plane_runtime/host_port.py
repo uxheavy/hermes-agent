@@ -95,6 +95,10 @@ _HOST_RESULT_DISPOSITIONS: Mapping[tuple[str, str | None], HostResultDisposition
         ("ok", None): "continue_with_tool_result",
         ("replayed", None): "continue_with_tool_result",
         ("invalid", "VALIDATION_ERROR"): "continue_with_tool_result",
+        # A publication attempted before its submitted outcome exists is a
+        # recoverable product rejection; the model may still submit first.
+        ("invalid", "OPERATION_REJECTED"): "continue_with_tool_result",
+        ("invalid", "OUTCOME_SUBMISSION_REQUIRED"): "continue_with_tool_result",
         # A generated Code Mode module may fail in the restricted isolate.
         # Return that finite, bounded result to the model so it can correct
         # the module in the same invocation; host/transport failures remain
@@ -479,6 +483,22 @@ def _prepared_read_refs_from_search_result(output: Any) -> tuple[str, ...]:
     return tuple(prepared_refs)
 
 
+def _successful_outcome_submit_from_code_mode_result(output: Any) -> bool:
+    """Detect a successful nested outcome submit without trusting model text."""
+
+    if not isinstance(output, Mapping):
+        return False
+    observations = output.get("observations")
+    if not isinstance(observations, list):
+        return False
+    return any(
+        isinstance(observation, Mapping)
+        and observation.get("operationRef") == "operation:agent.outcome.submit"
+        and observation.get("status") in {"ok", "replayed"}
+        for observation in observations
+    )
+
+
 def _prepared_read_ref_from_search_result(output: Any) -> str | None:
     """Return a single prepared read ref for compatibility with callers."""
 
@@ -815,6 +835,7 @@ class PlaneHostBinding:
     _prepared_read_handoff_pending: bool = field(default=False, init=False, repr=False)
     _code_mode_phase_hint: str | None = field(default=None, init=False, repr=False)
     _code_mode_continuation_used: bool = field(default=False, init=False, repr=False)
+    _outcome_submission_pending: bool = field(default=False, init=False, repr=False)
     _outcome_publication_metadata: dict[str, Any] | None = field(
         default=None, init=False, repr=False
     )
@@ -899,6 +920,12 @@ class PlaneHostBinding:
             if self._outcome_publication_metadata is None:
                 return None
             return dict(self._outcome_publication_metadata)
+
+    def outcome_submission_pending(self) -> bool:
+        """Return whether explicit publication is still required after submit."""
+
+        with self._lock:
+            return self._outcome_submission_pending and self._terminal_action_reason is None
 
     def _fail(self, message: str) -> None:
         if self._fatal_error is None:
@@ -1137,6 +1164,12 @@ class PlaneHostBinding:
             except Exception:
                 self._set_callback_phase("adapter_event")
                 raise
+            if (
+                request.action == "code"
+                and result.status in {"ok", "replayed"}
+                and _successful_outcome_submit_from_code_mode_result(result.output)
+            ):
+                self._outcome_submission_pending = True
             prepared_ref: str | None = None
             if (
                 operation_ref == "operation:search_workspace"
@@ -1355,6 +1388,7 @@ class PlaneHostBinding:
                 self._terminal_action_request = request
                 if self._outcome_publication_metadata is not None:
                     self._outcome_publication_metadata["terminal_armed"] = True
+                self._outcome_submission_pending = False
             if self.emit_body is not None:
                 try:
                     self.emit_body(

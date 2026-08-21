@@ -1,6 +1,9 @@
 from types import SimpleNamespace
 
-from agent.chat_completion_helpers import _plane_codex_request_overrides
+from agent.chat_completion_helpers import (
+    _plane_codex_request_overrides,
+    _plane_first_tool_tools,
+)
 from agent.transports import get_transport
 
 
@@ -83,6 +86,40 @@ def test_first_tool_precedence_is_preserved_over_post_search_hint():
     request = _request(agent, [_EXECUTE_TOOL, _PUBLISH_TOOL])
 
     assert request["tool_choice"] == "required"
+
+
+def test_successful_submit_requires_explicit_publish_tool():
+    agent = SimpleNamespace(
+        provider="openai-codex",
+        model="gpt-5.6-codex",
+        request_overrides={},
+        _plane_runtime_outcome_submission_pending_check=lambda: True,
+    )
+
+    request = _request(agent, [_EXECUTE_TOOL, _PUBLISH_TOOL])
+
+    assert request["tool_choice"] == "required"
+    assert agent._plane_first_required_tool == "plane_publish"
+    assert _plane_first_tool_tools(agent, [_EXECUTE_TOOL, _PUBLISH_TOOL]) == [_PUBLISH_TOOL]
+
+
+def test_publish_requirement_is_not_created_for_ordinary_plane_or_non_plane_turns():
+    for agent in (
+        SimpleNamespace(
+            provider="openai-codex",
+            model="gpt-5.6-codex",
+            request_overrides={},
+            _plane_runtime_outcome_submission_pending_check=lambda: False,
+        ),
+        SimpleNamespace(
+            provider="other-provider",
+            model="other-model",
+            request_overrides={},
+        ),
+    ):
+        request = _request(agent, [_EXECUTE_TOOL, _PUBLISH_TOOL])
+        assert request["tool_choice"] == "auto"
+        assert getattr(agent, "_plane_first_required_tool", None) is None
 
 
 def test_pre_search_invalid_and_out_of_policy_hints_fail_closed_to_auto():
