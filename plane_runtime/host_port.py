@@ -1172,7 +1172,8 @@ class PlaneHostBinding:
                 with self._lock:
                     self._code_mode_phase_hint = None
                     should_arm = (
-                        result.status in {"ok", "replayed"}
+                        operation_ref == PLANE_CODE_MODE_EXECUTE_OPERATION
+                        and result.status in {"ok", "replayed"}
                         and self.code_mode_phase == "post_search"
                         and not self._code_mode_continuation_used
                     )

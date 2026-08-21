@@ -744,6 +744,40 @@ print("text_response")
         )
         self.assertIsNone(binding.code_mode_phase_hint())
 
+    def test_non_execute_outer_code_operation_does_not_arm_continuation(self) -> None:
+        output = {
+            "result": {
+                "ok": True,
+                "result": {
+                    "results": [
+                        {
+                            "objectType": "work_item",
+                            "workItemReadCall": "prepared-call:guard",
+                        }
+                    ]
+                },
+            }
+        }
+        binding = PlaneHostBinding(
+            port=CallablePlaneHostPort(
+                lambda request: _result(request, output=output)
+            ),
+            run_id="run:outer-guard",
+            invocation_id="invocation:outer-guard",
+            correlation_id="correlation:outer-guard",
+            cancellation=lambda: False,
+            code_mode_phase="post_search",
+            eager_operation_refs=frozenset({"operation:other"}),
+        )
+
+        binding.call(
+            action="code",
+            operation_ref="operation:other",
+            input={"source": "export default async () => ({})"},
+            source="code",
+        )
+        self.assertIsNone(binding.code_mode_phase_hint())
+
     def test_code_mode_search_result_accepts_v72_opaque_read_call(self) -> None:
         output = {
             "result": {
