@@ -1540,7 +1540,6 @@ class PlaneHostBinding:
                 self._terminal_action_request = request
                 if self._outcome_publication_metadata is not None:
                     self._outcome_publication_metadata["terminal_armed"] = True
-                self._outcome_submission_ref = None
             if self.emit_body is not None:
                 try:
                     self.emit_body(

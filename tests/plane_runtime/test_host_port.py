@@ -2236,7 +2236,7 @@ print("text_response")
                     request,
                     output={"result": {"outcome": {"outcomeRef": "outcome-submission:test"}}},
                 )
-            if len(calls) > 1:
+            if len(calls) > 2:
                 return _result(
                     request,
                     status="conflict",
@@ -2289,12 +2289,17 @@ print("text_response")
         )
 
         self.assertEqual(binding.terminal_action_reason(), "product_outcome_published")
+        self.assertEqual(binding.outcome_submission_ref(), "outcome-submission:test")
         self.assertEqual(duplicate, first)
         self.assertEqual(len(calls), 2)
         self.assertIsNone(binding.fatal_error)
         self.assertEqual(
             [body["kind"] for body in bodies],
-            ["progress_observed", "outcome_submission_observed"],
+            [
+                "progress_observed",
+                "progress_observed",
+                "outcome_submission_observed",
+            ],
         )
 
     def test_replayed_outcome_publication_retains_nonarming_metadata(self) -> None:
@@ -2397,7 +2402,11 @@ print("text_response")
         self.assertEqual(binding.terminal_action_reason(), "product_outcome_published")
         self.assertEqual(
             [body["kind"] for body in bodies],
-            ["progress_observed", "outcome_submission_observed"],
+            [
+                "progress_observed",
+                "progress_observed",
+                "outcome_submission_observed",
+            ],
         )
 
     def test_generic_outcome_receipt_in_output_arms_terminal_publication(self) -> None:
@@ -2462,10 +2471,14 @@ print("text_response")
         self.assertIsNone(binding.fatal_error)
         self.assertEqual(
             [body["kind"] for body in bodies],
-            ["progress_observed", "outcome_submission_observed"],
+            [
+                "progress_observed",
+                "progress_observed",
+                "outcome_submission_observed",
+            ],
         )
         self.assertEqual(
-            bodies[1]["publication"],
+            bodies[2]["publication"],
             {
                 "action": "applied",
                 "productKind": "outcome_submission",
@@ -2819,7 +2832,11 @@ print("text_response")
         self.assertIsNone(binding.terminal_action_reason())
         self.assertEqual(
             [body["kind"] for body in bodies],
-            ["progress_observed", "outcome_submission_observed"],
+            [
+                "progress_observed",
+                "progress_observed",
+                "outcome_submission_observed",
+            ],
         )
 
     def test_nonterminal_publications_and_plain_calls_do_not_signal(self) -> None:
