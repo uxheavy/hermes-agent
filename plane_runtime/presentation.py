@@ -16,6 +16,7 @@ _RULES = (
     "Call plane_operation directly with the listed exact input shape for every eager operation; eager operations are already disclosed and must not be rediscovered.",
     "For an operation not listed under eagerOperations, call catalog.search once and then operation:catalog.describe once before invocation.",
     "For an assigned work-item route, make operation:search_workspace the first Plane call and use its prepared typed references; do not begin with catalog.search or catalog.describe.",
+    "After search_workspace returns a work item, copy its opaque workItemReadCall string into plane_operation input {\"preparedCallRef\":\"<the returned prepared-call:...>\"}; do not construct an action/operationRef/input envelope, nest an object under preparedCallRef, or use project_id/issue_id.",
     "Never guess input field names.",
     "Disclosure is not authorization.",
     "Ordinary final text is not publication.",
@@ -29,6 +30,19 @@ _CODE_MODE_RULES = (
     "Disclosure is not authorization.",
 )
 
+_PREPARED_READ_INPUT_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["preparedCallRef"],
+    "properties": {
+        "preparedCallRef": {
+            "type": "string",
+            "minLength": len("prepared-call:"),
+            "maxLength": 256,
+        }
+    },
+}
+
 
 def _plain(value: Any) -> Any:
     if isinstance(value, Mapping):
@@ -38,6 +52,14 @@ def _plain(value: Any) -> Any:
     if isinstance(value, list):
         return [_plain(item) for item in value]
     return value
+
+
+def _model_input_schema(operation: Mapping[str, Any]) -> Any:
+    """Project the opaque work-item handoff into the model-facing contract."""
+
+    if operation.get("operationRef") == "operation:work_item.read":
+        return _plain(_PREPARED_READ_INPUT_SCHEMA)
+    return _plain(operation["inputSchema"])
 
 
 def build_model_guidance(snapshot: G1RunSnapshot) -> str:
@@ -52,7 +74,7 @@ def build_model_guidance(snapshot: G1RunSnapshot) -> str:
         "eagerOperations": [
             {
                 "operationRef": operation["operationRef"],
-                "inputSchema": _plain(operation["inputSchema"]),
+                "inputSchema": _model_input_schema(operation),
             }
             for operation in snapshot.eager_operations
         ],

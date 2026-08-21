@@ -415,8 +415,9 @@ class AdapterPresentationTests(unittest.TestCase):
             ["operation:search_workspace", "operation:work_item.read"],
         )
         self.assertNotIn("operation:catalog.describe", [request["operationRef"] for request in requests])
-        self.assertIn('"project_id"', str(captured["system_message"]))
-        self.assertIn('"issue_id"', str(captured["system_message"]))
+        self.assertIn('"required":["preparedCallRef"]', str(captured["system_message"]))
+        self.assertNotIn('"project_id"', str(captured["system_message"]))
+        self.assertNotIn('"issue_id"', str(captured["system_message"]))
 
 
 if __name__ == "__main__":
