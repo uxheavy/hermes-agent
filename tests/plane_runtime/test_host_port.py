@@ -27,6 +27,8 @@ from plane_runtime.host_port import (
     PlaneHostError,
     PlaneHostUnavailable,
     HostCallRequest,
+    PLANE_CATALOG_DESCRIBE_OPERATION,
+    PLANE_CATALOG_SEARCH_OPERATION,
     PLANE_OUTCOME_SUBMIT_OPERATION,
     PLANE_OUTCOME_PUBLISH_OPERATION,
     UnixSocketPlaneHostPort,
@@ -772,6 +774,149 @@ class HostPortTests(unittest.TestCase):
         )
         self.assertEqual(first_use.status, "invalid")
         self.assertEqual(len(fresh_requests), 1)
+
+    def test_catalog_search_replays_locally_after_successful_discovery(self) -> None:
+        requests: list[dict] = []
+
+        def respond(request: dict) -> dict:
+            requests.append(request)
+            if request["operationRef"] == PLANE_CATALOG_SEARCH_OPERATION:
+                return _result(
+                    request,
+                    output={"operations": [{"operationId": "work_item.read"}]},
+                )
+            if request["operationRef"] == PLANE_CATALOG_DESCRIBE_OPERATION:
+                return _result(
+                    request,
+                    output={
+                        "operation": {
+                            "operationId": request["input"]["operation_id"],
+                            "operationRef": "operation:" + request["input"]["operation_id"],
+                            "inputSchema": {"type": "object"},
+                        }
+                    },
+                )
+            self.assertEqual(request["operationRef"], "operation:mutate@1")
+            return _result(
+                request,
+                status="denied",
+                errorCode="NOT_AUTHORIZED",
+                errorMessage="operation is not authorized",
+            )
+
+        binding = PlaneHostBinding(
+            port=CallablePlaneHostPort(respond),
+            run_id="run:catalog-replay",
+            invocation_id="invocation:catalog-replay",
+            correlation_id="correlation:catalog-replay",
+            cancellation=lambda: False,
+        )
+        first_search = binding.call(
+            action="read",
+            operation_ref=PLANE_CATALOG_SEARCH_OPERATION,
+            input={"query": "assigned", "limit": 8},
+            source="model",
+        )
+        description = binding.call(
+            action="read",
+            operation_ref=PLANE_CATALOG_DESCRIBE_OPERATION,
+            input={"operation_id": "work_item.read"},
+            source="model",
+        )
+        different_description = binding.call(
+            action="read",
+            operation_ref=PLANE_CATALOG_DESCRIBE_OPERATION,
+            input={"operation_id": "work_item.rename"},
+            source="model",
+        )
+        repeated_search = binding.call(
+            action="read",
+            operation_ref=PLANE_CATALOG_SEARCH_OPERATION,
+            input={"query": "assigned", "limit": 8},
+            source="model",
+        )
+        denied_mutation = binding.call(
+            action="mutate",
+            operation_ref="operation:mutate@1",
+            input={"name": "assigned"},
+            source="model",
+        )
+
+        self.assertEqual(first_search.status, "ok")
+        self.assertEqual(description.status, "ok")
+        self.assertEqual(different_description.status, "ok")
+        self.assertEqual(repeated_search.status, "replayed")
+        self.assertTrue(repeated_search.replayed)
+        self.assertEqual(
+            repeated_search.output,
+            {
+                "alreadyDiscovered": True,
+                "operationRef": PLANE_CATALOG_SEARCH_OPERATION,
+            },
+        )
+        self.assertEqual(denied_mutation.status, "denied")
+        self.assertIsNone(binding.fatal_error)
+        self.assertEqual(
+            [request["operationRef"] for request in requests],
+            [
+                PLANE_CATALOG_SEARCH_OPERATION,
+                PLANE_CATALOG_DESCRIBE_OPERATION,
+                PLANE_CATALOG_DESCRIBE_OPERATION,
+                "operation:mutate@1",
+            ],
+        )
+        self.assertEqual(len(binding.records), 4)
+
+    def test_catalog_search_guard_does_not_arm_on_incomplete_discovery(self) -> None:
+        requests: list[dict] = []
+
+        def respond(request: dict) -> dict:
+            requests.append(request)
+            if request["operationRef"] == PLANE_CATALOG_DESCRIBE_OPERATION:
+                return _result(
+                    request,
+                    status="invalid",
+                    errorCode="VALIDATION_ERROR",
+                    errorMessage="operation_id is unknown",
+                )
+            return _result(request, output={"operations": []})
+
+        binding = PlaneHostBinding(
+            port=CallablePlaneHostPort(respond),
+            run_id="run:catalog-incomplete",
+            invocation_id="invocation:catalog-incomplete",
+            correlation_id="correlation:catalog-incomplete",
+            cancellation=lambda: False,
+        )
+        binding.call(
+            action="read",
+            operation_ref=PLANE_CATALOG_SEARCH_OPERATION,
+            input={"query": "assigned", "limit": 8},
+            source="model",
+        )
+        binding.call(
+            action="read",
+            operation_ref=PLANE_CATALOG_DESCRIBE_OPERATION,
+            input={"operation_id": "missing"},
+            source="model",
+        )
+        second_search = binding.call(
+            action="read",
+            operation_ref=PLANE_CATALOG_SEARCH_OPERATION,
+            input={"query": "assigned", "limit": 8},
+            source="model",
+        )
+
+        self.assertEqual(second_search.status, "ok")
+        self.assertFalse(second_search.replayed)
+        self.assertEqual(
+            [request["operationRef"] for request in requests],
+            [
+                PLANE_CATALOG_SEARCH_OPERATION,
+                PLANE_CATALOG_DESCRIBE_OPERATION,
+                PLANE_CATALOG_SEARCH_OPERATION,
+            ],
+        )
 
     def test_cross_process_model_search_consumes_prepared_read_before_text_exit(self) -> None:
         """A child using the real model-facing tool dispatch cannot exit after search."""

@@ -922,6 +922,8 @@ class PlaneHostBinding:
     _terminal_action_request: HostCallRequest | None = field(default=None, init=False, repr=False)
     _prepared_read_handoff_pending: bool = field(default=False, init=False, repr=False)
     _prepared_read_completion: HostCallResult | None = field(default=None, init=False, repr=False)
+    _catalog_search_discovered: bool = field(default=False, init=False, repr=False)
+    _catalog_describe_discovered: bool = field(default=False, init=False, repr=False)
     _code_mode_phase_hint: str | None = field(default=None, init=False, repr=False)
     _code_mode_continuation_used: bool = field(default=False, init=False, repr=False)
     _outcome_submission_ref: str | None = field(default=None, init=False, repr=False)
@@ -1167,6 +1169,31 @@ class PlaneHostBinding:
             raise PlaneHostUnavailable("catalog.describe result was malformed or mismatched") from exc
         self.described_operation_refs.add(described_ref)
 
+    def _catalog_search_replay_for(
+        self, request: HostCallRequest
+    ) -> HostCallResult | None:
+        """Bound repeated model catalog search after discovery is complete."""
+
+        if not (
+            request.action == "read"
+            and request.source == "model"
+            and request.operation_ref == PLANE_CATALOG_SEARCH_OPERATION
+            and self._catalog_search_discovered
+            and self._catalog_describe_discovered
+        ):
+            return None
+        return HostCallResult(
+            request_ref=request.request_ref,
+            correlation_id=request.correlation_id,
+            idempotency_key=request.idempotency_key,
+            status="replayed",
+            replayed=True,
+            output={
+                "alreadyDiscovered": True,
+                "operationRef": PLANE_CATALOG_SEARCH_OPERATION,
+            },
+        )
+
     def _is_cancelled(self) -> bool:
         try:
             cancelled = self.cancellation()
@@ -1254,6 +1281,9 @@ class PlaneHostBinding:
                 duplicate = self._duplicate_after_prepared_read(request)
                 if duplicate is not None:
                     return duplicate
+            catalog_search_replay = self._catalog_search_replay_for(request)
+            if catalog_search_replay is not None:
+                return catalog_search_replay
             self._require_schema_disclosure(
                 action=action,
                 operation_ref=operation_ref,
@@ -1290,6 +1320,18 @@ class PlaneHostBinding:
             except Exception:
                 self._set_callback_phase("adapter_event")
                 raise
+            if (
+                request.action == "read"
+                and request.operation_ref == PLANE_CATALOG_SEARCH_OPERATION
+                and result.status in {"ok", "replayed"}
+            ):
+                self._catalog_search_discovered = True
+            if (
+                request.action == "read"
+                and request.operation_ref == PLANE_CATALOG_DESCRIBE_OPERATION
+                and result.status in {"ok", "replayed"}
+            ):
+                self._catalog_describe_discovered = True
             self._emit_call_observation(request, result)
             try:
                 self._observe_publication(request, result)
