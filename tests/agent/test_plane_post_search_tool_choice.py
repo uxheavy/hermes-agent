@@ -96,8 +96,9 @@ def test_post_search_phase_selects_named_code_mode_tool():
         provider="openai-codex",
         model="gpt-5.6-codex",
         request_overrides={},
-        _plane_runtime_code_mode_phase_hint=lambda: "post_search",
-        _plane_runtime_code_mode_phase_consume=lambda: consumed.append(True),
+        _plane_runtime_code_mode_phase_consume=lambda: (
+            consumed.append(True) or "post_search"
+        ),
     )
 
     request = _request(agent, [_EXECUTE_TOOL, _PUBLISH_TOOL])
@@ -115,8 +116,7 @@ def test_post_search_phase_consumer_is_one_shot():
         provider="openai-codex",
         model="gpt-5.6-codex",
         request_overrides={},
-        _plane_runtime_code_mode_phase_hint=lambda: phase[0],
-        _plane_runtime_code_mode_phase_consume=lambda: phase.__setitem__(0, None),
+        _plane_runtime_code_mode_phase_consume=lambda: phase.pop(0),
     )
 
     first = _request(agent, [_EXECUTE_TOOL, _PUBLISH_TOOL])
@@ -127,6 +127,49 @@ def test_post_search_phase_consumer_is_one_shot():
         "name": "plane_execute_typescript",
     }
     assert second["tool_choice"] == "auto"
+
+
+def test_post_search_phase_requires_atomic_consumer():
+    agent = SimpleNamespace(
+        provider="openai-codex",
+        model="gpt-5.6-codex",
+        request_overrides={},
+        _plane_runtime_code_mode_phase_hint=lambda: "post_search",
+    )
+
+    request = _request(agent, [_EXECUTE_TOOL, _PUBLISH_TOOL])
+
+    assert request["tool_choice"] == "auto"
+
+
+def test_post_search_phase_consumer_must_return_trusted_phase():
+    consumed = []
+    agent = SimpleNamespace(
+        provider="openai-codex",
+        model="gpt-5.6-codex",
+        request_overrides={},
+        _plane_runtime_code_mode_phase_consume=lambda: consumed.append(True),
+    )
+
+    request = _request(agent, [_EXECUTE_TOOL, _PUBLISH_TOOL])
+
+    assert request["tool_choice"] == "auto"
+    assert consumed == [True]
+
+
+def test_post_search_phase_is_not_consumed_without_execute_tool():
+    phase = ["post_search"]
+    agent = SimpleNamespace(
+        provider="openai-codex",
+        model="gpt-5.6-codex",
+        request_overrides={},
+        _plane_runtime_code_mode_phase_consume=lambda: phase.pop(0),
+    )
+
+    request = _request(agent, [_PUBLISH_TOOL])
+
+    assert request["tool_choice"] == "auto"
+    assert phase == ["post_search"]
 
 
 def test_first_tool_precedence_is_preserved_over_post_search_hint():

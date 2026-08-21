@@ -132,26 +132,28 @@ def _plane_codex_request_overrides(agent, tools):
         return overrides
     if not str(getattr(agent, "model", "")).lower().startswith("gpt-5.6"):
         return overrides
-    phase_hint = getattr(agent, "_plane_runtime_code_mode_phase_hint", None)
-    if not callable(phase_hint):
-        return overrides
-    try:
-        phase = phase_hint()
-    except Exception:
-        return overrides
-    if phase == "post_search" and any(
+    if not any(
         _plane_tool_name(tool) == _PLANE_CODE_MODE_TOOL for tool in (tools or [])
     ):
-        consume_phase = getattr(agent, "_plane_runtime_code_mode_phase_consume", None)
-        if callable(consume_phase):
-            try:
-                consume_phase()
-            except Exception:
-                return overrides
-        overrides["tool_choice"] = {
-            "type": "function",
-            "name": _PLANE_CODE_MODE_TOOL,
-        }
+        return overrides
+
+    # The host binding's take method is the atomic phase read-and-consume
+    # boundary. Do not observe the phase through one callback and consume it
+    # through another: concurrent request construction could otherwise turn
+    # one trusted handoff into multiple continuations.
+    consume_phase = getattr(agent, "_plane_runtime_code_mode_phase_consume", None)
+    if not callable(consume_phase):
+        return overrides
+    try:
+        phase = consume_phase()
+    except Exception:
+        return overrides
+    if phase != "post_search":
+        return overrides
+    overrides["tool_choice"] = {
+        "type": "function",
+        "name": _PLANE_CODE_MODE_TOOL,
+    }
     return overrides
 
 
