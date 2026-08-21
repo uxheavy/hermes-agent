@@ -96,6 +96,7 @@ _HOST_RESULT_DISPOSITIONS: Mapping[tuple[str, str | None], HostResultDisposition
         ("ok", None): "continue_with_tool_result",
         ("replayed", None): "continue_with_tool_result",
         ("invalid", "VALIDATION_ERROR"): "continue_with_tool_result",
+        ("invalid", "READ_ALREADY_CONSUMED"): "continue_with_tool_result",
         # A generated Code Mode module may fail in the restricted isolate.
         # Return that finite, bounded result to the model so it can correct
         # the module in the same invocation; host/transport failures remain
@@ -1420,14 +1421,11 @@ class PlaneHostBinding:
             request_ref=request.request_ref,
             correlation_id=request.correlation_id,
             idempotency_key=request.idempotency_key,
-            status="replayed",
-            replayed=True,
-            output={
-                "ok": True,
-                "replayed": True,
-                "duplicate": True,
-                "operationId": "work_item.read",
-            },
+            status="invalid",
+            replayed=False,
+            output=None,
+            error_code="READ_ALREADY_CONSUMED",
+            error_message="the invocation already consumed its prepared work-item read",
         )
 
     def publish(

@@ -722,21 +722,25 @@ class HostPortTests(unittest.TestCase):
         duplicate = binding.call(
             action="read",
             operation_ref="operation:work_item.read",
-            input={"preparedCallRef": {"unexpected": True}},
+            input={
+                "preparedCallRef": {
+                    "acceptedForm": "unrecognized",
+                    "keyNames": ["preparedCallRef"],
+                    "valueTypes": ["object", "string"],
+                    "nestingDepth": 1,
+                    "sizeClass": "small",
+                }
+            },
             source="model",
         )
 
         self.assertEqual(first.status, "ok")
-        self.assertEqual(duplicate.status, "replayed")
-        self.assertTrue(duplicate.replayed)
+        self.assertEqual(duplicate.status, "invalid")
+        self.assertFalse(duplicate.replayed)
+        self.assertEqual(duplicate.error_code, "READ_ALREADY_CONSUMED")
         self.assertEqual(
-            duplicate.output,
-            {
-                "ok": True,
-                "replayed": True,
-                "duplicate": True,
-                "operationId": "work_item.read",
-            },
+            duplicate.error_message,
+            "the invocation already consumed its prepared work-item read",
         )
         self.assertNotIn("prepared-call:opaque", json.dumps(duplicate.to_dict()))
         self.assertEqual(len(requests), 1)
