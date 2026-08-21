@@ -34,7 +34,7 @@ class G1ContractTests(unittest.TestCase):
         )
         self.assertEqual(
             G1_CONTRACT_DIGESTS["runSnapshot"],
-            "5836fdcf333eab9ada37bc7a3078ce5cf33a779dd4fcbadb1c3848d572339d37",
+            "0e72f04579f8cebd00b7afee1885d0ff68ee04ee30dfd7ff3e74e9ca05cddaed",
         )
         self.assertEqual(
             G1_CONTRACT_DIGESTS["runtimeEvent"],
@@ -46,7 +46,7 @@ class G1ContractTests(unittest.TestCase):
         )
         self.assertEqual(
             G1_MANIFEST_DIGEST,
-            "3a9994f725a183a5c9e9ba122424b757af7726979849538f95d29753ae3364a8",
+            "b9977eb93b0c521cba3047f96de790cd472181caaab6473440148f4797f5583d",
         )
 
     def test_eager_presentation_fields_are_strict(self) -> None:
@@ -81,6 +81,23 @@ class G1ContractTests(unittest.TestCase):
         raw["toolCatalog"]["eagerOperations"][0]["inputSchema"]["required"] = ["other"]  # type: ignore[index]
         with self.assertRaisesRegex(G1ContractError, "immutable content"):
             G1RunSnapshot.from_dict(raw)
+
+    def test_code_mode_phase_is_bounded_and_typed(self) -> None:
+        raw = make_snapshot()
+        raw["runtimePolicy"]["codeModePhase"] = "post_search"  # type: ignore[index]
+        raw["contentDigest"] = _digest(
+            "snapshot", {key: value for key, value in raw.items() if key != "contentDigest"}
+        )
+        snapshot = G1RunSnapshot.from_dict(raw)
+        self.assertEqual(snapshot.code_mode_phase, "post_search")
+
+        invalid = copy.deepcopy(raw)
+        invalid["runtimePolicy"]["codeModePhase"] = "before_search"  # type: ignore[index]
+        invalid["contentDigest"] = _digest(
+            "snapshot", {key: value for key, value in invalid.items() if key != "contentDigest"}
+        )
+        with self.assertRaisesRegex(G1ContractError, "codeModePhase"):
+            G1RunSnapshot.from_dict(invalid)
 
     def test_input_schema_and_aggregate_bounds_reject_without_truncation(self) -> None:
         per_schema = make_snapshot()

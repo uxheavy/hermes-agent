@@ -65,6 +65,7 @@ _FALLBACK_EXHAUSTED_COOLDOWN_S = 5.0
 # Responses ``required`` mode selects it without provider-specific function
 # object syntax; once the adapter consumes the hint, normal ``auto`` resumes.
 _PLANE_FIRST_REQUIRED_TOOL = "plane_execute_typescript"
+_PLANE_CODE_MODE_TOOL = "plane_execute_typescript"
 
 
 def _plane_tool_name(tool):
@@ -93,19 +94,37 @@ def _plane_first_tool_tools(agent, tools):
 
 
 def _plane_codex_request_overrides(agent, tools):
-    """Return request overrides with Plane's bounded first-tool choice.
+    """Return request overrides with Plane's bounded tool choices.
 
-    Only the finite adapter-owned hint can add this override.  In particular,
-    a missing/unknown hint or an exposed toolset without the required tool
-    leaves the existing request-overrides and transport defaults unchanged.
+    V69's finite first-tool requirement takes precedence. After the trusted
+    host consumes a prepared read, V70 selects the named Code Mode function
+    for the next Codex Responses request.
     """
     configured = getattr(agent, "request_overrides", None)
     overrides = dict(configured) if isinstance(configured, dict) else {}
-    if getattr(agent, "_plane_first_required_tool", None) != _PLANE_FIRST_REQUIRED_TOOL:
+    if getattr(agent, "_plane_first_required_tool", None) == _PLANE_FIRST_REQUIRED_TOOL:
+        if _plane_first_tool_available(agent, tools):
+            overrides["tool_choice"] = "required"
         return overrides
 
-    if _plane_first_tool_available(agent, tools):
-        overrides["tool_choice"] = "required"
+    if getattr(agent, "provider", None) != "openai-codex":
+        return overrides
+    if not str(getattr(agent, "model", "")).lower().startswith("gpt-5.6"):
+        return overrides
+    phase_hint = getattr(agent, "_plane_runtime_code_mode_phase_hint", None)
+    if not callable(phase_hint):
+        return overrides
+    try:
+        phase = phase_hint()
+    except Exception:
+        return overrides
+    if phase == "post_search" and any(
+        _plane_tool_name(tool) == _PLANE_CODE_MODE_TOOL for tool in (tools or [])
+    ):
+        overrides["tool_choice"] = {
+            "type": "function",
+            "name": _PLANE_CODE_MODE_TOOL,
+        }
     return overrides
 
 

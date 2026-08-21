@@ -29,16 +29,17 @@ MAX_EAGER_OPERATIONS = 64
 MAX_EAGER_INPUT_SCHEMA_BYTES = 16 * 1024
 MAX_EAGER_PRESENTATION_BYTES = 512 * 1024
 MAX_EAGER_SCHEMA_PROPERTIES = 4096
+CODE_MODE_PHASES = frozenset({"none", "post_search"})
 
 # Frozen bytes from the paired Plane G1 runtime contract manifest.
 G1_CONTRACT_DIGESTS = {
-    "runSnapshot": "5836fdcf333eab9ada37bc7a3078ce5cf33a779dd4fcbadb1c3848d572339d37",
+    "runSnapshot": "0e72f04579f8cebd00b7afee1885d0ff68ee04ee30dfd7ff3e74e9ca05cddaed",
     "invocationEnvelope": "b7a15d74406f1624cdb7cd95b42edfd1ffee596abe57e4f00ed60e2e23ded995",
     "runtimeEvent": "d0fb1c67a7424f5359f9c09ff7206ef7d3d0d6e90e62b724c4a5e4e4bc13412d",
     "runtimeExit": "7b8fcefc9600eb1b4f8f0d4a383587489558b32ac27fa8a5d81bdf3e9443cf0b",
     "runtimeDurableState": "444c944ec8a5054f33c8662470529a1f4565d42ff06138438beceeef7967a0da",
 }
-G1_MANIFEST_DIGEST = "3a9994f725a183a5c9e9ba122424b757af7726979849538f95d29753ae3364a8"
+G1_MANIFEST_DIGEST = "b9977eb93b0c521cba3047f96de790cd472181caaab6473440148f4797f5583d"
 
 _ROLES = {"worker", "delegator", "gardener", "chief_of_staff", "hr", "evaluator", "custom"}
 _TRIGGERS = {"initial", "human_input", "recoverable_restart", "continuation"}
@@ -392,6 +393,7 @@ def _validate_snapshot(raw: Any) -> dict[str, Any]:
             "maxCodeModeInputBytes",
             "maxCodeModeOutputBytes",
             "maxCodeModeCalls",
+            "codeModePhase",
         },
         "runtimePolicy",
     )
@@ -411,6 +413,8 @@ def _validate_snapshot(raw: Any) -> dict[str, Any]:
             _bounded_byte_count(policy[key], f"runtimePolicy.{key}")
     if "maxCodeModeCalls" in policy:
         _bounded_integer(policy["maxCodeModeCalls"], "runtimePolicy.maxCodeModeCalls")
+    if "codeModePhase" in policy and policy["codeModePhase"] not in CODE_MODE_PHASES:
+        raise G1ContractError("runtimePolicy.codeModePhase is unsupported")
     _bounded_budget(data["totalBudget"], "totalBudget")
 
     digests = _object(data["contractDigests"], "contractDigests")
@@ -543,6 +547,10 @@ class G1RunSnapshot:
     @property
     def model_name(self) -> str:
         return str(self.raw["runtimePolicy"]["model"]["model"])
+
+    @property
+    def code_mode_phase(self) -> str:
+        return str(self.raw["runtimePolicy"].get("codeModePhase", "none"))
 
     @property
     def adapter_name(self) -> str:

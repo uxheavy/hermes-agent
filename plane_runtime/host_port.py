@@ -28,7 +28,7 @@ from dataclasses import dataclass, field, replace
 from types import MappingProxyType
 from typing import Any, Callable, Iterator, Literal, Mapping, Protocol
 
-from .g1_contract import G1ContractError, validate_eager_input_schema
+from .g1_contract import CODE_MODE_PHASES, G1ContractError, validate_eager_input_schema
 
 
 HOST_PROTOCOL = "plane.agent-runtime/v1"
@@ -759,6 +759,7 @@ class PlaneHostBinding:
     eager_operation_refs: frozenset[str] = field(default_factory=frozenset)
     max_calls: int = MAX_HOST_CALLS
     records: list[HostCallRecord] = field(default_factory=list)
+    code_mode_phase: str = "none"
     described_operation_refs: set[str] = field(default_factory=set, init=False, repr=False)
     _fatal_error: str | None = field(default=None, init=False, repr=False)
     _fatal_error_after_terminal: bool = field(default=False, init=False, repr=False)
@@ -769,6 +770,7 @@ class PlaneHostBinding:
     _terminal_action_result: HostCallResult | None = field(default=None, init=False, repr=False)
     _terminal_action_request: HostCallRequest | None = field(default=None, init=False, repr=False)
     _prepared_read_handoff_pending: bool = field(default=False, init=False, repr=False)
+    _code_mode_phase_hint: str | None = field(default=None, init=False, repr=False)
     _outcome_publication_metadata: dict[str, Any] | None = field(
         default=None, init=False, repr=False
     )
@@ -791,6 +793,8 @@ class PlaneHostBinding:
             for operation_ref in self.eager_operation_refs
         ):
             raise ValueError("Plane host eager operation refs must be operation references")
+        if self.code_mode_phase not in CODE_MODE_PHASES:
+            raise ValueError("Plane host Code Mode phase is unsupported")
 
     @property
     def fatal_error(self) -> str | None:
@@ -827,6 +831,12 @@ class PlaneHostBinding:
 
         with self._lock:
             return self._prepared_read_handoff_pending
+
+    def code_mode_phase_hint(self) -> str | None:
+        """Return the one trusted Code Mode phase hint, if armed."""
+
+        with self._lock:
+            return self._code_mode_phase_hint
 
     def outcome_publication_metadata(self) -> dict[str, Any] | None:
         """Return the last validated outcome publication's bounded facts."""
@@ -1099,12 +1109,18 @@ class PlaneHostBinding:
                     combined_output = dict(result.output) if isinstance(result.output, Mapping) else {}
                     combined_output["preparedReadResult"] = prepared_read.to_dict()
                     result = replace(result, output=combined_output)
+                    if prepared_read.status in {"ok", "replayed"} and self.code_mode_phase == "post_search":
+                        with self._lock:
+                            self._code_mode_phase_hint = "post_search"
             if (
                 operation_ref == "operation:work_item.read"
                 and isinstance(input.get("preparedCallRef"), str)
                 and result.status in {"ok", "replayed"}
             ):
                 self._prepared_read_handoff_pending = False
+            if action == "code":
+                with self._lock:
+                    self._code_mode_phase_hint = None
             if _host_result_disposition(result) == "poison_invocation":
                 self._fail(result.error_message or "Plane host rejected the callback")
             if self._is_cancelled():

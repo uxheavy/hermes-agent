@@ -635,6 +635,55 @@ print("text_response")
                 )
             )
 
+    def test_post_search_code_mode_hint_arms_after_prepared_read_and_is_consumed(self) -> None:
+        def respond(request: dict) -> dict:
+            if request["operationRef"] == "operation:search_workspace":
+                output = {
+                    "ok": True,
+                    "result": {
+                        "results": [
+                            {
+                                "objectType": "work_item",
+                                "workItemReadCall": {
+                                    "action": "read",
+                                    "operationRef": "operation:work_item.read",
+                                    "input": {"preparedCallRef": "prepared-call:post-search"},
+                                },
+                            }
+                        ]
+                    },
+                }
+            elif request["operationRef"] == "operation:work_item.read":
+                output = {"ok": True, "result": {"work_item": {"title": "assigned"}}}
+            else:
+                self.assertEqual(request["action"], "code")
+                output = {"ok": True, "result": {"completed": True}}
+            return _result(request, output=output)
+
+        binding = PlaneHostBinding(
+            port=CallablePlaneHostPort(respond),
+            run_id="run:post-search",
+            invocation_id="invocation:post-search",
+            correlation_id="correlation:post-search",
+            cancellation=lambda: False,
+            code_mode_phase="post_search",
+        )
+        binding.call(
+            action="read",
+            operation_ref="operation:search_workspace",
+            input={"query": "assigned"},
+            source="model",
+        )
+
+        self.assertEqual(binding.code_mode_phase_hint(), "post_search")
+        binding.call(
+            action="code",
+            operation_ref="plane.code-mode.execute@1",
+            input={"source": "export default async () => ({})"},
+            source="code",
+        )
+        self.assertIsNone(binding.code_mode_phase_hint())
+
     def test_unix_socket_client_round_trips_exact_canonical_contract(self) -> None:
         with _LocalHostServer(
             lambda request: (
