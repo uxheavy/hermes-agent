@@ -1173,6 +1173,38 @@ class PlaneHostBinding:
             ):
                 self._prepared_read_handoff_pending = False
             if action == "code":
+                prepared_refs = ()
+                prepared_read_succeeded = False
+                if (
+                    operation_ref == PLANE_CODE_MODE_EXECUTE_OPERATION
+                    and result.status in {"ok", "replayed"}
+                ):
+                    prepared_refs = _prepared_read_refs_from_code_mode_result(
+                        result.output
+                    )
+                    if len(prepared_refs) == 1:
+                        # The Plane host prepared this exact capability during
+                        # the Code Mode search. Consume it here through the
+                        # same bound port so generated code never has to
+                        # rebuild or nest a ready-to-call envelope.
+                        self._prepared_read_handoff_pending = True
+                        prepared_read = self.call(
+                            action="read",
+                            operation_ref="operation:work_item.read",
+                            input={"preparedCallRef": prepared_refs[0]},
+                            source="code",
+                        )
+                        prepared_read_succeeded = prepared_read.status in {
+                            "ok",
+                            "replayed",
+                        }
+                        combined_output = (
+                            dict(result.output)
+                            if isinstance(result.output, Mapping)
+                            else {}
+                        )
+                        combined_output["preparedReadResult"] = prepared_read.to_dict()
+                        result = replace(result, output=combined_output)
                 with self._lock:
                     self._code_mode_phase_hint = None
                     should_arm = (
@@ -1181,7 +1213,10 @@ class PlaneHostBinding:
                         and self.code_mode_phase == "post_search"
                         and not self._code_mode_continuation_used
                     )
-                if should_arm and _prepared_read_refs_from_code_mode_result(result.output):
+                if should_arm and (
+                    prepared_read_succeeded
+                    or len(prepared_refs) > 1
+                ):
                     with self._lock:
                         if not self._code_mode_continuation_used:
                             self._code_mode_phase_hint = "post_search"

@@ -677,7 +677,7 @@ print("text_response")
         )
 
         self.assertEqual(binding.code_mode_phase_hint(), "post_search")
-        binding.call(
+        result = binding.call(
             action="code",
             operation_ref="plane.code-mode.execute@1",
             input={"source": "export default async () => ({})"},
@@ -685,7 +685,7 @@ print("text_response")
         )
         self.assertIsNone(binding.code_mode_phase_hint())
 
-    def test_code_mode_search_result_arms_one_shot_continuation_without_read(self) -> None:
+    def test_code_mode_search_result_auto_consumes_one_prepared_read(self) -> None:
         def respond(request: dict) -> dict:
             if request["action"] == "code":
                 output = {
@@ -715,7 +715,14 @@ print("text_response")
                     ],
                 }
                 return _result(request, output=output)
-            return _result(request, output={"unexpected": True})
+            self.assertEqual(request["operationRef"], "operation:work_item.read")
+            self.assertEqual(
+                request["input"], {"preparedCallRef": "prepared-call:code-search"}
+            )
+            return _result(
+                request,
+                output={"ok": True, "result": {"work_item": {"title": "assigned"}}},
+            )
 
         binding = PlaneHostBinding(
             port=CallablePlaneHostPort(respond),
@@ -732,17 +739,24 @@ print("text_response")
             source="code",
         )
 
+        self.assertEqual(
+            [record.request.operation_ref for record in binding.records],
+            [
+                "plane.code-mode.execute@1",
+                "operation:work_item.read",
+            ],
+        )
+        self.assertEqual(
+            binding.records[1].request.input,
+            {"preparedCallRef": "prepared-call:code-search"},
+        )
+        self.assertEqual(
+            result.output["preparedReadResult"]["output"]["result"]["work_item"]["title"],
+            "assigned",
+        )
         self.assertEqual(binding.code_mode_phase_hint(), "post_search")
         self.assertEqual(binding.take_code_mode_phase_hint(), "post_search")
         self.assertIsNone(binding.take_code_mode_phase_hint())
-
-        binding.call(
-            action="code",
-            operation_ref="plane.code-mode.execute@1",
-            input={"source": "export default async () => ({})"},
-            source="code",
-        )
-        self.assertIsNone(binding.code_mode_phase_hint())
 
     def test_non_execute_outer_code_operation_does_not_arm_continuation(self) -> None:
         output = {
@@ -831,6 +845,61 @@ print("text_response")
             _prepared_read_refs_from_code_mode_result(output),
             ("prepared-call:object",),
         )
+
+    def test_code_mode_malformed_prepared_search_result_stays_fail_closed(self) -> None:
+        requests: list[dict] = []
+
+        def respond(request: dict) -> dict:
+            requests.append(request)
+            return _result(
+                request,
+                output={
+                    "schemaVersion": "plane.code-mode/v1",
+                    "result": {
+                        "ok": True,
+                        "result": {
+                            "results": [
+                                {
+                                    "objectType": "work_item",
+                                    "workItemReadCall": {
+                                        "preparedCallRef": {
+                                            "preparedCallRef": "prepared-call:tampered"
+                                        }
+                                    },
+                                }
+                            ]
+                        },
+                    },
+                    "observations": [
+                        {
+                            "source": "code",
+                            "action": "code",
+                            "operationRef": "operation:search_workspace",
+                            "status": "ok",
+                        }
+                    ],
+                },
+            )
+
+        binding = PlaneHostBinding(
+            port=CallablePlaneHostPort(respond),
+            run_id="run:code-search-tamper",
+            invocation_id="invocation:code-search-tamper",
+            correlation_id="correlation:code-search-tamper",
+            cancellation=lambda: False,
+            code_mode_phase="post_search",
+        )
+        binding.call(
+            action="code",
+            operation_ref="plane.code-mode.execute@1",
+            input={"source": "export default async () => ({})"},
+            source="code",
+        )
+
+        assert [request["operationRef"] for request in requests] == [
+            "plane.code-mode.execute@1"
+        ]
+        assert binding.code_mode_phase_hint() is None
 
     def test_code_mode_read_consumption_and_non_code_operations_do_not_arm(self) -> None:
         def respond(request: dict) -> dict:
