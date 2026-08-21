@@ -466,7 +466,8 @@ def _prepared_read_refs_from_search_result(output: Any) -> tuple[str, ...]:
     for item in items:
         if not isinstance(item, Mapping):
             continue
-        if item.get("objectType") != "work_item":
+        object_type = item.get("objectType")
+        if object_type is not None and object_type != "work_item":
             continue
         call = item.get("workItemReadCall")
         if not isinstance(call, Mapping):
