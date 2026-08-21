@@ -40,6 +40,7 @@ PLANE_PUBLISH_TOOL = "plane_publish"
 PLANE_CODE_MODE_TOOL = "plane_execute_typescript"
 PLANE_CODE_MODE_SCHEMA_VERSION = "plane.code-mode/v1"
 PLANE_CODE_MODE_EXECUTE_OPERATION = "plane.code-mode.execute@1"
+PLANE_OUTCOME_SUBMIT_OPERATION = "operation:agent.outcome.submit"
 PLANE_OUTCOME_PUBLISH_OPERATION = "operation:agent.outcome.publish"
 PLANE_DISCOVERY_OPERATION = "plane.operations.discover@1"
 PLANE_CATALOG_SEARCH_OPERATION = "operation:catalog.search"
@@ -497,22 +498,45 @@ def _prepared_read_refs_from_search_result(output: Any) -> tuple[str, ...]:
     return tuple(prepared_refs)
 
 
-def _successful_outcome_submit_from_code_mode_result(output: Any) -> bool:
-    """Detect a successful nested outcome submit without trusting model text."""
+def _outcome_ref_from_operation_result(value: Any) -> str | None:
+    """Extract the gateway-bound outcome ref from one bounded operation result."""
+
+    if not isinstance(value, Mapping):
+        return None
+    result = value.get("result")
+    if not isinstance(result, Mapping):
+        return None
+    outcome = result.get("outcome")
+    if not isinstance(outcome, Mapping):
+        return None
+    outcome_ref = outcome.get("outcomeRef")
+    if not isinstance(outcome_ref, str) or not outcome_ref.startswith("outcome-submission:"):
+        return None
+    try:
+        return _text(outcome_ref, "host.result.output.result.outcome.outcomeRef", 256)
+    except PlaneHostError:
+        return None
+
+
+def _outcome_ref_from_code_mode_result(output: Any) -> str | None:
+    """Extract a submit ref only when Code Mode observed that exact operation."""
 
     if not isinstance(output, Mapping):
-        return False
+        return None
     observations = output.get("observations")
     if not isinstance(observations, list):
-        return False
-    return any(
+        return None
+    submit_observed = any(
         isinstance(observation, Mapping)
         and observation.get("source") == "code"
         and observation.get("action") == "code"
-        and observation.get("operationRef") == "operation:agent.outcome.submit"
+        and observation.get("operationRef") == PLANE_OUTCOME_SUBMIT_OPERATION
         and observation.get("status") in {"ok", "replayed"}
         for observation in observations
     )
+    if not submit_observed:
+        return None
+    return _outcome_ref_from_operation_result(output.get("result"))
 
 
 def _prepared_read_ref_from_search_result(output: Any) -> str | None:
@@ -873,7 +897,7 @@ class PlaneHostBinding:
     _prepared_read_handoff_pending: bool = field(default=False, init=False, repr=False)
     _code_mode_phase_hint: str | None = field(default=None, init=False, repr=False)
     _code_mode_continuation_used: bool = field(default=False, init=False, repr=False)
-    _outcome_submission_pending: bool = field(default=False, init=False, repr=False)
+    _outcome_submission_ref: str | None = field(default=None, init=False, repr=False)
     _outcome_publication_metadata: dict[str, Any] | None = field(
         default=None, init=False, repr=False
     )
@@ -963,7 +987,25 @@ class PlaneHostBinding:
         """Return whether explicit publication is still required after submit."""
 
         with self._lock:
-            return self._outcome_submission_pending and self._terminal_action_reason is None
+            return self._outcome_submission_ref is not None and self._terminal_action_reason is None
+
+    def outcome_submission_ref(self) -> str | None:
+        """Return the trusted outcome ref bound by this invocation's submit."""
+
+        with self._lock:
+            return self._outcome_submission_ref
+
+    def _bind_outcome_submission_ref(self, outcome_ref: str) -> None:
+        with self._lock:
+            if (
+                self._outcome_submission_ref is not None
+                and self._outcome_submission_ref != outcome_ref
+            ):
+                self._fail("successful outcome submit returned a different outcome ref")
+                raise PlaneHostUnavailable(
+                    "successful outcome submit returned a different outcome ref"
+                )
+            self._outcome_submission_ref = outcome_ref
 
     def _fail(self, message: str) -> None:
         if self._fatal_error is None:
@@ -1224,16 +1266,23 @@ class PlaneHostBinding:
                 self._set_callback_phase("adapter_event")
                 raise
             if (
-                request.operation_ref == "operation:agent.outcome.submit"
+                request.operation_ref == PLANE_OUTCOME_SUBMIT_OPERATION
                 and result.status in {"ok", "replayed"}
             ):
-                self._outcome_submission_pending = True
+                outcome_ref = _outcome_ref_from_operation_result(result.output)
+                if outcome_ref is None:
+                    self._fail("successful outcome submit returned no bound outcome ref")
+                    raise PlaneHostUnavailable(
+                        "successful outcome submit returned no bound outcome ref"
+                    )
+                self._bind_outcome_submission_ref(outcome_ref)
             if (
                 request.action == "code"
                 and result.status in {"ok", "replayed"}
-                and _successful_outcome_submit_from_code_mode_result(result.output)
             ):
-                self._outcome_submission_pending = True
+                outcome_ref = _outcome_ref_from_code_mode_result(result.output)
+                if outcome_ref is not None:
+                    self._bind_outcome_submission_ref(outcome_ref)
             prepared_ref: str | None = None
             if (
                 operation_ref == "operation:search_workspace"
@@ -1348,6 +1397,20 @@ class PlaneHostBinding:
             )
             resource_ref = _text(resource_ref, "publication.resourceRef", 256)
             content = _text(content, "publication.content", MAX_HOST_CONTENT_BYTES)
+            if kind == "outcome":
+                expected_ref = self.outcome_submission_ref()
+                if expected_ref is None:
+                    raise PlaneHostError(
+                        "explicit outcome publication requires a successful outcome submit"
+                    )
+                if operation_ref != PLANE_OUTCOME_PUBLISH_OPERATION:
+                    raise PlaneHostError(
+                        "outcome publication operationRef is not the trusted publish operation"
+                    )
+                if resource_ref != expected_ref:
+                    raise PlaneHostError(
+                        "outcome publication resourceRef is not bound to this invocation"
+                    )
         except PlaneHostError as exc:
             self._fail(str(exc) or "publication request was invalid")
             raise
@@ -1370,6 +1433,22 @@ class PlaneHostBinding:
             self._fail("explicit publication was not authorized by the Plane host")
             return result
         return result
+
+    def publish_outcome(self, *, content: str) -> HostCallResult:
+        """Publish the submitted outcome without exposing its trusted ref to the model."""
+
+        outcome_ref = self.outcome_submission_ref()
+        if outcome_ref is None:
+            self._fail("explicit outcome publication requires a successful outcome submit")
+            raise PlaneHostError(
+                "explicit outcome publication requires a successful outcome submit"
+            )
+        return self.publish(
+            kind="outcome",
+            operation_ref=PLANE_OUTCOME_PUBLISH_OPERATION,
+            resource_ref=outcome_ref,
+            content=content,
+        )
 
     def _observe_publication(
         self, request: HostCallRequest, result: HostCallResult
@@ -1461,7 +1540,7 @@ class PlaneHostBinding:
                 self._terminal_action_request = request
                 if self._outcome_publication_metadata is not None:
                     self._outcome_publication_metadata["terminal_armed"] = True
-                self._outcome_submission_pending = False
+                self._outcome_submission_ref = None
             if self.emit_body is not None:
                 try:
                     self.emit_body(
@@ -1749,19 +1828,23 @@ def _handle_plane_publish(args: Mapping[str, Any], **_: Any) -> str:
             "plane_publish",
         )
         kind = _text(data.get("kind"), "plane_publish.kind", 32)
-        operation_ref = _text(
-            data.get("operationRef"),
-            "plane_publish.operationRef",
-            MAX_HOST_OPERATION_REF_BYTES,
-        )
-        resource_ref = _text(data.get("resourceRef"), "plane_publish.resourceRef", 256)
         content = _text(data.get("content"), "plane_publish.content", MAX_HOST_CONTENT_BYTES)
-        result = _binding_or_error().publish(
-            kind=kind,
-            operation_ref=operation_ref,
-            resource_ref=resource_ref,
-            content=content,
-        )
+        binding = _binding_or_error()
+        if kind == "outcome" and "operationRef" not in data and "resourceRef" not in data:
+            result = binding.publish_outcome(content=content)
+        else:
+            operation_ref = _text(
+                data.get("operationRef"),
+                "plane_publish.operationRef",
+                MAX_HOST_OPERATION_REF_BYTES,
+            )
+            resource_ref = _text(data.get("resourceRef"), "plane_publish.resourceRef", 256)
+            result = binding.publish(
+                kind=kind,
+                operation_ref=operation_ref,
+                resource_ref=resource_ref,
+                content=content,
+            )
         return result.model_payload()
     except PlaneHostCancelled as exc:
         return _error_payload(str(exc), code="cancelled")
@@ -1858,18 +1941,33 @@ def install_plane_tools() -> None:
                 "name": PLANE_PUBLISH_TOOL,
                 "description": (
                     "Explicitly ask the Plane host to publish a conversation or "
-                    "outcome. Ordinary final text never calls this implicitly."
+                    "outcome. For an outcome, provide only kind=outcome and content; "
+                    "the trusted submit ref and publish operation are bound internally. "
+                    "Ordinary final text never calls this implicitly."
                 ),
                 "parameters": {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "properties": {
-                        "kind": {"type": "string", "enum": ["conversation", "outcome"]},
-                        "operationRef": {"type": "string"},
-                        "resourceRef": {"type": "string"},
-                        "content": {"type": "string"},
-                    },
-                    "required": ["kind", "operationRef", "resourceRef", "content"],
+                    "oneOf": [
+                        {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "properties": {
+                                "kind": {"type": "string", "enum": ["outcome"]},
+                                "content": {"type": "string"},
+                            },
+                            "required": ["kind", "content"],
+                        },
+                        {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "properties": {
+                                "kind": {"type": "string", "enum": ["conversation"]},
+                                "operationRef": {"type": "string"},
+                                "resourceRef": {"type": "string"},
+                                "content": {"type": "string"},
+                            },
+                            "required": ["kind", "operationRef", "resourceRef", "content"],
+                        },
+                    ],
                 },
             },
             _handle_plane_publish,
@@ -1898,6 +1996,7 @@ __all__ = [
     "PLANE_PUBLICATION_TOOLSET",
     "PLANE_CODE_MODE_TOOLSET",
     "PLANE_CODE_MODE_TOOL",
+    "PLANE_OUTCOME_SUBMIT_OPERATION",
     "PLANE_OUTCOME_PUBLISH_OPERATION",
     "bind_plane_host",
     "current_plane_host",

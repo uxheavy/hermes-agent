@@ -27,6 +27,7 @@ from plane_runtime.host_port import (
     PlaneHostError,
     PlaneHostUnavailable,
     HostCallRequest,
+    PLANE_OUTCOME_SUBMIT_OPERATION,
     PLANE_OUTCOME_PUBLISH_OPERATION,
     UnixSocketPlaneHostPort,
     bind_plane_host,
@@ -137,6 +138,19 @@ def _result(request: dict, *, status: str = "ok", output: object = None, **extra
     }
 
 
+def _submitted_result(
+    request: dict,
+    *,
+    outcome_ref: str = "outcome-submission:test",
+    status: str = "ok",
+) -> dict:
+    return _result(
+        request,
+        status=status,
+        output={"result": {"outcome": {"outcomeRef": outcome_ref}}},
+    )
+
+
 def _applied_outcome_publication(
     *, operation_ref: str = PLANE_OUTCOME_PUBLISH_OPERATION
 ) -> dict[str, str]:
@@ -161,6 +175,13 @@ class HostPortTests(unittest.TestCase):
                 return _result(
                     request,
                     output={
+                        "result": {
+                            "ok": True,
+                            "replayed": False,
+                            "result": {
+                                "outcome": {"outcomeRef": "outcome-submission:test"}
+                            },
+                        },
                         "observations": [
                             {
                                 "source": "code",
@@ -210,17 +231,26 @@ class HostPortTests(unittest.TestCase):
             correlation_id="correlation:publication-recoverable",
             cancellation=lambda: False,
         )
-        result = rejected.publish(
-            kind="outcome",
-            operation_ref=PLANE_OUTCOME_PUBLISH_OPERATION,
-            resource_ref="outcome-submission:missing",
-            content="too early",
-        )
-        self.assertEqual(result.status, "invalid")
-        self.assertIsNone(rejected.fatal_error)
+        with self.assertRaises(PlaneHostError):
+            rejected.publish(
+                kind="outcome",
+                operation_ref=PLANE_OUTCOME_PUBLISH_OPERATION,
+                resource_ref="outcome-submission:missing",
+                content="too early",
+            )
+        self.assertEqual(rejected.records, [])
 
         native = PlaneHostBinding(
-            port=CallablePlaneHostPort(lambda request: _result(request)),
+            port=CallablePlaneHostPort(
+                lambda request: _result(
+                    request,
+                    output={
+                        "result": {
+                            "outcome": {"outcomeRef": "outcome-submission:test"}
+                        }
+                    },
+                )
+            ),
             run_id="run:native-submit",
             invocation_id="invocation:native-submit",
             correlation_id="correlation:native-submit",
@@ -228,11 +258,12 @@ class HostPortTests(unittest.TestCase):
         )
         native.call(
             action="mutate",
-            operation_ref="operation:agent.outcome.submit",
+            operation_ref=PLANE_OUTCOME_SUBMIT_OPERATION,
             input={"summary": "bounded"},
             source="model",
         )
         self.assertTrue(native.outcome_submission_pending())
+        self.assertEqual(native.outcome_submission_ref(), "outcome-submission:test")
 
         unrelated = PlaneHostBinding(
             port=CallablePlaneHostPort(
@@ -255,6 +286,175 @@ class HostPortTests(unittest.TestCase):
             source="model",
         )
         self.assertEqual(unrelated.fatal_error, "unrelated mutation rejected")
+
+    def test_outcome_publish_tool_binds_submit_ref_and_hides_legacy_fields(self) -> None:
+        calls: list[dict] = []
+
+        def rpc(request: dict) -> dict:
+            calls.append(request)
+            if request["operationRef"] == PLANE_OUTCOME_SUBMIT_OPERATION:
+                return _result(
+                    request,
+                    output={
+                        "result": {
+                            "outcome": {"outcomeRef": "outcome-submission:trusted"}
+                        }
+                    },
+                )
+            return _result(
+                request,
+                publication={
+                    **_applied_outcome_publication(),
+                    "productRef": request["input"]["resourceRef"],
+                },
+            )
+
+        binding = PlaneHostBinding(
+            port=CallablePlaneHostPort(rpc),
+            run_id="run:publish-tool",
+            invocation_id="invocation:publish-tool",
+            correlation_id="correlation:publish-tool",
+            cancellation=lambda: False,
+        )
+        install_plane_tools()
+        with bind_plane_host(binding):
+            registry.dispatch(
+                "plane_operation",
+                {
+                    "action": "mutate",
+                    "operationRef": PLANE_OUTCOME_SUBMIT_OPERATION,
+                    "input": {"summary": "submitted"},
+                },
+            )
+            published = registry.dispatch(
+                "plane_publish",
+                {"kind": "outcome", "content": "explicit publication"},
+            )
+
+        self.assertEqual(json.loads(published)["status"], "ok")
+        self.assertEqual(
+            [(call["action"], call["operationRef"], call["input"].get("resourceRef")) for call in calls],
+            [
+                ("mutate", PLANE_OUTCOME_SUBMIT_OPERATION, None),
+                ("publish", PLANE_OUTCOME_PUBLISH_OPERATION, "outcome-submission:trusted"),
+            ],
+        )
+        publish_definition = next(
+            definition
+            for definition in registry.get_definitions({"plane_publish"}, quiet=True)
+            if definition["function"]["name"] == "plane_publish"
+        )
+        outcome_schema = publish_definition["function"]["parameters"]["oneOf"][0]
+        self.assertEqual(outcome_schema["required"], ["kind", "content"])
+        self.assertNotIn("operationRef", outcome_schema["properties"])
+        self.assertNotIn("resourceRef", outcome_schema["properties"])
+
+    def test_outcome_publish_tool_rejects_early_and_tampered_refs_without_host_call(self) -> None:
+        calls: list[dict] = []
+
+        def rpc(request: dict) -> dict:
+            calls.append(request)
+            if request["operationRef"] == PLANE_OUTCOME_SUBMIT_OPERATION:
+                return _result(
+                    request,
+                    output={
+                        "result": {
+                            "outcome": {"outcomeRef": "outcome-submission:trusted"}
+                        }
+                    },
+                )
+            return _result(request, publication=_applied_outcome_publication())
+
+        install_plane_tools()
+        early = PlaneHostBinding(
+            port=CallablePlaneHostPort(rpc),
+            run_id="run:early-publish",
+            invocation_id="invocation:early-publish",
+            correlation_id="correlation:early-publish",
+            cancellation=lambda: False,
+        )
+        with bind_plane_host(early):
+            early_payload = registry.dispatch(
+                "plane_publish",
+                {"kind": "outcome", "content": "too early"},
+            )
+        self.assertEqual(json.loads(early_payload)["status"], "error")
+        self.assertEqual(calls, [])
+
+        trusted = PlaneHostBinding(
+            port=CallablePlaneHostPort(rpc),
+            run_id="run:tampered-publish",
+            invocation_id="invocation:tampered-publish",
+            correlation_id="correlation:tampered-publish",
+            cancellation=lambda: False,
+        )
+        with bind_plane_host(trusted):
+            registry.dispatch(
+                "plane_operation",
+                {
+                    "action": "mutate",
+                    "operationRef": PLANE_OUTCOME_SUBMIT_OPERATION,
+                    "input": {"summary": "submitted"},
+                },
+            )
+            tampered_payload = registry.dispatch(
+                "plane_publish",
+                {
+                    "kind": "outcome",
+                    "operationRef": PLANE_OUTCOME_PUBLISH_OPERATION,
+                    "resourceRef": "outcome-submission:other-run",
+                    "content": "tampered",
+                },
+            )
+        self.assertEqual(json.loads(tampered_payload)["status"], "error")
+        self.assertEqual(
+            [call["action"] for call in calls],
+            ["mutate"],
+        )
+
+    def test_replayed_submit_binds_ref_and_replayed_publish_does_not_terminalize(self) -> None:
+        calls: list[dict] = []
+
+        def rpc(request: dict) -> dict:
+            calls.append(request)
+            if request["operationRef"] == PLANE_OUTCOME_SUBMIT_OPERATION:
+                return _result(
+                    request,
+                    status="replayed",
+                    output={
+                        "result": {
+                            "outcome": {"outcomeRef": "outcome-submission:replayed"}
+                        }
+                    },
+                )
+            return _result(
+                request,
+                status="replayed",
+                publication={
+                    **_applied_outcome_publication(),
+                    "productRef": "outcome-submission:replayed",
+                },
+            )
+
+        binding = PlaneHostBinding(
+            port=CallablePlaneHostPort(rpc),
+            run_id="run:replayed-submit",
+            invocation_id="invocation:replayed-submit",
+            correlation_id="correlation:replayed-submit",
+            cancellation=lambda: False,
+        )
+        binding.call(
+            action="mutate",
+            operation_ref=PLANE_OUTCOME_SUBMIT_OPERATION,
+            input={"summary": "replayed"},
+            source="model",
+        )
+        result = binding.publish_outcome(content="replayed publication")
+
+        self.assertEqual(result.status, "replayed")
+        self.assertEqual(binding.outcome_submission_ref(), "outcome-submission:replayed")
+        self.assertIsNone(binding.terminal_action_reason())
+        self.assertEqual([call["action"] for call in calls], ["mutate", "publish"])
 
     def test_untrusted_submit_observation_does_not_arm_publication(self) -> None:
         binding = PlaneHostBinding(
@@ -1769,6 +1969,8 @@ print("text_response")
 
         def rpc(request: dict) -> dict:
             calls.append(request)
+            if request["operationRef"] == PLANE_OUTCOME_SUBMIT_OPERATION:
+                return _submitted_result(request)
             if request["action"] == "publish":
                 return _result(
                     request,
@@ -1783,6 +1985,12 @@ print("text_response")
             invocation_id="invocation:test",
             correlation_id="correlation:test",
             cancellation=lambda: False,
+        )
+        binding.call(
+            action="mutate",
+            operation_ref=PLANE_OUTCOME_SUBMIT_OPERATION,
+            input={"summary": "submitted"},
+            source="model",
         )
         binding.publish(
             kind="outcome",
@@ -1808,7 +2016,7 @@ print("text_response")
             self.assertEqual(result.status, "conflict")
             self.assertEqual(result.error_code, "PLANE_CONFLICT")
             self.assertEqual(json.loads(result.model_payload())["status"], "conflict")
-        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(calls), 2)
         self.assertIsNone(binding.fatal_error)
 
     def test_successful_host_result_with_error_fields_remains_rejected(self) -> None:
@@ -1971,6 +2179,8 @@ print("text_response")
         bodies: list[dict] = []
 
         def rpc(request: dict) -> dict:
+            if request["operationRef"] == PLANE_OUTCOME_SUBMIT_OPERATION:
+                return _submitted_result(request, status="replayed")
             return _result(
                 request,
                 output={"published": True},
@@ -1996,6 +2206,12 @@ print("text_response")
             cancellation=lambda: False,
             emit_body=bodies.append,
         )
+        binding.call(
+            action="mutate",
+            operation_ref=PLANE_OUTCOME_SUBMIT_OPERATION,
+            input={"summary": "replayed"},
+            source="model",
+        )
         binding.publish(
             kind="conversation",
             operation_ref="operation:conversation-publish@1",
@@ -2015,6 +2231,11 @@ print("text_response")
 
         def rpc(request: dict) -> dict:
             calls.append(request)
+            if request["operationRef"] == PLANE_OUTCOME_SUBMIT_OPERATION:
+                return _result(
+                    request,
+                    output={"result": {"outcome": {"outcomeRef": "outcome-submission:test"}}},
+                )
             if len(calls) > 1:
                 return _result(
                     request,
@@ -2048,6 +2269,12 @@ print("text_response")
             cancellation=lambda: False,
             emit_body=bodies.append,
         )
+        binding.call(
+            action="mutate",
+            operation_ref=PLANE_OUTCOME_SUBMIT_OPERATION,
+            input={"summary": "submitted"},
+            source="model",
+        )
         first = binding.publish(
             kind="outcome",
             operation_ref=PLANE_OUTCOME_PUBLISH_OPERATION,
@@ -2063,7 +2290,7 @@ print("text_response")
 
         self.assertEqual(binding.terminal_action_reason(), "product_outcome_published")
         self.assertEqual(duplicate, first)
-        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(calls), 2)
         self.assertIsNone(binding.fatal_error)
         self.assertEqual(
             [body["kind"] for body in bodies],
@@ -2072,6 +2299,8 @@ print("text_response")
 
     def test_replayed_outcome_publication_retains_nonarming_metadata(self) -> None:
         def rpc(request: dict) -> dict:
+            if request["operationRef"] == PLANE_OUTCOME_SUBMIT_OPERATION:
+                return _submitted_result(request, status="replayed")
             return _result(
                 request,
                 status="replayed",
@@ -2085,6 +2314,12 @@ print("text_response")
             correlation_id="correlation:test",
             cancellation=lambda: False,
             emit_body=lambda _body: None,
+        )
+        binding.call(
+            action="mutate",
+            operation_ref=PLANE_OUTCOME_SUBMIT_OPERATION,
+            input={"summary": "replayed"},
+            source="model",
         )
         binding.publish(
             kind="outcome",
@@ -2111,6 +2346,8 @@ print("text_response")
 
         def rpc(request: dict) -> dict:
             calls.append(request)
+            if request["operationRef"] == PLANE_OUTCOME_SUBMIT_OPERATION:
+                return _submitted_result(request)
             return _result(
                 request,
                 output={"published": True},
@@ -2126,6 +2363,12 @@ print("text_response")
             emit_body=bodies.append,
         )
         install_plane_tools()
+        binding.call(
+            action="mutate",
+            operation_ref=PLANE_OUTCOME_SUBMIT_OPERATION,
+            input={"summary": "submitted"},
+            source="model",
+        )
         with bind_plane_host(binding):
             generic_payload = registry.dispatch(
                 "plane_operation",
@@ -2141,7 +2384,7 @@ print("text_response")
             )
 
         self.assertEqual(json.loads(generic_payload)["status"], "ok")
-        original = binding.records[0].result
+        original = binding.records[1].result
         dedicated = binding.publish(
             kind="outcome",
             operation_ref=PLANE_OUTCOME_PUBLISH_OPERATION,
@@ -2149,8 +2392,8 @@ print("text_response")
             content="generic outcome",
         )
         self.assertIs(dedicated, original)
-        self.assertEqual(calls[0]["action"], "mutate")
-        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[1]["action"], "mutate")
+        self.assertEqual(len(calls), 2)
         self.assertEqual(binding.terminal_action_reason(), "product_outcome_published")
         self.assertEqual(
             [body["kind"] for body in bodies],
@@ -2163,6 +2406,8 @@ print("text_response")
 
         def rpc(request: dict) -> dict:
             calls.append(request)
+            if request["operationRef"] == PLANE_OUTCOME_SUBMIT_OPERATION:
+                return _submitted_result(request)
             return _result(
                 request,
                 output={
@@ -2188,6 +2433,12 @@ print("text_response")
             cancellation=lambda: False,
             emit_body=bodies.append,
         )
+        binding.call(
+            action="mutate",
+            operation_ref=PLANE_OUTCOME_SUBMIT_OPERATION,
+            input={"summary": "submitted"},
+            source="model",
+        )
         generic = binding.call(
             action="mutate",
             operation_ref=PLANE_OUTCOME_PUBLISH_OPERATION,
@@ -2206,7 +2457,7 @@ print("text_response")
         )
 
         self.assertIs(dedicated, generic)
-        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(calls), 2)
         self.assertEqual(binding.terminal_action_reason(), "product_outcome_published")
         self.assertIsNone(binding.fatal_error)
         self.assertEqual(
@@ -2403,6 +2654,8 @@ print("text_response")
         def rpc(request: dict) -> dict:
             with calls_lock:
                 calls.append(request)
+            if request["operationRef"] == PLANE_OUTCOME_SUBMIT_OPERATION:
+                return _submitted_result(request)
             time.sleep(0.01)
             return _result(request, publication=_applied_outcome_publication())
 
@@ -2413,6 +2666,12 @@ print("text_response")
             correlation_id="correlation:test",
             cancellation=lambda: False,
             emit_body=bodies.append,
+        )
+        binding.call(
+            action="mutate",
+            operation_ref=PLANE_OUTCOME_SUBMIT_OPERATION,
+            input={"summary": "submitted"},
+            source="model",
         )
 
         def generic() -> object:
@@ -2439,9 +2698,9 @@ print("text_response")
             results = [executor.submit(generic), executor.submit(dedicated)]
             returned = [future.result() for future in results]
 
-        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(calls), 2)
         self.assertIs(returned[0], returned[1])
-        self.assertIs(returned[0], binding.records[0].result)
+        self.assertIs(returned[0], binding.records[1].result)
         self.assertEqual(binding.terminal_action_reason(), "product_outcome_published")
         self.assertEqual(
             sum(body["kind"] == "outcome_submission_observed" for body in bodies),
@@ -2453,6 +2712,8 @@ print("text_response")
 
         def rpc(request: dict) -> dict:
             calls.append(request)
+            if request["operationRef"] == PLANE_OUTCOME_SUBMIT_OPERATION:
+                return _submitted_result(request)
             if request["action"] == "read":
                 return _result(
                     request,
@@ -2485,6 +2746,12 @@ print("text_response")
             cancellation=lambda: False,
             emit_body=lambda _body: None,
         )
+        binding.call(
+            action="mutate",
+            operation_ref=PLANE_OUTCOME_SUBMIT_OPERATION,
+            input={"summary": "submitted"},
+            source="model",
+        )
         failed = binding.call(
             action="read",
             operation_ref="operation:read@1",
@@ -2502,12 +2769,14 @@ print("text_response")
         self.assertEqual(binding.terminal_action_reason(), "product_outcome_published")
         self.assertFalse(binding.fatal_error_after_terminal)
         self.assertIsNotNone(binding.fatal_error)
-        self.assertEqual([request["action"] for request in calls], ["read", "publish"])
+        self.assertEqual([request["action"] for request in calls], ["mutate", "read", "publish"])
 
     def test_replayed_applied_outcome_on_fresh_binding_does_not_signal(self) -> None:
         bodies: list[dict] = []
 
         def rpc(request: dict) -> dict:
+            if request["operationRef"] == PLANE_OUTCOME_SUBMIT_OPERATION:
+                return _submitted_result(request, status="replayed")
             return _result(
                 request,
                 status="replayed",
@@ -2533,6 +2802,12 @@ print("text_response")
             correlation_id="correlation:test",
             cancellation=lambda: False,
             emit_body=bodies.append,
+        )
+        binding.call(
+            action="mutate",
+            operation_ref=PLANE_OUTCOME_SUBMIT_OPERATION,
+            input={"summary": "replayed"},
+            source="model",
         )
         binding.publish(
             kind="outcome",
@@ -2582,6 +2857,8 @@ print("text_response")
         self.assertIsNone(binding.terminal_action_reason())
 
         def denied_rpc(request: dict) -> dict:
+            if request["operationRef"] == PLANE_OUTCOME_SUBMIT_OPERATION:
+                return _submitted_result(request)
             return _result(
                 request,
                 status="denied",
@@ -2597,6 +2874,12 @@ print("text_response")
             cancellation=lambda: False,
             emit_body=lambda _body: None,
         )
+        denied.call(
+            action="mutate",
+            operation_ref=PLANE_OUTCOME_SUBMIT_OPERATION,
+            input={"summary": "submitted"},
+            source="model",
+        )
         denied.publish(
             kind="outcome",
             operation_ref=PLANE_OUTCOME_PUBLISH_OPERATION,
@@ -2608,11 +2891,15 @@ print("text_response")
 
         failed = PlaneHostBinding(
             port=CallablePlaneHostPort(
-                lambda request: _result(
-                    request,
-                    status="unavailable",
-                    errorCode="OUTCOME_UNKNOWN",
-                    errorMessage="publication outcome is unknown",
+                lambda request: (
+                    _submitted_result(request)
+                    if request["operationRef"] == PLANE_OUTCOME_SUBMIT_OPERATION
+                    else _result(
+                        request,
+                        status="unavailable",
+                        errorCode="OUTCOME_UNKNOWN",
+                        errorMessage="publication outcome is unknown",
+                    )
                 )
             ),
             run_id="run:test",
@@ -2620,6 +2907,12 @@ print("text_response")
             correlation_id="correlation:test",
             cancellation=lambda: False,
             emit_body=lambda _body: None,
+        )
+        failed.call(
+            action="mutate",
+            operation_ref=PLANE_OUTCOME_SUBMIT_OPERATION,
+            input={"summary": "submitted"},
+            source="model",
         )
         failed.publish(
             kind="outcome",
@@ -2631,6 +2924,8 @@ print("text_response")
         self.assertIsNotNone(failed.fatal_error)
 
         def applied_rpc(request: dict) -> dict:
+            if request["operationRef"] == PLANE_OUTCOME_SUBMIT_OPERATION:
+                return _submitted_result(request)
             return _result(
                 request,
                 publication={
@@ -2654,6 +2949,12 @@ print("text_response")
             correlation_id="correlation:test",
             cancellation=lambda: False,
             emit_body=mock.Mock(side_effect=RuntimeError("event sink failed")),
+        )
+        emission_failed.call(
+            action="mutate",
+            operation_ref=PLANE_OUTCOME_SUBMIT_OPERATION,
+            input={"summary": "submitted"},
+            source="model",
         )
         with self.assertRaises(PlaneHostUnavailable):
             emission_failed.publish(

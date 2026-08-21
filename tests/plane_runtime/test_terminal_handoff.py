@@ -232,7 +232,14 @@ def test_real_hermes_long_route_preserves_applied_publication_after_observation_
                 errorMessage="policy denied this read",
             )
         if operation_ref == "operation:agent.outcome.submit":
-            return _result(request, output={"outcomeRef": outcome_ref})
+            return _result(
+                request,
+                output={
+                    "result": {
+                        "outcome": {"outcomeRef": outcome_ref}
+                    }
+                },
+            )
         if request["action"] == "publish":
             return _result(
                 request,
