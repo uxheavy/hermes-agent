@@ -353,6 +353,65 @@ class HostPortTests(unittest.TestCase):
         assert read.status == "ok"
         assert binding.prepared_read_handoff_pending() is False
 
+    def test_opaque_prepared_search_forces_one_code_mode_turn(self) -> None:
+        responses = iter(
+            (
+                {
+                    "ok": True,
+                    "result": {
+                        "results": [
+                            {
+                                "objectType": "work_item",
+                                "workItemReadCall": "prepared-call:opaque",
+                            }
+                        ]
+                    },
+                },
+                {"ok": True, "result": {"work_item": {"title": "assigned"}}},
+                {"ok": True, "result": {"continued": True}},
+            )
+        )
+        binding = PlaneHostBinding(
+            port=CallablePlaneHostPort(lambda request: _result(request, output=next(responses))),
+            run_id="run:opaque",
+            invocation_id="invocation:opaque",
+            correlation_id="correlation:opaque",
+            cancellation=lambda: False,
+            code_mode_phase="post_search",
+        )
+        binding.call(
+            action="read",
+            operation_ref="operation:search_workspace",
+            input={"query": "assigned"},
+            source="model",
+        )
+        assert [record.request.operation_ref for record in binding.records] == [
+            "operation:search_workspace",
+            "operation:work_item.read",
+        ]
+        assert binding.prepared_read_handoff_pending() is False
+        assert binding.code_mode_phase_hint() == "post_search"
+
+        from agent.chat_completion_helpers import _plane_codex_request_overrides
+
+        agent = SimpleNamespace(
+            request_overrides={},
+            _plane_runtime_code_mode_phase_hint=binding.code_mode_phase_hint,
+        )
+        tools = [{"type": "function", "function": {"name": "plane_execute_typescript"}}]
+        assert _plane_codex_request_overrides(agent, tools)["tool_choice"] == {
+            "type": "function",
+            "name": "plane_execute_typescript",
+        }
+
+        binding.call(
+            action="code",
+            operation_ref="plane.code-mode.execute@1",
+            input={"source": "return 1"},
+            source="code",
+        )
+        assert binding.code_mode_phase_hint() is None
+
     def test_cross_process_model_search_consumes_prepared_read_before_text_exit(self) -> None:
         """A child using the real model-facing tool dispatch cannot exit after search."""
 

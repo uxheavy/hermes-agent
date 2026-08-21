@@ -57,6 +57,34 @@ _OPENROUTER_PROVIDER_SORT_VALUES = {"throughput", "latency", "price"}
 # narrower non-rate-limit case.  See issue #24996.
 _FALLBACK_EXHAUSTED_COOLDOWN_S = 5.0
 
+_PLANE_CODE_MODE_TOOL = "plane_execute_typescript"
+
+
+def _plane_tool_name(tool):
+    if not isinstance(tool, dict):
+        return None
+    if tool.get("name") == _PLANE_CODE_MODE_TOOL:
+        return _PLANE_CODE_MODE_TOOL
+    function = tool.get("function")
+    if isinstance(function, dict) and function.get("name") == _PLANE_CODE_MODE_TOOL:
+        return _PLANE_CODE_MODE_TOOL
+    return None
+
+
+def _plane_codex_request_overrides(agent, tools):
+    """Require one bounded Code Mode turn after a trusted prepared search."""
+
+    configured = getattr(agent, "request_overrides", None)
+    overrides = dict(configured) if isinstance(configured, dict) else {}
+    hint_check = getattr(agent, "_plane_runtime_code_mode_phase_hint", None)
+    try:
+        hinted = callable(hint_check) and hint_check() == "post_search"
+    except Exception:
+        hinted = False
+    if hinted and any(_plane_tool_name(tool) == _PLANE_CODE_MODE_TOOL for tool in (tools or [])):
+        overrides["tool_choice"] = {"type": "function", "name": _PLANE_CODE_MODE_TOOL}
+    return overrides
+
 
 def _context_thread_target(callback):
     """Bind a no-argument thread target to the caller's ContextVars."""
@@ -1224,7 +1252,7 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
             base_url=agent.base_url,
             max_tokens=agent.max_tokens,
             timeout=agent._resolved_api_call_timeout(),
-            request_overrides=agent.request_overrides,
+            request_overrides=_plane_codex_request_overrides(agent, tools_for_api),
             is_github_responses=is_github_responses,
             is_codex_backend=is_codex_backend,
             is_xai_responses=is_xai_responses,

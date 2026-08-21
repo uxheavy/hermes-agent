@@ -1085,6 +1085,7 @@ class HermesKernelAdapter:
                     str(operation["operationRef"])
                     for operation in snapshot.eager_operations
                 ),
+                code_mode_phase=str(snapshot.raw.get("runtimePolicy", {}).get("codeModePhase", "none")),
             )
             if self._host_port is not None
             else None
@@ -1097,6 +1098,11 @@ class HermesKernelAdapter:
                     agent,
                     "_plane_runtime_prepared_read_pending_check",
                     host_binding.prepared_read_handoff_pending,
+                )
+                setattr(
+                    agent,
+                    "_plane_runtime_code_mode_phase_hint",
+                    host_binding.code_mode_phase_hint,
                 )
             # Plane's provider allowance is a hard invocation boundary. The
             # interactive Hermes summary fallback would spend an additional
