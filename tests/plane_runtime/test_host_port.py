@@ -3575,6 +3575,45 @@ print("text_response")
                 input_value,
             )
 
+    def test_registry_normalizes_sparse_prepared_ref_and_rejects_malformed_variants(self) -> None:
+        prepared_ref = "prepared-call:sparse"
+        sparse = {"preparedCallRef": {"preparedCallRef": prepared_ref}}
+        self.assertEqual(
+            _normalize_prepared_read_input(
+                "read", "operation:work_item.read", sparse
+            ),
+            {"preparedCallRef": prepared_ref},
+        )
+
+        malformed = (
+            {"preparedCallRef": {"preparedCallRef": "not-a-prepared-call"}},
+            {
+                "preparedCallRef": {
+                    "preparedCallRef": prepared_ref,
+                    "issue_id": "must-not-cross-the-seam",
+                }
+            },
+            {
+                "preparedCallRef": {
+                    "action": "mutate",
+                    "operationRef": "operation:work_item.read",
+                    "input": {"preparedCallRef": prepared_ref},
+                }
+            },
+            {
+                "preparedCallRef": {
+                    "preparedCallRef": "prepared-call:" + "x" * 256,
+                }
+            },
+        )
+        for input_value in malformed:
+            self.assertIs(
+                _normalize_prepared_read_input(
+                    "read", "operation:work_item.read", input_value
+                ),
+                input_value,
+            )
+
     def test_registry_normalizes_bare_and_input_wrapped_prepared_read_refs(self) -> None:
         install_plane_tools()
         requests: list[dict] = []
