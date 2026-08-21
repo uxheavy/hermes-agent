@@ -3857,7 +3857,6 @@ print("text_response")
                     "result": {
                         "results": [
                             {
-                                "objectType": "work_item",
                                 "workItemReadCall": {
                                     "action": "read",
                                     "operationRef": "operation:work_item.read",
