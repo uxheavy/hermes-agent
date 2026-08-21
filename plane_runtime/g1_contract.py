@@ -346,9 +346,11 @@ def _validate_snapshot(raw: Any) -> dict[str, Any]:
         _content_ref(item_data["contentDigest"], f"context[{index}].contentDigest")
 
     catalog = _object(data["toolCatalog"], "RunSnapshot.toolCatalog")
-    _reject_unknown(catalog, {"catalogDigest", "eagerOperations"}, "toolCatalog")
+    _reject_unknown(catalog, {"catalogDigest", "modelToolset", "eagerOperations"}, "toolCatalog")
     _required(catalog, {"catalogDigest", "eagerOperations"}, "toolCatalog")
     _content_ref(catalog["catalogDigest"], "toolCatalog.catalogDigest")
+    if "modelToolset" in catalog and catalog["modelToolset"] not in {"standard", "code_mode_only"}:
+        raise G1ContractError("toolCatalog.modelToolset is unsupported")
     operations = catalog["eagerOperations"]
     if not isinstance(operations, list) or len(operations) > MAX_EAGER_OPERATIONS:
         raise G1ContractError(
@@ -529,6 +531,10 @@ class G1RunSnapshot:
     @property
     def eager_operations(self) -> tuple[Mapping[str, Any], ...]:
         return tuple(self.raw["toolCatalog"]["eagerOperations"])
+
+    @property
+    def model_toolset(self) -> str:
+        return str(self.raw["toolCatalog"].get("modelToolset", "standard"))
 
     @property
     def model_provider(self) -> str:

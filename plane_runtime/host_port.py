@@ -6,10 +6,10 @@ trusted host owns the callable transport and binds identity, authorization,
 and credentials on the other side of that transport.  Hermes exposes only
 bounded, invocation-scoped tool callbacks to the existing agent loop.
 
-The registered tools deliberately live in a dynamic ``plane_runtime``
-toolset.  They are installed only by :class:`HermesKernelAdapter`, and their
-handlers resolve a context-local port, so another Hermes conversation cannot
-reuse this invocation's host binding.
+The registered tools deliberately live in dynamic Plane toolsets. They are
+installed only by :class:`HermesKernelAdapter`, and their handlers resolve a
+context-local port, so another Hermes conversation cannot reuse this
+invocation's host binding.
 """
 
 from __future__ import annotations
@@ -32,7 +32,8 @@ from .g1_contract import G1ContractError, validate_eager_input_schema
 
 
 HOST_PROTOCOL = "plane.agent-runtime/v1"
-PLANE_RUNTIME_TOOLSET = "plane_runtime"
+PLANE_OPERATION_TOOLSET = "plane_runtime_operations"
+PLANE_PUBLICATION_TOOLSET = "plane_runtime_publication"
 PLANE_CODE_MODE_TOOLSET = "plane_runtime_code_mode"
 PLANE_OPERATION_TOOL = "plane_operation"
 PLANE_PUBLISH_TOOL = "plane_publish"
@@ -1478,7 +1479,7 @@ def install_plane_tools() -> None:
         )
         registry.register(
             PLANE_OPERATION_TOOL,
-            PLANE_RUNTIME_TOOLSET,
+            PLANE_OPERATION_TOOLSET,
             {
                 "name": PLANE_OPERATION_TOOL,
                 "description": (
@@ -1505,7 +1506,7 @@ def install_plane_tools() -> None:
         )
         registry.register(
             PLANE_PUBLISH_TOOL,
-            PLANE_RUNTIME_TOOLSET,
+            PLANE_PUBLICATION_TOOLSET,
             {
                 "name": PLANE_PUBLISH_TOOL,
                 "description": (
@@ -1548,6 +1549,8 @@ __all__ = [
     "PLANE_CODE_MODE_SCHEMA_VERSION",
     "PLANE_CODE_MODE_TOOLSET",
     "PLANE_CODE_MODE_TOOL",
+    "PLANE_OPERATION_TOOLSET",
+    "PLANE_PUBLICATION_TOOLSET",
     "PLANE_OUTCOME_PUBLISH_OPERATION",
     "bind_plane_host",
     "current_plane_host",
