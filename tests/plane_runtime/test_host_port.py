@@ -688,6 +688,97 @@ class HostPortTests(unittest.TestCase):
         assert read.status == "ok"
         assert binding.prepared_read_handoff_pending() is False
 
+    def test_post_consume_stray_prepared_read_is_bounded_local_replay(self) -> None:
+        requests: list[dict] = []
+
+        def respond(request: dict) -> dict:
+            requests.append(request)
+            if len(requests) == 1:
+                return _result(
+                    request,
+                    output={"ok": True, "result": {"work_item": {"title": "assigned"}}},
+                )
+            return _result(
+                request,
+                status="invalid",
+                output={"shapeDiagnostic": {"acceptedForm": "unrecognized"}},
+                errorCode="PREPARED_CALL_INVALID",
+                errorMessage="prepared work-item read reference is invalid",
+            )
+
+        binding = PlaneHostBinding(
+            port=CallablePlaneHostPort(respond),
+            run_id="run:duplicate-read",
+            invocation_id="invocation:duplicate-read",
+            correlation_id="correlation:duplicate-read",
+            cancellation=lambda: False,
+        )
+        first = binding.call(
+            action="read",
+            operation_ref="operation:work_item.read",
+            input={"preparedCallRef": "prepared-call:opaque"},
+            source="model",
+        )
+        duplicate = binding.call(
+            action="read",
+            operation_ref="operation:work_item.read",
+            input={"preparedCallRef": {"unexpected": True}},
+            source="model",
+        )
+
+        self.assertEqual(first.status, "ok")
+        self.assertEqual(duplicate.status, "replayed")
+        self.assertTrue(duplicate.replayed)
+        self.assertEqual(
+            duplicate.output,
+            {
+                "ok": True,
+                "replayed": True,
+                "duplicate": True,
+                "operationId": "work_item.read",
+            },
+        )
+        self.assertNotIn("prepared-call:opaque", json.dumps(duplicate.to_dict()))
+        self.assertEqual(len(requests), 1)
+        self.assertIsNone(binding.fatal_error)
+
+        tampered = binding.call(
+            action="read",
+            operation_ref="operation:work_item.read",
+            input={"preparedCallRef": "prepared-call:opaque-tampered"},
+            source="model",
+        )
+        self.assertEqual(tampered.status, "invalid")
+        self.assertEqual(tampered.error_code, "PREPARED_CALL_INVALID")
+        self.assertEqual(len(requests), 2)
+
+        fresh_requests: list[dict] = []
+
+        def fresh_respond(request: dict) -> dict:
+            fresh_requests.append(request)
+            return _result(
+                request,
+                status="invalid",
+                errorCode="PREPARED_CALL_INVALID",
+                errorMessage="prepared work-item read reference is invalid",
+            )
+
+        fresh = PlaneHostBinding(
+            port=CallablePlaneHostPort(fresh_respond),
+            run_id="run:first-use-malformed",
+            invocation_id="invocation:first-use-malformed",
+            correlation_id="correlation:first-use-malformed",
+            cancellation=lambda: False,
+        )
+        first_use = fresh.call(
+            action="read",
+            operation_ref="operation:work_item.read",
+            input={"preparedCallRef": {"unexpected": True}},
+            source="model",
+        )
+        self.assertEqual(first_use.status, "invalid")
+        self.assertEqual(len(fresh_requests), 1)
+
     def test_cross_process_model_search_consumes_prepared_read_before_text_exit(self) -> None:
         """A child using the real model-facing tool dispatch cannot exit after search."""
 

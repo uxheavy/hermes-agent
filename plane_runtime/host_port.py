@@ -698,6 +698,22 @@ def _normalize_prepared_read_input(
     return normalized if normalized is not None else input_value
 
 
+def _is_stray_prepared_read_shape(input_value: Mapping[str, Any]) -> bool:
+    """Recognize only a ref-free or unrecognized wrapper after completion."""
+
+    if not input_value:
+        return True
+    if set(input_value) != {"preparedCallRef"}:
+        return False
+    candidate = input_value.get("preparedCallRef")
+    if not isinstance(candidate, Mapping):
+        return False
+    normalized = _normalize_prepared_read_input(
+        "read", "operation:work_item.read", input_value
+    )
+    return dict(normalized) == dict(input_value)
+
+
 class UnixSocketPlaneHostPort:
     """Invocation-scoped canonical JSONL client for the trusted Plane host.
 
@@ -896,6 +912,7 @@ class PlaneHostBinding:
     _terminal_action_result: HostCallResult | None = field(default=None, init=False, repr=False)
     _terminal_action_request: HostCallRequest | None = field(default=None, init=False, repr=False)
     _prepared_read_handoff_pending: bool = field(default=False, init=False, repr=False)
+    _prepared_read_completion: HostCallResult | None = field(default=None, init=False, repr=False)
     _code_mode_phase_hint: str | None = field(default=None, init=False, repr=False)
     _code_mode_continuation_used: bool = field(default=False, init=False, repr=False)
     _outcome_submission_ref: str | None = field(default=None, init=False, repr=False)
@@ -1210,11 +1227,6 @@ class PlaneHostBinding:
             if self._is_cancelled():
                 self._fail("Plane host callback cancelled")
                 raise PlaneHostCancelled("Plane host callback cancelled")
-            self._require_schema_disclosure(
-                action=action,
-                operation_ref=operation_ref,
-                input_value=input,
-            )
             try:
                 request = HostCallRequest(
                     run_id=self.run_id,
@@ -1229,6 +1241,15 @@ class PlaneHostBinding:
             except PlaneHostError as exc:
                 self._fail(str(exc) or "Plane host request was invalid")
                 raise
+            if operation_ref == "operation:work_item.read":
+                duplicate = self._duplicate_after_prepared_read(request)
+                if duplicate is not None:
+                    return duplicate
+            self._require_schema_disclosure(
+                action=action,
+                operation_ref=operation_ref,
+                input_value=input,
+            )
             terminal_result = self._terminal_result_for(request)
             if terminal_result is not None:
                 return terminal_result
@@ -1316,9 +1337,11 @@ class PlaneHostBinding:
             if (
                 operation_ref == "operation:work_item.read"
                 and isinstance(input.get("preparedCallRef"), str)
+                and _opaque_prepared_ref(input.get("preparedCallRef")) is not None
                 and result.status in {"ok", "replayed"}
             ):
                 self._prepared_read_handoff_pending = False
+                self._prepared_read_completion = result
             if action == "code":
                 prepared_refs = ()
                 prepared_read_succeeded = False
@@ -1379,6 +1402,33 @@ class PlaneHostBinding:
                 self._fail("Plane host callback cancelled")
                 raise PlaneHostCancelled("Plane host callback cancelled")
             return result
+
+    def _duplicate_after_prepared_read(
+        self,
+        request: HostCallRequest,
+    ) -> HostCallResult | None:
+        """Absorb one stray post-consume read without another host callback."""
+
+        completion = self._prepared_read_completion
+        if (
+            completion is None
+            or request.action != "read"
+            or not _is_stray_prepared_read_shape(request.input)
+        ):
+            return None
+        return HostCallResult(
+            request_ref=request.request_ref,
+            correlation_id=request.correlation_id,
+            idempotency_key=request.idempotency_key,
+            status="replayed",
+            replayed=True,
+            output={
+                "ok": True,
+                "replayed": True,
+                "duplicate": True,
+                "operationId": "work_item.read",
+            },
+        )
 
     def publish(
         self,
