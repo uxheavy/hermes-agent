@@ -629,24 +629,14 @@ class HostPortTests(unittest.TestCase):
                 output = {
                     "ok": True,
                     "result": {
-                        "results": [
-                            {
-                                "objectType": "work_item",
-                                "workItemReadCall": {
-                                    "action": "read",
-                                    "operationRef": "operation:work_item.read",
-                                    "input": {"preparedCallRef": "prepared-call:first"},
-                                },
-                            },
-                            {
-                                "objectType": "work_item",
-                                "workItemReadCall": {
-                                    "action": "read",
-                                    "operationRef": "operation:work_item.read",
-                                    "input": {"preparedCallRef": "prepared-call:second"},
-                                },
-                            },
-                        ]
+                        "results": [],
+                        "assignmentWorkItemReadDecision": {
+                            "schemaVersion": "plane.assignment-read-handoff/v1",
+                            "recognizedCount": 2,
+                            "acceptedForm": "unrecognized",
+                            "failureClass": "multiple",
+                            "shape": {"nestingDepth": 0, "sizeClass": "large"},
+                        },
                     },
                 }
             else:
@@ -1459,10 +1449,14 @@ print("text_response")
             "result": {
                 "ok": True,
                 "result": {
-                    "results": [
-                        {"objectType": "work_item", "workItemReadCall": "prepared-call:first"},
-                        {"objectType": "work_item", "workItemReadCall": "prepared-call:second"},
-                    ]
+                    "results": [],
+                    "assignmentWorkItemReadDecision": {
+                        "schemaVersion": "plane.assignment-read-handoff/v1",
+                        "recognizedCount": 2,
+                        "acceptedForm": "unrecognized",
+                        "failureClass": "multiple",
+                        "shape": {"nestingDepth": 0, "sizeClass": "large"},
+                    },
                 },
             },
             "observations": [

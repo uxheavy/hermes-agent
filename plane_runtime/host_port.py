@@ -492,8 +492,16 @@ def _assignment_read_decision_requires_followup(output: Any) -> bool:
     result = output.get("result")
     if isinstance(output.get("results"), list):
         result = output
-    if not isinstance(result, Mapping) or "assignmentWorkItemReadDecision" not in result:
+    if not isinstance(result, Mapping):
         return False
+    if "assignmentWorkItemReadDecision" not in result:
+        nested_result = result.get("result")
+        if (
+            not isinstance(nested_result, Mapping)
+            or "assignmentWorkItemReadDecision" not in nested_result
+        ):
+            return False
+        result = nested_result
     decision = result.get("assignmentWorkItemReadDecision")
     if not _bounded_assignment_read_decision(decision):
         return True
@@ -1386,9 +1394,13 @@ class PlaneHostBinding:
                         and self.code_mode_phase == "post_search"
                         and not self._code_mode_continuation_used
                     )
+                assignment_read_followup = _assignment_read_decision_requires_followup(
+                    result.output
+                )
                 if should_arm and (
                     prepared_read_succeeded
                     or len(prepared_refs) > 1
+                    or assignment_read_followup
                 ):
                     with self._lock:
                         if not self._code_mode_continuation_used:
