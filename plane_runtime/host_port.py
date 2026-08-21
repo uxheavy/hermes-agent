@@ -590,6 +590,13 @@ def _wrapped_ready_to_call_prepared_ref(value: Any) -> str | None:
         decoded = json.loads(value, object_pairs_hook=_duplicate_rejecting_pairs)
     except (TypeError, ValueError):
         return None
+    if (
+        isinstance(decoded, Mapping)
+        and set(decoded) == {"preparedCallRef"}
+    ):
+        # V85's operator path stringifies the canonical ref once. Parse only
+        # this exact shape; a nested object is never recursively unwrapped.
+        return _opaque_prepared_ref(decoded.get("preparedCallRef"))
     return _ready_to_call_prepared_ref(decoded)
 
 

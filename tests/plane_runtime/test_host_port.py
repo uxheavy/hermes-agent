@@ -2890,6 +2890,67 @@ print("text_response")
                 input_value,
             )
 
+    def test_registry_normalizes_json_stringified_sparse_ref_only(self) -> None:
+        prepared_ref = "prepared-call:json-stringified"
+        stringified = json.dumps(
+            {"preparedCallRef": prepared_ref},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        self.assertEqual(
+            _normalize_prepared_read_input(
+                "read",
+                "operation:work_item.read",
+                {"preparedCallRef": stringified},
+            ),
+            {"preparedCallRef": prepared_ref},
+        )
+
+        malformed = (
+            # Duplicate keys must not be reduced to an accepted canonical ref.
+            {
+                "preparedCallRef": (
+                    '{"preparedCallRef":"prepared-call:first",'
+                    '"preparedCallRef":"prepared-call:second"}'
+                )
+            },
+            # Extra fields are outside the finite canonical-ref shape.
+            {
+                "preparedCallRef": json.dumps(
+                    {"preparedCallRef": prepared_ref, "extra": True},
+                    separators=(",", ":"),
+                )
+            },
+            # The opaque reference prefix remains gateway-owned validation.
+            {
+                "preparedCallRef": json.dumps(
+                    {"preparedCallRef": "not-a-prepared-call"},
+                    separators=(",", ":"),
+                )
+            },
+            # Oversized opaque values are not normalized.
+            {
+                "preparedCallRef": json.dumps(
+                    {"preparedCallRef": "prepared-call:" + "x" * 256},
+                    separators=(",", ":"),
+                )
+            },
+            # The accepted branch is exactly one JSON object layer, not recursive.
+            {
+                "preparedCallRef": json.dumps(
+                    {"preparedCallRef": {"preparedCallRef": prepared_ref}},
+                    separators=(",", ":"),
+                )
+            },
+        )
+        for input_value in malformed:
+            self.assertIs(
+                _normalize_prepared_read_input(
+                    "read", "operation:work_item.read", input_value
+                ),
+                input_value,
+            )
+
     def test_registry_normalizes_bare_and_input_wrapped_prepared_read_refs(self) -> None:
         install_plane_tools()
         requests: list[dict] = []
