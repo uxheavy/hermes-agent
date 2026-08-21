@@ -207,6 +207,23 @@ def _runtime_exception_class(exception: BaseException) -> str:
     return name if name in RUNTIME_FAILURE_EXCEPTION_CLASSES else "Unknown"
 
 
+_STRUCTURED_FAILURE_EXCEPTION_CLASSES = MappingProxyType(
+    {
+        "outcome_unknown": "RuntimeError",
+        "budget_exhausted": "RuntimeError",
+        "required_tool_not_used": "RuntimeError",
+    }
+)
+
+
+def _structured_failure_exception_class(failure_reason: object) -> str:
+    """Project only exact, bounded Hermes failure reasons into runtime evidence."""
+
+    if not isinstance(failure_reason, str):
+        return "Unknown"
+    return _STRUCTURED_FAILURE_EXCEPTION_CLASSES.get(failure_reason, "Unknown")
+
+
 class ProviderOutcomeUnknownError(RuntimeError):
     """A provider request may have reached upstream and must not be replayed."""
 
@@ -1504,6 +1521,10 @@ class HermesKernelAdapter:
                     retryable=False,
                     usage=usage,
                     model_calls=model_calls,
+                    runtime_phase="conversation",
+                    exception_class=_structured_failure_exception_class(
+                        result.get("failure_reason")
+                    ),
                 )
             if result.get("failure_reason") == "budget_exhausted":
                 return HermesKernelResult(
@@ -1513,6 +1534,10 @@ class HermesKernelAdapter:
                     retryable=False,
                     usage=usage,
                     model_calls=model_calls,
+                    runtime_phase="conversation",
+                    exception_class=_structured_failure_exception_class(
+                        result.get("failure_reason")
+                    ),
                 )
             model = snapshot.raw["runtimePolicy"].get("model", {})
             provider_failure_cause = _provider_result_failure_cause(
@@ -1529,6 +1554,10 @@ class HermesKernelAdapter:
                 usage=usage,
                 model_calls=model_calls,
                 failure_cause=provider_failure_cause,
+                runtime_phase="conversation",
+                exception_class=_structured_failure_exception_class(
+                    result.get("failure_reason")
+                ),
             )
         question = result.get("input_request") or result.get("waiting_for_input")
         if isinstance(question, str) and question:

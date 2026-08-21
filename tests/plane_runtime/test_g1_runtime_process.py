@@ -1505,6 +1505,75 @@ class G1RuntimeProcessTests(unittest.TestCase):
         self.assertEqual(result.kind, "failed")
         self.assertEqual(result.failure_code, "budget_exhausted")
         self.assertFalse(result.retryable)
+        self.assertEqual(result.runtime_phase, "conversation")
+        self.assertEqual(result.exception_class, "RuntimeError")
+
+    def test_hermes_adapter_projects_bounded_structured_failure_reason(self) -> None:
+        snapshot = G1RunSnapshot.from_dict(make_snapshot())
+        invocation = G1InvocationEnvelope.from_dict(make_invocation(snapshot.to_dict()))
+
+        class Credentials:
+            def resolve(self, provider: str) -> dict[str, str]:
+                del provider
+                return {"api_key": "trusted-host-secret"}
+
+        for failure_reason, expected_exception_class in (
+            ("required_tool_not_used", "RuntimeError"),
+            ("unclassified_failure_reason", "Unknown"),
+        ):
+            class FailedAgent:
+                session_input_tokens = 1
+                session_output_tokens = 1
+
+                def run_conversation(self, message: str, *, system_message: str) -> dict[str, object]:
+                    del message, system_message
+                    return {
+                        "failed": True,
+                        "failure_reason": failure_reason,
+                        "error": "private structured failure detail",
+                    }
+
+            result = HermesKernelAdapter(
+                agent_factory=lambda **kwargs: FailedAgent(),
+                credential_source=Credentials(),
+            ).dispatch(snapshot, invocation, lambda: False, lambda body: None, model_call_allowance=1)
+
+            self.assertEqual(result.failure_code, "runtime_error")
+            self.assertEqual(result.runtime_phase, "conversation")
+            self.assertEqual(result.exception_class, expected_exception_class)
+            self.assertNotIn("private structured failure detail", json.dumps(result.__dict__))
+            exit_frame = _terminal_failure(snapshot, invocation, result, 0)
+            self.assertEqual(exit_frame["failure"]["runtimePhase"], "conversation")
+            self.assertEqual(exit_frame["failure"]["exceptionClass"], expected_exception_class)
+            self.assertNotIn("private structured failure detail", json.dumps(exit_frame))
+
+    def test_hermes_adapter_projects_structured_outcome_unknown_diagnostic(self) -> None:
+        snapshot = G1RunSnapshot.from_dict(make_snapshot())
+        invocation = G1InvocationEnvelope.from_dict(make_invocation(snapshot.to_dict()))
+
+        class OutcomeUnknownAgent:
+            session_input_tokens = 1
+            session_output_tokens = 1
+
+            def run_conversation(self, message: str, *, system_message: str) -> dict[str, object]:
+                del message, system_message
+                return {
+                    "failed": True,
+                    "failure_reason": "outcome_unknown",
+                    "error": "private outcome detail",
+                }
+
+        result = HermesKernelAdapter(
+            agent_factory=lambda **kwargs: OutcomeUnknownAgent(),
+            credential_source=InlineCredentialSource(
+                {"api_key": "trusted-host-secret"}, "test-provider"
+            ),
+        ).dispatch(snapshot, invocation, lambda: False, lambda body: None, model_call_allowance=1)
+
+        self.assertEqual(result.failure_code, "outcome_unknown")
+        self.assertEqual(result.runtime_phase, "conversation")
+        self.assertEqual(result.exception_class, "RuntimeError")
+        self.assertNotIn("private outcome detail", json.dumps(result.__dict__))
 
     def test_hermes_adapter_classifies_bounded_provider_result_failures(self) -> None:
         snapshot = G1RunSnapshot.from_dict(make_snapshot())
