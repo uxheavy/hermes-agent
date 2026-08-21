@@ -34,10 +34,18 @@ _HOST_CALLBACK_PHASES = frozenset(
 
 def _bounded_host_operation_diagnostic(
     value: Mapping[str, Any] | None,
-) -> dict[str, str] | None:
+) -> dict[str, Any] | None:
     """Project only the finite, digested host callback facts onto RuntimeExit."""
 
-    if not isinstance(value, Mapping) or set(value) != {"callbackPhase", "operationRefDigest"}:
+    if not isinstance(value, Mapping):
+        return None
+    allowed = {
+        "callbackPhase",
+        "operationRefDigest",
+        "codeModeHostStatus",
+        "codeModeFailureClass",
+    }
+    if set(value).difference(allowed):
         return None
     phase = value.get("callbackPhase")
     operation_ref_digest = value.get("operationRefDigest")
@@ -48,7 +56,28 @@ def _bounded_host_operation_diagnostic(
         or any(char not in "0123456789abcdef" for char in operation_ref_digest)
     ):
         return None
-    return {"callbackPhase": phase, "operationRefDigest": operation_ref_digest}
+    result: dict[str, Any] = {
+        "callbackPhase": phase,
+        "operationRefDigest": operation_ref_digest,
+    }
+    code_mode_fields = {"codeModeHostStatus", "codeModeFailureClass"}
+    present = code_mode_fields.intersection(value)
+    if present and present != code_mode_fields:
+        return None
+    if present:
+        if value["codeModeHostStatus"] not in {
+            "ok", "replayed", "denied", "conflict", "unavailable", "invalid"
+        } or value["codeModeFailureClass"] not in {
+            "code_mode", "callback", "transport", "contract", "unknown"
+        }:
+            return None
+        result.update(
+            {
+                "codeModeHostStatus": value["codeModeHostStatus"],
+                "codeModeFailureClass": value["codeModeFailureClass"],
+            }
+        )
+    return result
 
 
 def _write_model_usage(diagnostics: TextIO | None, model_calls: int | None) -> None:

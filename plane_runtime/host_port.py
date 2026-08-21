@@ -6,10 +6,10 @@ trusted host owns the callable transport and binds identity, authorization,
 and credentials on the other side of that transport.  Hermes exposes only
 bounded, invocation-scoped tool callbacks to the existing agent loop.
 
-The registered tools deliberately live in dynamic Plane toolsets. They are
-installed only by :class:`HermesKernelAdapter`, and their handlers resolve a
-context-local port, so another Hermes conversation cannot reuse this
-invocation's host binding.
+The registered tools deliberately live in a dynamic ``plane_runtime``
+toolset.  They are installed only by :class:`HermesKernelAdapter`, and their
+handlers resolve a context-local port, so another Hermes conversation cannot
+reuse this invocation's host binding.
 """
 
 from __future__ import annotations
@@ -74,6 +74,17 @@ _RESULT_STATUSES = {
     "invalid",
 }
 
+_CODE_MODE_HOST_STATUSES = frozenset(_RESULT_STATUSES)
+_CODE_MODE_CONTRACT_ERRORS = frozenset(
+    {
+        "VALIDATION_ERROR",
+        "PREPARED_CALL_INVALID",
+        "PROTOCOL_ERROR",
+        "SOURCE_TOO_LARGE",
+        "BUDGET_EXCEEDED",
+    }
+)
+
 HostResultDisposition = Literal[
     "continue_with_tool_result",
     "poison_invocation",
@@ -84,6 +95,11 @@ _HOST_RESULT_DISPOSITIONS: Mapping[tuple[str, str | None], HostResultDisposition
         ("ok", None): "continue_with_tool_result",
         ("replayed", None): "continue_with_tool_result",
         ("invalid", "VALIDATION_ERROR"): "continue_with_tool_result",
+        # A generated Code Mode module may fail in the restricted isolate.
+        # Return that finite, bounded result to the model so it can correct
+        # the module in the same invocation; host/transport failures remain
+        # poison unless explicitly classified above.
+        ("invalid", "CODE_MODE_FAILED"): "continue_with_tool_result",
         ("denied", "NOT_AUTHORIZED"): "continue_with_tool_result",
         ("conflict", "PLANE_CONFLICT"): "continue_with_tool_result",
     }
@@ -460,44 +476,100 @@ def _prepared_read_ref_from_search_result(output: Any) -> str | None:
     return refs[0] if len(refs) == 1 else None
 
 
+def _opaque_prepared_ref(value: Any) -> str | None:
+    if (
+        not isinstance(value, str)
+        or not value.startswith("prepared-call:")
+        or len(value.encode("utf-8")) > 256
+    ):
+        return None
+    return value
+
+
+def _ready_to_call_prepared_ref(value: Any) -> str | None:
+    if (
+        not isinstance(value, Mapping)
+        or set(value) != {"action", "operationRef", "input"}
+        or value.get("action") != "read"
+        or value.get("operationRef") != "operation:work_item.read"
+    ):
+        return None
+    nested_input = value.get("input")
+    if not isinstance(nested_input, Mapping) or set(nested_input) != {"preparedCallRef"}:
+        return None
+    return _opaque_prepared_ref(nested_input.get("preparedCallRef"))
+
+
+def _wrapped_ready_to_call_prepared_ref(value: Any) -> str | None:
+    if isinstance(value, Mapping):
+        return _ready_to_call_prepared_ref(value)
+    if not isinstance(value, str) or not value.startswith("{"):
+        return None
+    if len(value.encode("utf-8")) > MAX_HOST_INPUT_BYTES:
+        return None
+    try:
+        decoded = json.loads(value, object_pairs_hook=_duplicate_rejecting_pairs)
+    except (TypeError, ValueError):
+        return None
+    return _ready_to_call_prepared_ref(decoded)
+
+
 def _normalize_prepared_read_input(
     action: str, operation_ref: str, input_value: Mapping[str, Any]
 ) -> Mapping[str, Any]:
-    """Accept the exact ready-to-call read envelope without widening the port.
+    """Accept only finite, lossless shapes of the prepared read handoff.
 
-    ``search_workspace`` returns a complete ``workItemReadCall`` object. A
-    model can reasonably copy that object into ``plane_operation.input`` even
-    though the host callback already receives ``action`` and ``operationRef``
-    at the top level. Only that exact, operation-bound shape is collapsed to
-    the canonical opaque reference input; all other shapes remain untouched
-    and are rejected by the trusted Plane host.
+    The model-facing search result can reach the host callback as the opaque
+    reference itself, one ``input`` wrapper, the complete ready-to-call
+    envelope, one named ``workItemReadCall`` wrapper, or that exact envelope
+    wrapped under ``preparedCallRef`` as an object or JSON string. These
+    branches are deliberately explicit rather than recursive: only the exact
+    read binding and one bounded opaque reference are collapsed to the
+    canonical input; every other shape remains untouched for Plane to reject.
     """
 
-    if (
-        action != "read"
-        or operation_ref != "operation:work_item.read"
-        or set(input_value) != {
-            "action",
-            "operationRef",
-            "input",
-        }
-    ):
+    if action != "read" or operation_ref != "operation:work_item.read":
         return input_value
-    if (
-        input_value.get("action") != "read"
-        or input_value.get("operationRef") != operation_ref
-    ):
-        return input_value
-    nested_input = input_value.get("input")
-    if (
-        not isinstance(nested_input, Mapping)
-        or set(nested_input) != {"preparedCallRef"}
-        or not isinstance(nested_input.get("preparedCallRef"), str)
-        or not nested_input["preparedCallRef"].startswith("prepared-call:")
-        or len(nested_input["preparedCallRef"].encode("utf-8")) > 256
-    ):
-        return input_value
-    return {"preparedCallRef": nested_input["preparedCallRef"]}
+    def canonical_ref(candidate: Any) -> Mapping[str, Any] | None:
+        if (
+            not isinstance(candidate, Mapping)
+            or set(candidate) != {"preparedCallRef"}
+            or not isinstance(candidate.get("preparedCallRef"), str)
+            or not candidate["preparedCallRef"].startswith("prepared-call:")
+            or len(candidate["preparedCallRef"].encode("utf-8")) > 256
+        ):
+            return None
+        return {"preparedCallRef": candidate["preparedCallRef"]}
+
+    def ready_envelope(candidate: Any) -> Mapping[str, Any] | None:
+        if (
+            not isinstance(candidate, Mapping)
+            or set(candidate) != {"action", "operationRef", "input"}
+            or candidate.get("action") != "read"
+            or candidate.get("operationRef") != operation_ref
+        ):
+            return None
+        return canonical_ref(candidate.get("input"))
+
+    def wrapped_ready_envelope(candidate: Any) -> Mapping[str, Any] | None:
+        prepared_ref = _wrapped_ready_to_call_prepared_ref(candidate)
+        return canonical_ref({"preparedCallRef": prepared_ref}) if prepared_ref else None
+
+    # The accepted forms are intentionally enumerated. In particular, a named
+    # wrapper may contain only the ready envelope, not another wrapper.
+    if set(input_value) == {"preparedCallRef"}:
+        normalized = canonical_ref(input_value)
+        if normalized is None:
+            normalized = wrapped_ready_envelope(input_value["preparedCallRef"])
+    elif set(input_value) == {"input"}:
+        normalized = canonical_ref(input_value.get("input"))
+    elif set(input_value) == {"action", "operationRef", "input"}:
+        normalized = ready_envelope(input_value)
+    elif set(input_value) == {"workItemReadCall"}:
+        normalized = ready_envelope(input_value.get("workItemReadCall"))
+    else:
+        normalized = None
+    return normalized if normalized is not None else input_value
 
 
 class UnixSocketPlaneHostPort:
@@ -683,13 +755,14 @@ class PlaneHostBinding:
     correlation_id: str
     cancellation: Callable[[], bool]
     emit_body: Callable[[Mapping[str, Any]], None] | None = None
+    diagnostic_callback: Callable[[Mapping[str, Any]], None] | None = None
     eager_operation_refs: frozenset[str] = field(default_factory=frozenset)
     max_calls: int = MAX_HOST_CALLS
     records: list[HostCallRecord] = field(default_factory=list)
     described_operation_refs: set[str] = field(default_factory=set, init=False, repr=False)
     _fatal_error: str | None = field(default=None, init=False, repr=False)
     _fatal_error_after_terminal: bool = field(default=False, init=False, repr=False)
-    _host_operation_diagnostic: dict[str, str] | None = field(
+    _host_operation_diagnostic: dict[str, Any] | None = field(
         default=None, init=False, repr=False
     )
     _terminal_action_reason: str | None = field(default=None, init=False, repr=False)
@@ -731,7 +804,7 @@ class PlaneHostBinding:
             return self._fatal_error_after_terminal
 
     @property
-    def host_operation_diagnostic(self) -> dict[str, str] | None:
+    def host_operation_diagnostic(self) -> dict[str, Any] | None:
         """Return only bounded, non-secret facts about the last host callback."""
 
         with self._lock:
@@ -779,10 +852,50 @@ class PlaneHostBinding:
             operation_ref_digest = self._host_operation_diagnostic["operationRefDigest"]
         else:
             return
-        self._host_operation_diagnostic = {
+        diagnostic = {
             "callbackPhase": phase,
             "operationRefDigest": operation_ref_digest,
         }
+        self._host_operation_diagnostic = diagnostic
+        if self.diagnostic_callback is not None:
+            try:
+                self.diagnostic_callback(diagnostic)
+            except Exception:
+                # Diagnostics are observational only and must never alter the
+                # host authorization or callback result.
+                pass
+
+    def _set_code_mode_diagnostic(
+        self,
+        request: HostCallRequest,
+        *,
+        status: str,
+        error_code: str | None = None,
+    ) -> None:
+        """Attach only finite Code Mode result facts to the host diagnostic."""
+
+        if request.action != "code":
+            return
+        bounded_status = status if status in _CODE_MODE_HOST_STATUSES else "unavailable"
+        if error_code == "CODE_MODE_FAILED":
+            failure_class = "code_mode"
+        elif error_code == "CALLBACK_FAILED":
+            failure_class = "callback"
+        elif error_code in _CODE_MODE_CONTRACT_ERRORS or bounded_status == "invalid":
+            failure_class = "contract"
+        elif bounded_status == "unavailable":
+            failure_class = "transport"
+        else:
+            failure_class = "unknown"
+        diagnostic = dict(self._host_operation_diagnostic or {})
+        diagnostic["codeModeHostStatus"] = bounded_status
+        diagnostic["codeModeFailureClass"] = failure_class
+        self._host_operation_diagnostic = diagnostic
+        if self.diagnostic_callback is not None:
+            try:
+                self.diagnostic_callback(diagnostic)
+            except Exception:
+                pass
 
     def _schema_is_disclosed(self, operation_ref: str) -> bool:
         return operation_ref in self.eager_operation_refs or operation_ref in self.described_operation_refs
@@ -933,12 +1046,21 @@ class PlaneHostBinding:
             try:
                 result = self.port.invoke(request)
             except PlaneHostError as exc:
+                self._set_code_mode_diagnostic(
+                    request, status="unavailable", error_code="HOST_UNAVAILABLE"
+                )
                 self._fail(str(exc) or "Plane host callback failed")
                 raise
             except Exception as exc:
+                self._set_code_mode_diagnostic(
+                    request, status="unavailable", error_code="HOST_UNAVAILABLE"
+                )
                 self._fail("Plane host callback failed")
                 raise PlaneHostUnavailable("Plane host callback failed") from exc
             self._set_callback_phase("host_return", request)
+            self._set_code_mode_diagnostic(
+                request, status=result.status, error_code=result.error_code
+            )
             self.records.append(HostCallRecord(request, result))
             try:
                 self._record_catalog_description(request, result)
@@ -1019,7 +1141,10 @@ class PlaneHostBinding:
             source="model",
         )
         if result.status not in {"ok", "replayed"}:
-            if result.status == "conflict" and result.error_code == "PLANE_CONFLICT":
+            if (
+                _host_result_disposition(result) == "continue_with_tool_result"
+                and result.status in {"invalid", "conflict"}
+            ):
                 return result
             self._fail("explicit publication was not authorized by the Plane host")
             return result
@@ -1547,10 +1672,10 @@ __all__ = [
     "MAX_CODE_MODE_SOURCE_BYTES",
     "PLANE_CODE_MODE_EXECUTE_OPERATION",
     "PLANE_CODE_MODE_SCHEMA_VERSION",
-    "PLANE_CODE_MODE_TOOLSET",
-    "PLANE_CODE_MODE_TOOL",
     "PLANE_OPERATION_TOOLSET",
     "PLANE_PUBLICATION_TOOLSET",
+    "PLANE_CODE_MODE_TOOLSET",
+    "PLANE_CODE_MODE_TOOL",
     "PLANE_OUTCOME_PUBLISH_OPERATION",
     "bind_plane_host",
     "current_plane_host",

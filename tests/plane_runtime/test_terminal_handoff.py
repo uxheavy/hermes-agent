@@ -415,6 +415,94 @@ def test_post_terminal_code_mode_host_exception_preserves_applied_publication() 
     assert "provider-test-marker" not in json.dumps(host_requests + bodies)
 
 
+def test_diagnostics_projection_failure_cannot_relabel_applied_publication() -> None:
+    """Diagnostics are observation-only and must not turn a completed product into a runtime failure."""
+
+    from plane_runtime import current_plane_host
+    from plane_runtime.hermes_adapter import HermesKernelAdapter
+    from tests.plane_runtime.test_g1_runtime_process import (
+        G1InvocationEnvelope,
+        G1RunSnapshot,
+        make_invocation,
+        make_snapshot,
+    )
+
+    snapshot = G1RunSnapshot.from_dict(make_snapshot())
+    invocation = G1InvocationEnvelope.from_dict(make_invocation(snapshot.to_dict()))
+
+    def rpc(request: dict) -> dict:
+        return _result(
+            request,
+            output={"published": True},
+            publication={
+                "action": "applied",
+                "productKind": "outcome_submission",
+                "productRef": "outcome-submission:test",
+                "operationAttemptRef": "operation-attempt:test",
+                "operationRef": PLANE_OUTCOME_PUBLISH_OPERATION,
+                "applicationServiceRef": "application-service:agent-lifecycle",
+                "gatewayReceiptRef": "gateway-receipt:test",
+                "receiptRef": "receipt:test",
+                "auditReceiptRef": "audit-receipt:test",
+                "productEventRef": "product-event:test",
+            },
+        )
+
+    class FakeAgent:
+        session_input_tokens = 1
+        session_output_tokens = 1
+        session_api_calls = 1
+
+        def __init__(self, **_kwargs: object) -> None:
+            self._session_messages = []
+
+        def interrupt(self, _reason: str) -> None:
+            return
+
+        def run_conversation(self, *_args: object, **_kwargs: object) -> dict[str, object]:
+            binding = current_plane_host()
+            assert binding is not None
+            binding.publish(
+                kind="outcome",
+                operation_ref=PLANE_OUTCOME_PUBLISH_OPERATION,
+                resource_ref="outcome-submission:test",
+                content="bounded outcome",
+            )
+            return {
+                "final_response": "ordinary final transcript evidence",
+                "failed": False,
+                "turn_exit_reason": "terminal_action(product_outcome_published)",
+            }
+
+    bodies: list[dict] = []
+
+    def emit_body(body: dict) -> None:
+        bodies.append(body)
+        if body.get("payload", {}).get("kind") == "runtime_diagnostics":
+            raise RuntimeError("synthetic observation sink failure")
+
+    result = HermesKernelAdapter(
+        agent_factory=lambda **kwargs: FakeAgent(**kwargs),
+        credential_source=type(
+            "Credentials",
+            (),
+            {"resolve": lambda _self, _provider: {"api_key": "provider-test-marker"}},
+        )(),
+        host_port=CallablePlaneHostPort(rpc),
+    ).dispatch(
+        snapshot,
+        invocation,
+        lambda: False,
+        emit_body,
+        model_call_allowance=2,
+    )
+
+    assert result.kind == "completed"
+    assert result.output_text == "ordinary final transcript evidence"
+    assert sum(body["kind"] == "outcome_submission_observed" for body in bodies) == 1
+    assert sum(body.get("payload", {}).get("kind") == "runtime_diagnostics" for body in bodies) == 1
+
+
 def test_pre_terminal_code_mode_host_exception_remains_failed() -> None:
     """The terminal-preserving exception branch must not swallow pre-terminal errors."""
 

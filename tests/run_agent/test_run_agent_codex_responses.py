@@ -305,6 +305,17 @@ def test_build_api_kwargs_codex(monkeypatch):
     assert "extra_body" not in kwargs
 
 
+def test_code_mode_keeps_codex_tool_choice_auto(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    agent.request_overrides = {}
+
+    first = agent._build_api_kwargs([{"role": "user", "content": "run"}])
+    assert first["tool_choice"] == "auto"
+
+    later = agent._build_api_kwargs([{"role": "user", "content": "publish"}])
+    assert later["tool_choice"] == "auto"
+
+
 def test_build_api_kwargs_mantle_sets_extended_prompt_cache_retention(monkeypatch):
     _patch_agent_bootstrap(monkeypatch)
     agent = run_agent.AIAgent(
@@ -1729,8 +1740,6 @@ def test_duplicate_detection_uses_commentary_when_hidden_reasoning_changes(monke
     reasoning_items = interim_msgs[0].get("codex_reasoning_items")
     if reasoning_items:
         assert reasoning_items[0].get("id") == "rs_second"
-
-
 
 
 

@@ -31,8 +31,10 @@ from .host_port import (
     PlaneHostPort,
     bind_plane_host,
     install_plane_tools,
+    PLANE_CODE_MODE_TOOL,
     PLANE_CODE_MODE_TOOLSET,
     PLANE_OPERATION_TOOLSET,
+    PLANE_PUBLISH_TOOL,
     PLANE_PUBLICATION_TOOLSET,
 )
 from .presentation import PresentationBoundsError, build_model_guidance
@@ -54,6 +56,7 @@ _CODE_MODE_RUNTIME_POLICY_FIELDS = (
     "maxCodeModeOutputBytes",
     "maxCodeModeCalls",
 )
+_CODE_MODE_FIRST_REQUIRED_TOOL = "plane_execute_typescript"
 _OUTCOME_UNKNOWN_RUNTIME_MESSAGE = (
     "Provider outcome is unknown; Plane reconciliation is required before retrying."
 )
@@ -469,7 +472,7 @@ def _code_mode_is_available(snapshot: G1RunSnapshot) -> bool:
 
 
 def _plane_model_toolsets(snapshot: G1RunSnapshot) -> tuple[str, ...]:
-    """Project Plane's immutable model toolset into Hermes toolsets."""
+    """Resolve model-facing Plane toolsets from the immutable snapshot signal."""
 
     if snapshot.model_toolset == "code_mode_only":
         return (PLANE_PUBLICATION_TOOLSET, PLANE_CODE_MODE_TOOLSET)
@@ -478,8 +481,37 @@ def _plane_model_toolsets(snapshot: G1RunSnapshot) -> tuple[str, ...]:
     raise G1ContractError("snapshot.modelToolset is unsupported")
 
 
+def _plane_first_required_tool(snapshot: G1RunSnapshot) -> str | None:
+    """Return the finite first-tool requirement for Code Mode-only runs."""
+
+    if snapshot.model_toolset == "code_mode_only":
+        return _CODE_MODE_FIRST_REQUIRED_TOOL
+    return None
+
+
+def _restrict_plane_code_mode_tools(agent: Any, snapshot: G1RunSnapshot) -> None:
+    """Keep Code Mode presentation disjoint without changing registry dispatch."""
+
+    if snapshot.model_toolset != "code_mode_only":
+        return
+    from tools.registry import registry
+
+    allowed = {PLANE_CODE_MODE_TOOL, PLANE_PUBLISH_TOOL}
+    tools = registry.get_definitions(allowed, quiet=True)
+    names = {
+        tool.get("function", {}).get("name")
+        for tool in tools
+        if isinstance(tool, Mapping) and isinstance(tool.get("function"), Mapping)
+    }
+    if names != allowed:
+        raise G1ContractError("Code Mode model tool catalog is incomplete")
+    agent.tools = tools
+    agent.valid_tool_names = names
+
+
 def _strict_json_object(raw: bytes, expected: set[str], name: str) -> dict[str, Any]:
     """Parse one canonical object and reject duplicate/unknown/trailing data."""
+
     if raw != raw.strip() or len(raw) > _MAX_CREDENTIAL_VALUE_BYTES:
         raise G1ContractError(f"{name} is not canonical")
 
@@ -627,7 +659,7 @@ class HermesKernelResult:
     usage: Mapping[str, int] | None = None
     model_calls: int | None = None
     failure_cause: str | None = None
-    host_operation_diagnostic: Mapping[str, str] | None = None
+    host_operation_diagnostic: Mapping[str, Any] | None = None
 
 
 def _host_operation_failure_message(
@@ -751,6 +783,63 @@ def _terminal_lifecycle_observation(
     if len(encoded.encode("utf-8")) > min(maximum_bytes, 2_048):
         return None
     return encoded
+
+
+def _emit_plane_runtime_diagnostics(
+    agent: Any,
+    emit_body: Callable[[Mapping[str, Any]], None],
+) -> None:
+    """Emit bounded Code Mode request/response facts before terminal failure."""
+
+    diagnostics = getattr(agent, "_plane_runtime_diagnostics", None)
+    if not isinstance(diagnostics, dict):
+        return
+    payload: dict[str, Any] = {
+        "kind": "runtime_diagnostics",
+        "version": 1,
+        "requests": list(diagnostics.get("requests", []))[:32],
+        "responses": list(diagnostics.get("responses", []))[:32],
+    }
+    if isinstance(diagnostics.get("hostCallbacks"), list):
+        payload["hostCallbacks"] = list(diagnostics["hostCallbacks"])[:64]
+    try:
+        emit_body(
+            {
+                "kind": "progress_observed",
+                "payload": payload,
+                "publication": {"action": "observation_only"},
+            }
+        )
+    except Exception:
+        # Diagnostics are non-authoritative observations. A sink failure must
+        # not relabel a completed Plane product or trigger a runtime failure.
+        return
+
+
+def _record_plane_runtime_host_callback(agent: Any, diagnostic: Any) -> None:
+    """Retain only the bounded phase and operation-reference digest."""
+
+    diagnostics = getattr(agent, "_plane_runtime_diagnostics", None)
+    if not isinstance(diagnostics, dict) or not isinstance(diagnostic, Mapping):
+        return
+    phase = diagnostic.get("callbackPhase")
+    digest = diagnostic.get("operationRefDigest")
+    if (
+        phase not in HOST_CALLBACK_PHASES
+        or not isinstance(digest, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", digest)
+    ):
+        return
+    callbacks = diagnostics.setdefault("hostCallbacks", [])
+    if not isinstance(callbacks, list) or len(callbacks) >= 64:
+        return
+    callbacks.append(
+        {
+            "sequence": len(callbacks) + 1,
+            "phase": phase,
+            "operationRefDigest": digest,
+        }
+    )
 
 
 class NeverCancelled:
@@ -1092,6 +1181,11 @@ class HermesKernelAdapter:
         started_at = time.monotonic()
         agent: Any | None = None
         cancellation_monitor: _CancellationMonitor | None = None
+
+        def record_host_callback(diagnostic: Mapping[str, str]) -> None:
+            if agent is not None:
+                _record_plane_runtime_host_callback(agent, diagnostic)
+
         host_binding = (
             PlaneHostBinding(
                 port=self._host_port,
@@ -1100,6 +1194,7 @@ class HermesKernelAdapter:
                 correlation_id=invocation.correlation_id,
                 cancellation=cancellation,
                 emit_body=emit_body,
+                diagnostic_callback=record_host_callback,
                 eager_operation_refs=frozenset(
                     str(operation["operationRef"])
                     for operation in snapshot.eager_operations
@@ -1110,6 +1205,32 @@ class HermesKernelAdapter:
         )
         try:
             agent = self._agent_factory(**agent_kwargs)
+            _restrict_plane_code_mode_tools(agent, snapshot)
+            first_required_tool = _plane_first_required_tool(snapshot)
+            if host_binding is not None:
+                setattr(
+                    agent,
+                    "_plane_runtime_diagnostics",
+                    {"requests": [], "responses": [], "hostCallbacks": []},
+                )
+            if first_required_tool is not None:
+                try:
+                    from tools.registry import registry
+
+                    first_tool_registered = registry.get_entry(first_required_tool) is not None
+                except Exception:
+                    first_tool_registered = False
+                if not first_tool_registered:
+                    return HermesKernelResult(
+                        kind="failed",
+                        failure_code="runtime_error",
+                        failure_message="Code Mode first tool registry is unavailable",
+                        failure_cause="static_configuration_failure",
+                        retryable=False,
+                        model_calls=0,
+                    )
+                setattr(agent, "_plane_first_required_tool", first_required_tool)
+                setattr(agent, "_plane_first_required_tool_retries", 0)
             if host_binding is not None:
                 setattr(agent, "_terminal_action_check", host_binding.terminal_action_reason)
                 setattr(
@@ -1157,6 +1278,7 @@ class HermesKernelAdapter:
                 and getattr(exc, "retryable", None) is False
                 and getattr(exc, "upstream_initiated", False) is True
             ):
+                _emit_plane_runtime_diagnostics(agent, emit_body)
                 return HermesKernelResult(
                     kind="failed",
                     failure_code="outcome_unknown",
@@ -1295,6 +1417,7 @@ class HermesKernelAdapter:
                     "publication": {"action": "observation_only"},
                 }
             )
+        _emit_plane_runtime_diagnostics(agent, emit_body)
         usage_values = (
             getattr(agent, "session_input_tokens", 0),
             getattr(agent, "session_output_tokens", 0),

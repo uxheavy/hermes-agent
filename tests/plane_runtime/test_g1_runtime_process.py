@@ -84,6 +84,7 @@ def make_snapshot() -> dict[str, object]:
         "context": [],
         "toolCatalog": {
             "catalogDigest": "content:" + "c" * 64,
+            "modelToolset": "standard",
             "eagerOperations": [
                 {
                     "operationRef": "operation:work_item.read",
@@ -183,6 +184,7 @@ def make_plane_accepted_snapshot() -> dict[str, object]:
     ]
     snapshot["toolCatalog"] = {
         "catalogDigest": "content:" + "c" * 64,
+        "modelToolset": "standard",
         "eagerOperations": [
             {
                 "operationRef": "operation:search_workspace",
@@ -1212,10 +1214,6 @@ class G1RuntimeProcessTests(unittest.TestCase):
 
     def test_hermes_adapter_uses_existing_agent_loop_and_redacts_host_credentials(self) -> None:
         snapshot_raw = make_snapshot()
-        snapshot_raw["toolCatalog"] = {
-            **snapshot_raw["toolCatalog"],  # type: ignore[misc]
-            "modelToolset": "code_mode_only",
-        }
         snapshot_raw["runtimePolicy"] = dict(snapshot_raw["runtimePolicy"])  # type: ignore[arg-type]
         snapshot_raw["runtimePolicy"]["adapter"] = "hermes"  # type: ignore[index]
         snapshot_raw["contentDigest"] = _digest(
@@ -1275,6 +1273,7 @@ class G1RuntimeProcessTests(unittest.TestCase):
         }
         snapshot_raw["toolCatalog"] = {
             "catalogDigest": "content:" + "c" * 64,
+            "modelToolset": "standard",
             "eagerOperations": [
                 {
                     "operationRef": "operation:work_item.read",
@@ -1651,6 +1650,31 @@ class G1RuntimeProcessTests(unittest.TestCase):
         )
         self.assertEqual(budget_result.failure_code, "budget_exhausted")
         self.assertIsNone(budget_result.failure_cause)
+
+    def test_code_mode_failure_diagnostic_round_trips_through_runtime_exit(self) -> None:
+        snapshot_raw = make_snapshot()
+        snapshot_raw["contentDigest"] = _digest(
+            "snapshot", {key: value for key, value in snapshot_raw.items() if key != "contentDigest"}
+        )
+        snapshot = G1RunSnapshot.from_dict(snapshot_raw)
+        invocation = G1InvocationEnvelope.from_dict(make_invocation(snapshot.to_dict()))
+        result = HermesKernelResult(
+            kind="failed",
+            failure_code="runtime_error",
+            failure_message="bounded host failure",
+            failure_cause="host_operation_failure",
+            retryable=False,
+            host_operation_diagnostic={
+                "callbackPhase": "host_return",
+                "operationRefDigest": "a" * 64,
+                "codeModeHostStatus": "invalid",
+                "codeModeFailureClass": "code_mode",
+            },
+        )
+        exit_frame = _terminal_failure(snapshot, invocation, result, 0)
+        self.assertEqual(exit_frame["failure"]["codeModeHostStatus"], "invalid")
+        self.assertEqual(exit_frame["failure"]["codeModeFailureClass"], "code_mode")
+        self.assertNotIn("bounded host failure", json.dumps(exit_frame))
 
     def test_adapter_classifies_runtime_exceptions_without_content_leakage(self) -> None:
         snapshot_raw = make_snapshot()

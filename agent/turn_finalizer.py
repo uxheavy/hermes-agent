@@ -66,6 +66,7 @@ _DIAGNOSTIC_EXIT_CATEGORIES = frozenset(
         "local_processing_error",
         "error_near_max_iterations",
         "partial_stream_recovery",
+        "required_tool_not_used",
         "other",
     }
 )
@@ -709,6 +710,9 @@ def finalize_turn(
     if terminal_budget_failure:
         result["failure_reason"] = "budget_exhausted"
         result["error"] = "model-call allowance is exhausted"
+    if _turn_exit_reason == "required_tool_not_used":
+        result["failure_reason"] = "required_tool_not_used"
+        result["error"] = "required Code Mode tool was not invoked"
     if agent._tool_guardrail_halt_decision is not None:
         result["guardrail"] = agent._tool_guardrail_halt_decision.to_metadata()
     # Surface any post-loop cleanup failures so the caller can distinguish a
