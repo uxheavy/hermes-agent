@@ -1025,6 +1025,67 @@ print("text_response")
         self.assertEqual(binding.take_code_mode_phase_hint(), "post_search")
         self.assertIsNone(binding.take_code_mode_phase_hint())
 
+    def test_code_mode_host_consumed_read_is_not_replayed_by_hermes(self) -> None:
+        requests: list[dict] = []
+
+        def respond(request: dict) -> dict:
+            requests.append(request)
+            return _result(
+                request,
+                output={
+                    "schemaVersion": "plane.code-mode/v1",
+                    "result": {
+                        "ok": True,
+                        "result": {
+                            "results": [
+                                {
+                                    "objectType": "work_item",
+                                    "workItemReadCall": "prepared-call:already-consumed",
+                                }
+                            ]
+                        },
+                    },
+                    "observations": [
+                        {
+                            "source": "code",
+                            "action": "code",
+                            "operationRef": "operation:search_workspace",
+                            "status": "ok",
+                        }
+                    ],
+                    "preparedReadResult": {
+                        "status": "ok",
+                        "replayed": False,
+                        "output": {
+                            "ok": True,
+                            "result": {"work_item": {"title": "assigned"}},
+                        },
+                    },
+                },
+            )
+
+        binding = PlaneHostBinding(
+            port=CallablePlaneHostPort(respond),
+            run_id="run:code-host-consumed",
+            invocation_id="invocation:code-host-consumed",
+            correlation_id="correlation:code-host-consumed",
+            cancellation=lambda: False,
+            code_mode_phase="post_search",
+        )
+        result = binding.call(
+            action="code",
+            operation_ref="plane.code-mode.execute@1",
+            input={"source": "export default async () => ({})"},
+            source="code",
+        )
+
+        self.assertEqual(result.status, "ok")
+        self.assertEqual(
+            [request["operationRef"] for request in requests],
+            ["plane.code-mode.execute@1"],
+        )
+        self.assertFalse(binding.prepared_read_handoff_pending())
+
     def test_code_mode_multi_prepared_reads_stay_pending_before_text_exit(self) -> None:
         output = {
             "result": {

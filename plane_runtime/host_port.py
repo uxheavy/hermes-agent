@@ -452,7 +452,7 @@ def _prepared_read_refs_from_search_result(output: Any) -> tuple[str, ...]:
     model because there is no safe single handoff to choose.
     """
 
-    if not isinstance(output, Mapping):
+    if not isinstance(output, Mapping) or "preparedReadResult" in output:
         return ()
     result = output.get("result")
     if isinstance(output.get("results"), list):
@@ -532,7 +532,7 @@ def _prepared_read_refs_from_code_mode_result(output: Any) -> tuple[str, ...]:
     opaque prepared call was not consumed by that same Code Mode turn.
     """
 
-    if not isinstance(output, Mapping):
+    if not isinstance(output, Mapping) or "preparedReadResult" in output:
         return ()
     observations = output.get("observations")
     if not isinstance(observations, list):
