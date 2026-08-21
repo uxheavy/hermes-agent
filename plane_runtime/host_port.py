@@ -458,20 +458,24 @@ def _prepared_read_refs_from_search_result(output: Any) -> tuple[str, ...]:
                 return ()
             prepared_refs.append(prepared_ref)
             continue
-        if (
-            call.get("action") != "read"
-            or call.get("operationRef") != "operation:work_item.read"
+        if set(call) == {"preparedCallRef"}:
+            prepared_ref = _opaque_prepared_ref(call.get("preparedCallRef"))
+        elif (
+            call.get("action") == "read"
+            and call.get("operationRef") == "operation:work_item.read"
         ):
+            input_value = call.get("input")
+            prepared_ref = (
+                _opaque_prepared_ref(input_value.get("preparedCallRef"))
+                if isinstance(input_value, Mapping)
+                and set(input_value) == {"preparedCallRef"}
+                else None
+            )
+        else:
+            prepared_ref = None
+        if prepared_ref is None:
             return ()
-        input_value = call.get("input")
-        if (
-            not isinstance(input_value, Mapping)
-            or set(input_value) != {"preparedCallRef"}
-            or not isinstance(input_value.get("preparedCallRef"), str)
-            or not input_value["preparedCallRef"].startswith("prepared-call:")
-        ):
-            return ()
-        prepared_refs.append(input_value["preparedCallRef"])
+        prepared_refs.append(prepared_ref)
     return tuple(prepared_refs)
 
 

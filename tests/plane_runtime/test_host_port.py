@@ -805,6 +805,33 @@ print("text_response")
             ("prepared-call:v72",),
         )
 
+    def test_code_mode_search_result_accepts_bare_prepared_ref_object(self) -> None:
+        output = {
+            "result": {
+                "ok": True,
+                "result": {
+                    "results": [
+                        {
+                            "objectType": "work_item",
+                            "workItemReadCall": {"preparedCallRef": "prepared-call:object"},
+                        }
+                    ]
+                },
+            },
+            "observations": [
+                {
+                    "source": "code",
+                    "action": "code",
+                    "operationRef": "operation:search_workspace",
+                    "status": "ok",
+                }
+            ],
+        }
+        self.assertEqual(
+            _prepared_read_refs_from_code_mode_result(output),
+            ("prepared-call:object",),
+        )
+
     def test_code_mode_read_consumption_and_non_code_operations_do_not_arm(self) -> None:
         def respond(request: dict) -> dict:
             return _result(request, output={"accepted": True})
