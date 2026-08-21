@@ -1733,7 +1733,6 @@ class G1RuntimeProcessTests(unittest.TestCase):
                 "MemoryError",
                 "TimeoutError",
                 "RuntimeError",
-                "APIConnectionError",
             }:
                 expected_exception_class = "Unknown"
             self.assertEqual(result.runtime_phase, "agent_initialization")
