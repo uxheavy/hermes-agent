@@ -1249,6 +1249,14 @@ class PlaneHostBinding:
         accepted = result.status in {"ok", "replayed"}
         if expected_status is not None:
             accepted = result.status == expected_status and result.error_code == expected_error
+        if accepted and expected_ref == "operation:search_workspace":
+            prepared_refs = _prepared_read_refs_from_search_result(result.output)
+            if (
+                len(prepared_refs) != 1
+                or self._prepared_call_registry.get(prepared_refs[0]) is not False
+                or _assignment_read_decision_requires_followup(result.output)
+            ):
+                return
         if accepted:
             self._standard_route_index += 1
 

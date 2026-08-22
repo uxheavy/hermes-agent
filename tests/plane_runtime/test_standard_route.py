@@ -306,7 +306,23 @@ def test_standard_route_can_narrow_result_too_large_search():
     ]
 
 
-def test_standard_route_does_not_auto_read_ambiguous_refs():
+@pytest.mark.parametrize(
+    "search_output",
+    [
+        {"result": {"results": []}},
+        {
+            "result": {
+                "results": [
+                    {"workItemReadCall": "prepared-call:first"},
+                    {"workItemReadCall": "prepared-call:second"},
+                ]
+            }
+        },
+        {"result": {"results": [{"workItemReadCall": "not-a-prepared-call"}]}},
+    ],
+    ids=["zero", "multiple", "invalid"],
+)
+def test_standard_route_keeps_search_step_without_one_auto_readable_ref(search_output):
     route = {
         "schemaVersion": "plane.standard-route/v1",
         "steps": [
@@ -318,17 +334,7 @@ def test_standard_route_does_not_auto_read_ambiguous_refs():
 
     def respond(request):
         requests.append(request)
-        return _result(
-            request,
-            output={
-                "result": {
-                    "results": [
-                        {"workItemReadCall": "prepared-call:first"},
-                        {"workItemReadCall": "prepared-call:second"},
-                    ]
-                }
-            },
-        )
+        return _result(request, output=search_output)
 
     binding = PlaneHostBinding(
         port=CallablePlaneHostPort(respond),
@@ -350,16 +356,14 @@ def test_standard_route_does_not_auto_read_ambiguous_refs():
 
     assert result.status == "ok"
     assert "preparedReadResult" not in result.output
-    assert binding.prepared_read_handoff_pending() is True
-    assert len(requests) == 1
-    with pytest.raises(PlaneHostUnavailable):
-        binding.call(
-            action="read",
-            operation_ref="operation:search_workspace",
-            input={},
-            source="model",
-        )
-    assert len(requests) == 1
+    binding.call(
+        action="read",
+        operation_ref="operation:search_workspace",
+        input={},
+        source="model",
+    )
+    assert binding._standard_route_index == 0
+    assert len(requests) == 2
 
 
 def test_non_standard_search_does_not_auto_read_prepared_ref():
