@@ -163,6 +163,62 @@ class AdapterPresentationTests(unittest.TestCase):
         self.assertEqual(diagnostics[0]["requests"][0]["toolChoice"], "required")  # type: ignore[index]
         self.assertEqual(diagnostics[0]["responses"][-1]["toolCall"], "execute")  # type: ignore[index]
 
+    def test_generic_conversation_failure_preserves_bounded_diagnostics(self) -> None:
+        raw = copy.deepcopy(make_snapshot())
+        raw["runtimePolicy"] = dict(raw["runtimePolicy"])  # type: ignore[arg-type]
+        raw["runtimePolicy"]["adapter"] = "hermes"  # type: ignore[index]
+        raw["contentDigest"] = _digest(
+            "snapshot", {key: value for key, value in raw.items() if key != "contentDigest"}
+        )
+        snapshot = G1RunSnapshot.from_dict(raw)
+        invocation = G1InvocationEnvelope.from_dict(make_invocation(snapshot.to_dict()))
+
+        class ExplodingAgent:
+            session_api_calls = 0
+
+            def run_conversation(self, message: str, *, system_message: str) -> dict[str, str]:
+                del message, system_message
+                self._plane_runtime_diagnostics["requests"].append(
+                    {
+                        "sequence": 1,
+                        "toolChoice": "auto",
+                        "visibleToolset": "other",
+                        "visibleToolCount": 1,
+                        "serialized": True,
+                    }
+                )
+                self._plane_runtime_diagnostics["responses"].append(
+                    {"sequence": 1, "responseClass": "text_response", "toolCall": "none"}
+                )
+                raise AssertionError("private conversation detail")
+
+        class Credentials:
+            def resolve(self, provider: str) -> dict[str, str]:
+                del provider
+                return {"api_key": "provider-free-test-secret"}
+
+        bodies: list[dict[str, object]] = []
+        result = HermesKernelAdapter(
+            agent_factory=lambda **kwargs: ExplodingAgent(),
+            credential_source=Credentials(),
+            host_port=CallablePlaneHostPort(lambda request: {}),
+        ).dispatch(snapshot, invocation, lambda: False, bodies.append, model_call_allowance=1)
+
+        self.assertEqual(result.failure_cause, "runtime_unknown_failure")
+        self.assertEqual(result.runtime_phase, "conversation")
+        self.assertEqual(result.exception_class, "Unknown")
+        diagnostics = [
+            body["payload"]
+            for body in bodies
+            if body.get("kind") == "progress_observed"
+            and isinstance(body.get("payload"), dict)
+            and body["payload"].get("kind") == "runtime_diagnostics"
+        ]
+        self.assertEqual(len(diagnostics), 1)
+        self.assertEqual(diagnostics[0]["requests"][0]["visibleToolset"], "other")  # type: ignore[index]
+        self.assertEqual(diagnostics[0]["responses"][0]["responseClass"], "text_response")  # type: ignore[index]
+        self.assertNotIn("private conversation detail", json.dumps(bodies))
+
     def test_serialized_code_mode_snapshot_installs_first_tool_guard_before_final_text(self) -> None:
         raw = copy.deepcopy(make_snapshot())
         raw["toolCatalog"]["modelToolset"] = "code_mode_only"  # type: ignore[index]

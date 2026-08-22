@@ -1401,6 +1401,7 @@ class HermesKernelAdapter:
                     output_text=output_text,
                     model_calls=self._observed_model_calls(agent, None),
                 )
+            _emit_plane_runtime_diagnostics(agent, emit_body)
             return HermesKernelResult(
                 kind="failed",
                 failure_code="runtime_error",
