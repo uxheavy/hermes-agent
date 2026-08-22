@@ -107,6 +107,16 @@ def _plane_required_tool(agent):
                 return "plane_publish"
         except Exception:
             pass
+    required_check = getattr(agent, "_plane_runtime_required_tool_check", None)
+    if callable(required_check):
+        try:
+            required = required_check()
+        except Exception:
+            required = None
+        if required == _PLANE_PREPARED_READ_TOOL:
+            setattr(agent, "_plane_first_required_tool", required)
+            setattr(agent, "_plane_first_required_tool_retries", 0)
+            return required
     return None
 
 
@@ -189,9 +199,19 @@ def _plane_codex_request_overrides(agent, tools):
 
 
 def _plane_standard_request_overrides(agent, tools):
-    """Require the existing Plane operation tool for one pending read."""
+    """Require the existing Plane operation tool for one pending route step."""
     configured = getattr(agent, "request_overrides", None)
     overrides = dict(configured) if isinstance(configured, dict) else {}
+    required = _plane_required_tool(agent)
+    if required == _PLANE_PREPARED_READ_TOOL:
+        if _plane_first_tool_available(agent, tools):
+            overrides["tool_choice"] = {
+                "type": "function",
+                "function": {"name": required},
+            }
+            return overrides
+        setattr(agent, "_plane_first_required_tool", None)
+        return overrides
     pending_check = getattr(
         agent, "_plane_runtime_prepared_read_pending_check", None
     )

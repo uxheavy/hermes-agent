@@ -1301,6 +1301,7 @@ class HermesKernelAdapter:
                     str(operation["operationRef"])
                     for operation in snapshot.eager_operations
                 ),
+                standard_route=snapshot.model_toolset == "standard",
                 code_mode_phase=(
                     snapshot.code_mode_phase
                     if snapshot.model_name.lower().startswith("gpt-5.6")
@@ -1353,6 +1354,12 @@ class HermesKernelAdapter:
                     "_plane_runtime_prepared_read_pending_check",
                     host_binding.prepared_read_handoff_pending,
                 )
+                if snapshot.model_toolset == "standard":
+                    setattr(
+                        agent,
+                        "_plane_runtime_required_tool_check",
+                        host_binding.standard_route_required_tool,
+                    )
                 setattr(
                     agent,
                     "_plane_runtime_code_mode_phase_hint",

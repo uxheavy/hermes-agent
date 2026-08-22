@@ -1102,6 +1102,7 @@ print("text_response")
             invocation_id="invocation:bare-search",
             correlation_id="correlation:bare-search",
             cancellation=lambda: False,
+            standard_route=True,
             eager_operation_refs=frozenset({"operation:search_workspace"}),
         )
 
@@ -1117,6 +1118,7 @@ print("text_response")
             ["operation:search_workspace", "operation:work_item.read"],
         )
         self.assertFalse(binding.prepared_read_handoff_pending())
+        self.assertEqual(binding.standard_route_required_tool(), "plane_operation")
         self.assertEqual(
             search.output["preparedReadResult"]["output"]["result"]["work_item"]["title"],
             "assigned",
@@ -1273,6 +1275,7 @@ print("text_response")
         class Completions:
             def __init__(self) -> None:
                 self.calls = 0
+                self.tool_choices: list[object] = []
 
             def create(self, **_kwargs):
                 self.calls += 1
@@ -4297,6 +4300,7 @@ print("text_response")
 
             def create(self, **_kwargs: object):
                 self.calls += 1
+                self.tool_choices.append(_kwargs.get("tool_choice"))
                 def tool_call(call_id: str) -> SimpleNamespace:
                     return SimpleNamespace(
                         id=call_id,
@@ -4906,7 +4910,19 @@ print("text_response")
                     "schemaDigest": "content:" + "d" * 64,
                     "inputSchema": {"type": "object"},
                     "disclosure": "eager",
-                }
+                },
+                *[
+                    {
+                        "operationRef": operation_ref,
+                        "schemaDigest": "content:" + "e" * 64,
+                        "inputSchema": {"type": "object"},
+                        "disclosure": "eager",
+                    }
+                    for operation_ref in (
+                        "operation:evaluate",
+                        PLANE_OUTCOME_SUBMIT_OPERATION,
+                    )
+                ],
             ],
         }
         snapshot_raw["contentDigest"] = _digest(  # type: ignore[assignment]
@@ -4933,6 +4949,17 @@ print("text_response")
                     extra_content=None,
                 )
 
+            @staticmethod
+            def named_tool_call(name: str, arguments: dict[str, object], call_id: str):
+                return SimpleNamespace(
+                    id=call_id,
+                    function=SimpleNamespace(
+                        name=name,
+                        arguments=json.dumps(arguments),
+                    ),
+                    extra_content=None,
+                )
+
             def create(self, **_kwargs: object):
                 self.calls += 1
                 if self.calls == 1:
@@ -4946,6 +4973,57 @@ print("text_response")
                                     "input": {"query": "assigned", "limit": 1},
                                 },
                                 "call-search",
+                            )
+                        ],
+                        reasoning=None,
+                        reasoning_content=None,
+                        refusal=None,
+                    )
+                    finish_reason = "tool_calls"
+                elif self.calls == 4:
+                    message = SimpleNamespace(
+                        content=None,
+                        tool_calls=[
+                            self.tool_call(
+                                {
+                                    "action": "mutate",
+                                    "operationRef": "operation:evaluate",
+                                    "input": {"summary": "evaluated"},
+                                },
+                                "call-evaluate",
+                            )
+                        ],
+                        reasoning=None,
+                        reasoning_content=None,
+                        refusal=None,
+                    )
+                    finish_reason = "tool_calls"
+                elif self.calls == 5:
+                    message = SimpleNamespace(
+                        content=None,
+                        tool_calls=[
+                            self.tool_call(
+                                {
+                                    "action": "mutate",
+                                    "operationRef": PLANE_OUTCOME_SUBMIT_OPERATION,
+                                    "input": {"summary": "submitted"},
+                                },
+                                "call-submit",
+                            )
+                        ],
+                        reasoning=None,
+                        reasoning_content=None,
+                        refusal=None,
+                    )
+                    finish_reason = "tool_calls"
+                elif self.calls == 6:
+                    message = SimpleNamespace(
+                        content=None,
+                        tool_calls=[
+                            self.named_tool_call(
+                                "plane_publish",
+                                {"kind": "outcome", "content": "published"},
+                                "call-publish",
                             )
                         ],
                         reasoning=None,
@@ -5003,12 +5081,23 @@ print("text_response")
                         ]
                     },
                 }
-            else:
+            elif request["operationRef"] == "operation:work_item.read":
                 self.assertEqual(request["operationRef"], "operation:work_item.read")
                 self.assertEqual(
                     request["input"], {"preparedCallRef": "prepared-call:opaque"}
                 )
                 output = {"ok": True, "result": {"work_item": {"title": "assigned"}}}
+            elif request["operationRef"] == "operation:evaluate":
+                output = {"ok": True, "result": {"evaluated": True}}
+            elif request["operationRef"] == PLANE_OUTCOME_SUBMIT_OPERATION:
+                return _submitted_result(request)
+            else:
+                self.assertEqual(request["action"], "publish")
+                return _result(
+                    request,
+                    output={"published": True},
+                    publication=_applied_outcome_publication(),
+                )
             return _result(request, output=output)
 
         bodies: list[dict] = []
@@ -5025,15 +5114,33 @@ print("text_response")
                 invocation,
                 lambda: False,
                 bodies.append,
-                model_call_allowance=2,
+                model_call_allowance=6,
             )
 
-        self.assertEqual(result.kind, "completed")
-        self.assertEqual(result.output_text, "ordinary final evidence")
-        self.assertEqual(client.completions.calls, 2)
+        self.assertEqual(result.kind, "completed", result)
+        self.assertIsNone(result.failure_code)
+        self.assertEqual(client.completions.calls, 6)
+        plane_operation_choice = {
+            "type": "function",
+            "function": {"name": "plane_operation"},
+        }
         self.assertEqual(
-            [request["operationRef"] for request in requests],
-            ["operation:search_workspace", "operation:work_item.read"],
+            client.completions.tool_choices[1:5],
+            [plane_operation_choice] * 4,
+        )
+        self.assertEqual(
+            client.completions.tool_choices[5],
+            {"type": "function", "function": {"name": "plane_publish"}},
+        )
+        self.assertEqual(
+            [(request["action"], request["operationRef"]) for request in requests],
+            [
+                ("read", "operation:search_workspace"),
+                ("read", "operation:work_item.read"),
+                ("mutate", "operation:evaluate"),
+                ("mutate", PLANE_OUTCOME_SUBMIT_OPERATION),
+                ("publish", PLANE_OUTCOME_PUBLISH_OPERATION),
+            ],
         )
 
     def test_real_hermes_adapter_recovers_from_early_publish_before_code_mode(self) -> None:

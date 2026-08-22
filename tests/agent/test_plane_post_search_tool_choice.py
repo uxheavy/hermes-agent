@@ -93,6 +93,31 @@ def test_standard_route_pending_prepared_read_does_not_create_a_tool_path():
     assert _plane_standard_request_overrides(agent, [_PUBLISH_TOOL]) == {}
 
 
+def test_standard_route_required_tool_callback_reuses_first_tool_redirect():
+    agent = SimpleNamespace(
+        request_overrides={},
+        _plane_runtime_required_tool_check=lambda: "plane_operation",
+    )
+
+    overrides = _plane_standard_request_overrides(agent, [_PLANE_OPERATION_TOOL])
+
+    assert overrides["tool_choice"] == {
+        "type": "function",
+        "function": {"name": "plane_operation"},
+    }
+    assert agent._plane_first_required_tool == "plane_operation"
+
+
+def test_standard_route_unavailable_tool_clears_required_latch():
+    agent = SimpleNamespace(
+        request_overrides={},
+        _plane_runtime_required_tool_check=lambda: "plane_operation",
+    )
+
+    assert _plane_standard_request_overrides(agent, [_PUBLISH_TOOL]) == {}
+    assert agent._plane_first_required_tool is None
+
+
 def test_post_search_phase_selects_named_code_mode_tool():
     consumed = []
     agent = SimpleNamespace(

@@ -1032,6 +1032,7 @@ class PlaneHostBinding:
     emit_body: Callable[[Mapping[str, Any]], None] | None = None
     diagnostic_callback: Callable[[Mapping[str, Any]], None] | None = None
     eager_operation_refs: frozenset[str] = field(default_factory=frozenset)
+    standard_route: bool = False
     max_calls: int = MAX_HOST_CALLS
     records: list[HostCallRecord] = field(default_factory=list)
     code_mode_phase: str = "none"
@@ -1048,6 +1049,7 @@ class PlaneHostBinding:
     _prepared_read_completion: HostCallResult | None = field(default=None, init=False, repr=False)
     _prepared_read_ref: str | None = field(default=None, init=False, repr=False)
     _prepared_call_registry: dict[str, bool] = field(default_factory=dict, init=False, repr=False)
+    _standard_route_required_tool: str | None = field(default=None, init=False, repr=False)
     _outcome_unknown: bool = field(default=False, init=False, repr=False)
     _catalog_search_discovered: bool = field(default=False, init=False, repr=False)
     _catalog_describe_discovered: bool = field(default=False, init=False, repr=False)
@@ -1115,6 +1117,12 @@ class PlaneHostBinding:
 
         with self._lock:
             return self._prepared_read_handoff_pending
+
+    def standard_route_required_tool(self) -> str | None:
+        """Return the next required Plane tool after a successful work-item read."""
+
+        with self._lock:
+            return self._standard_route_required_tool
 
     def mark_outcome_unknown(self) -> None:
         """Latch durable provider uncertainty for this invocation."""
@@ -1629,6 +1637,16 @@ class PlaneHostBinding:
                 self._prepared_read_completion = result
                 self._prepared_read_ref = request.input["preparedCallRef"]
                 self._prepared_call_registry[request.input["preparedCallRef"]] = True
+            if (
+                self.standard_route
+                and result.status in {"ok", "replayed"}
+                and request.action in {"discover", "read", "mutate"}
+            ):
+                with self._lock:
+                    if request.operation_ref == "operation:work_item.read":
+                        self._standard_route_required_tool = PLANE_OPERATION_TOOL
+                    elif request.operation_ref == PLANE_OUTCOME_SUBMIT_OPERATION:
+                        self._standard_route_required_tool = None
             if action == "code":
                 prepared_refs = ()
                 prepared_read_succeeded = False
