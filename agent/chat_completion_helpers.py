@@ -67,6 +67,7 @@ _FALLBACK_EXHAUSTED_COOLDOWN_S = 5.0
 _PLANE_FIRST_REQUIRED_TOOL = "plane_execute_typescript"
 _PLANE_CODE_MODE_TOOL = "plane_execute_typescript"
 _PLANE_PREPARED_READ_TOOL = "plane_operation"
+_PLANE_PUBLISH_TOOL = "plane_publish"
 
 
 class PlaneCodeModeContinuationError(RuntimeError):
@@ -113,7 +114,7 @@ def _plane_required_tool(agent):
             required = required_check()
         except Exception:
             required = None
-        if required == _PLANE_PREPARED_READ_TOOL:
+        if required in {_PLANE_PREPARED_READ_TOOL, _PLANE_PUBLISH_TOOL}:
             setattr(agent, "_plane_first_required_tool", required)
             setattr(agent, "_plane_first_required_tool_retries", 0)
             return required
@@ -203,7 +204,7 @@ def _plane_standard_request_overrides(agent, tools):
     configured = getattr(agent, "request_overrides", None)
     overrides = dict(configured) if isinstance(configured, dict) else {}
     required = _plane_required_tool(agent)
-    if required == _PLANE_PREPARED_READ_TOOL:
+    if required in {_PLANE_PREPARED_READ_TOOL, _PLANE_PUBLISH_TOOL}:
         if _plane_first_tool_available(agent, tools):
             overrides["tool_choice"] = {
                 "type": "function",

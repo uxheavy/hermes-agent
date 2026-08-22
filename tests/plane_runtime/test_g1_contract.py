@@ -34,7 +34,7 @@ class G1ContractTests(unittest.TestCase):
         )
         self.assertEqual(
             G1_CONTRACT_DIGESTS["runSnapshot"],
-            "0e72f04579f8cebd00b7afee1885d0ff68ee04ee30dfd7ff3e74e9ca05cddaed",
+            "ca2944e248210658a6c0514c29e23d9dc002d2f9d397e6b5c7aef50d36202dc1",
         )
         self.assertEqual(
             G1_CONTRACT_DIGESTS["runtimeEvent"],
@@ -46,7 +46,7 @@ class G1ContractTests(unittest.TestCase):
         )
         self.assertEqual(
             G1_MANIFEST_DIGEST,
-            "36ef7172057f3ccec5cca8a15a763ee8b933ea0500dc0609fc604ceabb9f36c0",
+            "4faf04dae2df9fa3954f7af3bfa8895eed021d558b3c0e88e42511265202eb6e",
         )
 
     def test_eager_presentation_fields_are_strict(self) -> None:
@@ -114,6 +114,7 @@ class G1ContractTests(unittest.TestCase):
         over_count = make_snapshot()
         over_count["toolCatalog"] = {
             "catalogDigest": "content:" + "c" * 64,
+            "modelToolset": "standard",
             "eagerOperations": [
                 {
                     "operationRef": f"operation:operation-{index}",
@@ -134,6 +135,7 @@ class G1ContractTests(unittest.TestCase):
         aggregate = make_snapshot()
         aggregate["toolCatalog"] = {
             "catalogDigest": "content:" + "c" * 64,
+            "modelToolset": "standard",
             "eagerOperations": [
                 {
                     "operationRef": f"operation:operation-{index}",

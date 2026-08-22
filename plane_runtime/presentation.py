@@ -79,6 +79,8 @@ def build_model_guidance(snapshot: G1RunSnapshot) -> str:
             for operation in snapshot.eager_operations
         ],
     }
+    if snapshot.standard_route is not None:
+        assignment["standardRoute"] = snapshot.standard_route
     compact_assignment = json.dumps(
         assignment,
         ensure_ascii=False,

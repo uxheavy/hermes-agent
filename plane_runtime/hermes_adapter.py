@@ -1302,6 +1302,7 @@ class HermesKernelAdapter:
                     for operation in snapshot.eager_operations
                 ),
                 standard_route=snapshot.model_toolset == "standard",
+                standard_route_contract=snapshot.standard_route,
                 code_mode_phase=(
                     snapshot.code_mode_phase
                     if snapshot.model_name.lower().startswith("gpt-5.6")

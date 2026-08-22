@@ -28,6 +28,7 @@ MAX_INTEGER = 2_147_483_647
 MAX_EAGER_OPERATIONS = 64
 MAX_EAGER_INPUT_SCHEMA_BYTES = 16 * 1024
 MAX_EAGER_PRESENTATION_BYTES = 512 * 1024
+STANDARD_ROUTE_SCHEMA_VERSION = "plane.standard-route/v1"
 MAX_EAGER_SCHEMA_PROPERTIES = 4096
 CODE_MODE_PHASES = frozenset({"none", "post_search"})
 RUNTIME_FAILURE_PHASES = frozenset(
@@ -52,13 +53,13 @@ RUNTIME_FAILURE_EXCEPTION_CLASSES = frozenset(
 
 # Frozen bytes from the paired Plane G1 runtime contract manifest.
 G1_CONTRACT_DIGESTS = {
-    "runSnapshot": "0e72f04579f8cebd00b7afee1885d0ff68ee04ee30dfd7ff3e74e9ca05cddaed",
+    "runSnapshot": "ca2944e248210658a6c0514c29e23d9dc002d2f9d397e6b5c7aef50d36202dc1",
     "invocationEnvelope": "b7a15d74406f1624cdb7cd95b42edfd1ffee596abe57e4f00ed60e2e23ded995",
     "runtimeEvent": "d0fb1c67a7424f5359f9c09ff7206ef7d3d0d6e90e62b724c4a5e4e4bc13412d",
     "runtimeExit": "f596e131d3d1bf94c52352fa2156d6dedf4c793f1b31d3fbd6b7a478f4401df9",
     "runtimeDurableState": "444c944ec8a5054f33c8662470529a1f4565d42ff06138438beceeef7967a0da",
 }
-G1_MANIFEST_DIGEST = "36ef7172057f3ccec5cca8a15a763ee8b933ea0500dc0609fc604ceabb9f36c0"
+G1_MANIFEST_DIGEST = "4faf04dae2df9fa3954f7af3bfa8895eed021d558b3c0e88e42511265202eb6e"
 
 _ROLES = {"worker", "delegator", "gardener", "chief_of_staff", "hr", "evaluator", "custom"}
 _TRIGGERS = {"initial", "human_input", "recoverable_restart", "continuation"}
@@ -214,6 +215,31 @@ def _bounded_byte_count(value: Any, name: str) -> int:
     return value
 
 
+def _validate_standard_route(value: Any) -> dict[str, Any]:
+    data = _object(value, "toolCatalog.standardRoute")
+    _reject_unknown(data, {"schemaVersion", "steps"}, "toolCatalog.standardRoute")
+    _required(data, {"schemaVersion", "steps"}, "toolCatalog.standardRoute")
+    if data["schemaVersion"] != STANDARD_ROUTE_SCHEMA_VERSION:
+        raise G1ContractError("toolCatalog.standardRoute is unsupported")
+    steps = data["steps"]
+    if not isinstance(steps, list) or not 1 <= len(steps) <= 7:
+        raise G1ContractError("toolCatalog.standardRoute.steps must contain 1..7 items")
+    for index, raw in enumerate(steps):
+        step = _object(raw, f"toolCatalog.standardRoute.steps[{index}]")
+        _reject_unknown(step, {"operationRef", "optional", "expectedStatus", "expectedErrorCode"}, f"toolCatalog.standardRoute.steps[{index}]")
+        _required(step, {"operationRef"}, f"toolCatalog.standardRoute.steps[{index}]")
+        _ref(step["operationRef"], f"toolCatalog.standardRoute.steps[{index}].operationRef", "operation")
+        if step.get("optional") is not None and step.get("optional") is not True:
+            raise G1ContractError("standard route optional must be true")
+        if step.get("optional") is True and step["operationRef"] != "operation:work_item.read":
+            raise G1ContractError("standard route optional is reserved for prepared work_item.read")
+        if step.get("expectedStatus") is not None and step.get("expectedStatus") != "denied":
+            raise G1ContractError("standard route expectedStatus is unsupported")
+        if step.get("expectedErrorCode") is not None and step.get("expectedErrorCode") != "NOT_AUTHORIZED":
+            raise G1ContractError("standard route expectedErrorCode is unsupported")
+    return data
+
+
 def _bounded_budget(value: Any, name: str = "budget") -> dict[str, int]:
     data = _object(value, name)
     _reject_unknown(data, {"inputTokens", "outputTokens", "durationMs"}, name)
@@ -366,8 +392,8 @@ def _validate_snapshot(raw: Any) -> dict[str, Any]:
         _content_ref(item_data["contentDigest"], f"context[{index}].contentDigest")
 
     catalog = _object(data["toolCatalog"], "RunSnapshot.toolCatalog")
-    _reject_unknown(catalog, {"catalogDigest", "modelToolset", "eagerOperations"}, "toolCatalog")
-    _required(catalog, {"catalogDigest", "eagerOperations"}, "toolCatalog")
+    _reject_unknown(catalog, {"catalogDigest", "modelToolset", "eagerOperations", "standardRoute"}, "toolCatalog")
+    _required(catalog, {"catalogDigest", "modelToolset", "eagerOperations"}, "toolCatalog")
     _content_ref(catalog["catalogDigest"], "toolCatalog.catalogDigest")
     if "modelToolset" in catalog and catalog["modelToolset"] not in {"standard", "code_mode_only"}:
         raise G1ContractError("toolCatalog.modelToolset is unsupported")
@@ -398,6 +424,8 @@ def _validate_snapshot(raw: Any) -> dict[str, Any]:
         raise G1ContractError(
             f"toolCatalog exceeds {MAX_EAGER_PRESENTATION_BYTES} canonical JSON bytes"
         )
+    if "standardRoute" in catalog:
+        _validate_standard_route(catalog["standardRoute"])
 
     policy = _object(data["runtimePolicy"], "RunSnapshot.runtimePolicy")
     _reject_unknown(
@@ -558,6 +586,11 @@ class G1RunSnapshot:
     @property
     def model_toolset(self) -> str:
         return str(self.raw["toolCatalog"].get("modelToolset", "standard"))
+
+    @property
+    def standard_route(self) -> Mapping[str, Any] | None:
+        route = self.raw["toolCatalog"].get("standardRoute")
+        return route if isinstance(route, Mapping) else None
 
     @property
     def model_provider(self) -> str:

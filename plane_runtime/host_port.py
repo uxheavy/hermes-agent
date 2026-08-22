@@ -45,7 +45,6 @@ PLANE_OUTCOME_PUBLISH_OPERATION = "operation:agent.outcome.publish"
 PLANE_DISCOVERY_OPERATION = "plane.operations.discover@1"
 PLANE_CATALOG_SEARCH_OPERATION = "operation:catalog.search"
 PLANE_CATALOG_DESCRIBE_OPERATION = "operation:catalog.describe"
-
 MAX_HOST_REQUEST_BYTES = 16 * 1024
 MAX_HOST_RESULT_BYTES = 16 * 1024
 MAX_HOST_INPUT_BYTES = 8 * 1024
@@ -1033,6 +1032,7 @@ class PlaneHostBinding:
     diagnostic_callback: Callable[[Mapping[str, Any]], None] | None = None
     eager_operation_refs: frozenset[str] = field(default_factory=frozenset)
     standard_route: bool = False
+    standard_route_contract: Mapping[str, Any] | None = None
     max_calls: int = MAX_HOST_CALLS
     records: list[HostCallRecord] = field(default_factory=list)
     code_mode_phase: str = "none"
@@ -1050,6 +1050,8 @@ class PlaneHostBinding:
     _prepared_read_ref: str | None = field(default=None, init=False, repr=False)
     _prepared_call_registry: dict[str, bool] = field(default_factory=dict, init=False, repr=False)
     _standard_route_required_tool: str | None = field(default=None, init=False, repr=False)
+    _standard_route_steps: tuple[tuple[str, bool, str | None, str | None], ...] = field(default=(), init=False, repr=False)
+    _standard_route_index: int = field(default=0, init=False, repr=False)
     _outcome_unknown: bool = field(default=False, init=False, repr=False)
     _catalog_search_discovered: bool = field(default=False, init=False, repr=False)
     _catalog_describe_discovered: bool = field(default=False, init=False, repr=False)
@@ -1081,6 +1083,39 @@ class PlaneHostBinding:
             raise ValueError("Plane host eager operation refs must be operation references")
         if self.code_mode_phase not in CODE_MODE_PHASES:
             raise ValueError("Plane host Code Mode phase is unsupported")
+        if self.standard_route_contract is not None:
+            if not self.standard_route:
+                raise ValueError("standard route requires the standard model toolset")
+            route = self.standard_route_contract
+            if not isinstance(route, Mapping) or route.get("schemaVersion") != "plane.standard-route/v1":
+                raise ValueError("standard route contract is invalid")
+            if set(route) != {"schemaVersion", "steps"} or not isinstance(route.get("steps"), (list, tuple)):
+                raise ValueError("standard route contract has an invalid shape")
+            steps = tuple(route["steps"])
+            if not 1 <= len(steps) <= 7:
+                raise ValueError("standard route contract must contain 1..7 steps")
+            if any(
+                not isinstance(step, Mapping)
+                or set(step).difference({"operationRef", "optional", "expectedStatus", "expectedErrorCode"})
+                or "operationRef" not in step
+                for step in steps
+            ):
+                raise ValueError("standard route contract has an invalid step")
+            normalized = tuple(
+                (step["operationRef"], step.get("optional") is True, step.get("expectedStatus"), step.get("expectedErrorCode"))
+                for step in steps
+            )
+            if any(optional and operation_ref != "operation:work_item.read" for operation_ref, optional, _, _ in normalized):
+                raise ValueError("standard route optional is reserved for prepared work_item.read")
+            if any(
+                expected_status not in {None, "denied"}
+                or expected_error not in {None, "NOT_AUTHORIZED"}
+                for _, _, expected_status, expected_error in normalized
+            ):
+                raise ValueError("standard route expected denial is unsupported")
+            if any(operation_ref not in self.eager_operation_refs for operation_ref, _, _, _ in normalized):
+                raise ValueError("standard route step is not disclosed in eager operations")
+            self._standard_route_steps = normalized
 
     @property
     def fatal_error(self) -> str | None:
@@ -1122,7 +1157,50 @@ class PlaneHostBinding:
         """Return the next required Plane tool after a successful work-item read."""
 
         with self._lock:
+            if self._standard_route_steps:
+                while (
+                    self._standard_route_index < len(self._standard_route_steps)
+                    and self._standard_route_steps[self._standard_route_index][1]
+                    and not self._prepared_read_handoff_pending
+                ):
+                    self._standard_route_index += 1
+                if self._standard_route_index >= len(self._standard_route_steps):
+                    return None
+                return (
+                    PLANE_PUBLISH_TOOL
+                    if self._standard_route_steps[self._standard_route_index][0] == PLANE_OUTCOME_PUBLISH_OPERATION
+                    else PLANE_OPERATION_TOOL
+                )
             return self._standard_route_required_tool
+
+    def _check_standard_route(self, request: HostCallRequest) -> None:
+        if not self._standard_route_steps:
+            return
+        while (
+            self._standard_route_index < len(self._standard_route_steps)
+            and self._standard_route_steps[self._standard_route_index][1]
+            and not self._prepared_read_handoff_pending
+        ):
+            self._standard_route_index += 1
+        if self._standard_route_index >= len(self._standard_route_steps):
+            self._fail("standard route has no remaining operation")
+            raise PlaneHostUnavailable("standard route has no remaining operation")
+        expected_ref, _optional, _status, _error_code = self._standard_route_steps[self._standard_route_index]
+        if request.operation_ref != expected_ref or ((expected_ref == PLANE_OUTCOME_PUBLISH_OPERATION) != (request.action == "publish")):
+            self._fail("standard route operation does not match the remaining Plane step")
+            raise PlaneHostUnavailable("standard route operation does not match the remaining Plane step")
+
+    def _advance_standard_route(self, request: HostCallRequest, result: HostCallResult) -> None:
+        if not self._standard_route_steps or self._standard_route_index >= len(self._standard_route_steps):
+            return
+        expected_ref, _optional, expected_status, expected_error = self._standard_route_steps[self._standard_route_index]
+        if request.operation_ref != expected_ref:
+            return
+        accepted = result.status in {"ok", "replayed"}
+        if expected_status is not None:
+            accepted = result.status == expected_status and result.error_code == expected_error
+        if accepted:
+            self._standard_route_index += 1
 
     def mark_outcome_unknown(self) -> None:
         """Latch durable provider uncertainty for this invocation."""
@@ -1513,6 +1591,7 @@ class PlaneHostBinding:
                 operation_ref=operation_ref,
                 input_value=request.input,
             )
+            self._check_standard_route(request)
             terminal_result = self._terminal_result_for(request)
             if terminal_result is not None:
                 return terminal_result
@@ -1557,6 +1636,8 @@ class PlaneHostBinding:
                     for prepared_ref in serialized_refs:
                         self._prepared_call_registry.setdefault(prepared_ref, False)
             self.records.append(HostCallRecord(request, result))
+            if operation_ref not in {PLANE_OUTCOME_SUBMIT_OPERATION, PLANE_OUTCOME_PUBLISH_OPERATION}:
+                self._advance_standard_route(request, result)
             try:
                 self._record_catalog_description(request, result)
             except Exception:
@@ -1591,6 +1672,9 @@ class PlaneHostBinding:
                         "successful outcome submit returned no bound outcome ref"
                     )
                 self._bind_outcome_submission_ref(outcome_ref)
+                self._advance_standard_route(request, result)
+            if operation_ref == PLANE_OUTCOME_PUBLISH_OPERATION and result.status in {"ok", "replayed"}:
+                self._advance_standard_route(request, result)
             if (
                 request.action == "code"
                 and result.status in {"ok", "replayed"}
