@@ -1175,6 +1175,40 @@ class PlaneHostBinding:
                 )
             return self._standard_route_required_tool
 
+    def _standard_route_prepared_read_ref(
+        self,
+        *,
+        action: str,
+        operation_ref: str,
+        input_value: Mapping[str, Any],
+    ) -> tuple[bool, str | None]:
+        if (
+            not self.standard_route
+            or action != "read"
+            or operation_ref != "operation:work_item.read"
+            or _contains_prepared_read_marker(input_value)
+            or not self._standard_route_steps
+        ):
+            return False, None
+        index = self._standard_route_index
+        while (
+            index < len(self._standard_route_steps)
+            and self._standard_route_steps[index][1]
+            and not self._prepared_read_handoff_pending
+        ):
+            index += 1
+        if (
+            index >= len(self._standard_route_steps)
+            or self._standard_route_steps[index][0] != operation_ref
+        ):
+            return False, None
+        refs = tuple(
+            prepared_ref
+            for prepared_ref, consumed in self._prepared_call_registry.items()
+            if not consumed
+        )
+        return True, refs[0] if len(refs) == 1 else None
+
     def _check_standard_route(self, request: HostCallRequest) -> None:
         if not self._standard_route_steps:
             return
@@ -1188,7 +1222,12 @@ class PlaneHostBinding:
             self._fail("standard route has no remaining operation")
             raise PlaneHostUnavailable("standard route has no remaining operation")
         expected_ref, _optional, _status, _error_code = self._standard_route_steps[self._standard_route_index]
-        if request.operation_ref != expected_ref or ((expected_ref == PLANE_OUTCOME_PUBLISH_OPERATION) != (request.action == "publish")):
+        expected_read = expected_ref == "operation:work_item.read"
+        if (
+            request.operation_ref != expected_ref
+            or ((expected_ref == PLANE_OUTCOME_PUBLISH_OPERATION) != (request.action == "publish"))
+            or (expected_read and request.action != "read")
+        ):
             self._fail("standard route operation does not match the remaining Plane step")
             raise PlaneHostUnavailable("standard route operation does not match the remaining Plane step")
 
@@ -1528,6 +1567,13 @@ class PlaneHostBinding:
                     error_code="OUTCOME_UNKNOWN",
                     error_message="provider outcome is unknown; reconciliation is required",
                 )
+            standard_route_read, prepared_ref = self._standard_route_prepared_read_ref(
+                action=action,
+                operation_ref=operation_ref,
+                input_value=input,
+            )
+            if prepared_ref is not None:
+                input = {"preparedCallRef": prepared_ref}
             try:
                 request = HostCallRequest(
                     run_id=self.run_id,
@@ -1542,6 +1588,20 @@ class PlaneHostBinding:
             except PlaneHostError as exc:
                 self._fail(str(exc) or "Plane host request was invalid")
                 raise
+            if standard_route_read and prepared_ref is None:
+                return HostCallResult(
+                    request_ref=request.request_ref,
+                    correlation_id=request.correlation_id,
+                    idempotency_key=request.idempotency_key,
+                    status="invalid",
+                    replayed=False,
+                    output=None,
+                    error_code="PREPARED_CALL_INVALID",
+                    error_message=(
+                        "standard-route work-item read requires exactly one "
+                        "unconsumed prepared reference"
+                    ),
+                )
             if operation_ref == "operation:work_item.read":
                 duplicate = self._duplicate_after_prepared_read(request)
                 if duplicate is not None:
