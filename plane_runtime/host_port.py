@@ -1487,6 +1487,48 @@ class PlaneHostBinding:
             },
         )
 
+    def _workspace_search_replay_for(
+        self, request: HostCallRequest
+    ) -> HostCallResult | None:
+        """Bound a repeated model workspace search after its route step passed."""
+
+        if not (
+            self.standard_route
+            and request.action == "read"
+            and request.source == "model"
+            and request.operation_ref == "operation:search_workspace"
+            and self._standard_route_steps
+            and self._standard_route_index > 0
+            and self._prepared_read_completion is not None
+            and not self._prepared_read_handoff_pending
+            and not (
+                self._standard_route_index < len(self._standard_route_steps)
+                and self._standard_route_steps[self._standard_route_index][0]
+                == "operation:search_workspace"
+            )
+        ):
+            return None
+        if not any(
+            record.request.action == "read"
+            and record.request.source == "model"
+            and record.request.operation_ref == request.operation_ref
+            and record.request.input == request.input
+            and record.result.status in {"ok", "replayed"}
+            for record in self.records
+        ):
+            return None
+        return HostCallResult(
+            request_ref=request.request_ref,
+            correlation_id=request.correlation_id,
+            idempotency_key=request.idempotency_key,
+            status="replayed",
+            replayed=True,
+            output={
+                "alreadySearched": True,
+                "operationRef": "operation:search_workspace",
+            },
+        )
+
     def _is_cancelled(self) -> bool:
         try:
             cancelled = self.cancellation()
@@ -1609,6 +1651,9 @@ class PlaneHostBinding:
             catalog_search_replay = self._catalog_search_replay_for(request)
             if catalog_search_replay is not None:
                 return catalog_search_replay
+            workspace_search_replay = self._workspace_search_replay_for(request)
+            if workspace_search_replay is not None:
+                return workspace_search_replay
             prepared_read_input = (
                 action == "read"
                 and operation_ref == "operation:work_item.read"

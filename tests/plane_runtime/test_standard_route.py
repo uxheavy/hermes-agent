@@ -160,6 +160,99 @@ def test_standard_route_read_failure_is_attached_and_stays_pending():
         "operation:search_workspace",
         "operation:work_item.read",
     ]
+    with pytest.raises(PlaneHostUnavailable):
+        binding.call(
+            action="read",
+            operation_ref="operation:search_workspace",
+            input={},
+            source="model",
+        )
+    assert [request["operationRef"] for request in requests] == [
+        "operation:search_workspace",
+        "operation:work_item.read",
+    ]
+
+
+def test_standard_route_replays_only_a_completed_workspace_search():
+    route = {
+        "schemaVersion": "plane.standard-route/v1",
+        "steps": [
+            {"operationRef": "operation:search_workspace"},
+            {"operationRef": "operation:work_item.read"},
+        ],
+    }
+    requests = []
+
+    def respond(request):
+        requests.append(request)
+        if request["operationRef"] == "operation:search_workspace":
+            if len(requests) == 1:
+                return _result(
+                    request,
+                    status="invalid",
+                    errorCode="SEARCH_FAILED",
+                    errorMessage="search failed",
+                )
+            return _result(
+                request,
+                output={
+                    "result": {
+                        "results": [{"workItemReadCall": "prepared-call:assigned"}]
+                    }
+                },
+            )
+        assert request["operationRef"] == "operation:work_item.read"
+        return _result(request, output={"work_item": {"title": "assigned"}})
+
+    binding = PlaneHostBinding(
+        port=CallablePlaneHostPort(respond),
+        run_id="run:workspace-search-replay",
+        invocation_id="invocation:workspace-search-replay",
+        correlation_id="correlation:workspace-search-replay",
+        cancellation=lambda: False,
+        standard_route=True,
+        standard_route_contract=route,
+        eager_operation_refs=frozenset(step["operationRef"] for step in route["steps"]),
+    )
+
+    failed = binding.call(
+        action="read",
+        operation_ref="operation:search_workspace",
+        input={"query": "assigned"},
+        source="model",
+    )
+    completed = binding.call(
+        action="read",
+        operation_ref="operation:search_workspace",
+        input={"query": "assigned"},
+        source="model",
+    )
+    repeated = binding.call(
+        action="read",
+        operation_ref="operation:search_workspace",
+        input={"query": "assigned"},
+        source="model",
+    )
+
+    assert failed.status == "invalid"
+    assert completed.status == "ok"
+    assert repeated.status == "replayed"
+    assert repeated.output == {
+        "alreadySearched": True,
+        "operationRef": "operation:search_workspace",
+    }
+    with pytest.raises(PlaneHostUnavailable):
+        binding.call(
+            action="read",
+            operation_ref="operation:search_workspace",
+            input={"query": "new-target"},
+            source="model",
+        )
+    assert [request["operationRef"] for request in requests] == [
+        "operation:search_workspace",
+        "operation:search_workspace",
+        "operation:work_item.read",
+    ]
 
 
 def test_standard_route_does_not_auto_read_ambiguous_refs():
@@ -207,6 +300,14 @@ def test_standard_route_does_not_auto_read_ambiguous_refs():
     assert result.status == "ok"
     assert "preparedReadResult" not in result.output
     assert binding.prepared_read_handoff_pending() is True
+    assert len(requests) == 1
+    with pytest.raises(PlaneHostUnavailable):
+        binding.call(
+            action="read",
+            operation_ref="operation:search_workspace",
+            input={},
+            source="model",
+        )
     assert len(requests) == 1
 
 
