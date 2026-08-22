@@ -1794,11 +1794,32 @@ class G1RuntimeProcessTests(unittest.TestCase):
                 "operationRefDigest": "a" * 64,
                 "codeModeHostStatus": "invalid",
                 "codeModeFailureClass": "code_mode",
+                "socketPhase": "invoke",
+                "socketState": "failed",
+                "preparedHandoff": {
+                    "schemaVersion": "plane.prepared-handoff/v1",
+                    "events": [
+                        {
+                            "stage": "runtime_auto_read",
+                            "form": "absent",
+                            "preparedRefDigest": "b" * 64,
+                            "registryState": "absent",
+                            "reason": "none",
+                            "operationRefDigest": "a" * 64,
+                        }
+                    ],
+                },
             },
         )
         exit_frame = _terminal_failure(snapshot, invocation, result, 0)
         self.assertEqual(exit_frame["failure"]["codeModeHostStatus"], "invalid")
         self.assertEqual(exit_frame["failure"]["codeModeFailureClass"], "code_mode")
+        self.assertEqual(exit_frame["failure"]["socketPhase"], "invoke")
+        self.assertEqual(exit_frame["failure"]["socketState"], "failed")
+        self.assertEqual(
+            exit_frame["failure"]["preparedHandoff"]["events"][0]["stage"],
+            "runtime_auto_read",
+        )
         self.assertNotIn("bounded host failure", json.dumps(exit_frame))
 
     def test_adapter_classifies_runtime_exceptions_without_content_leakage(self) -> None:

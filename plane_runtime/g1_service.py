@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from datetime import datetime, timezone
-from typing import Any, Callable, Mapping, TextIO
+from typing import Any, Callable, TextIO
 
 from .g1_contract import (
     G1ContractError,
@@ -13,6 +13,7 @@ from .g1_contract import (
     G1RunSnapshot,
     RUNTIME_FAILURE_EXCEPTION_CLASSES,
     RUNTIME_FAILURE_PHASES,
+    _bounded_host_operation_diagnostic,
     bind_snapshot_and_invocation,
     build_event,
     build_exit,
@@ -29,59 +30,6 @@ from .host_port import PlaneHostPort
 
 
 _MODEL_USAGE_PROTOCOL = "plane.agent-runtime/internal-usage/v1"
-_HOST_CALLBACK_PHASES = frozenset(
-    {"before_host_call", "host_return", "model_observation_emit", "adapter_event"}
-)
-
-
-def _bounded_host_operation_diagnostic(
-    value: Mapping[str, Any] | None,
-) -> dict[str, Any] | None:
-    """Project only the finite, digested host callback facts onto RuntimeExit."""
-
-    if not isinstance(value, Mapping):
-        return None
-    allowed = {
-        "callbackPhase",
-        "operationRefDigest",
-        "codeModeHostStatus",
-        "codeModeFailureClass",
-    }
-    if set(value).difference(allowed):
-        return None
-    phase = value.get("callbackPhase")
-    operation_ref_digest = value.get("operationRefDigest")
-    if (
-        phase not in _HOST_CALLBACK_PHASES
-        or not isinstance(operation_ref_digest, str)
-        or len(operation_ref_digest) != 64
-        or any(char not in "0123456789abcdef" for char in operation_ref_digest)
-    ):
-        return None
-    result: dict[str, Any] = {
-        "callbackPhase": phase,
-        "operationRefDigest": operation_ref_digest,
-    }
-    code_mode_fields = {"codeModeHostStatus", "codeModeFailureClass"}
-    present = code_mode_fields.intersection(value)
-    if present and present != code_mode_fields:
-        return None
-    if present:
-        if value["codeModeHostStatus"] not in {
-            "ok", "replayed", "denied", "conflict", "unavailable", "invalid"
-        } or value["codeModeFailureClass"] not in {
-            "code_mode", "callback", "transport", "contract", "unknown"
-        }:
-            return None
-        result.update(
-            {
-                "codeModeHostStatus": value["codeModeHostStatus"],
-                "codeModeFailureClass": value["codeModeFailureClass"],
-            }
-        )
-    return result
-
-
 def _bounded_runtime_failure_diagnostic(
     result: HermesKernelResult,
 ) -> dict[str, str] | None:

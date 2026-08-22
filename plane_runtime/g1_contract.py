@@ -113,6 +113,133 @@ RUNTIME_FAILURE_CAUSES = frozenset(
         "provider_unknown_failure",
     }
 )
+_HOST_CALLBACK_PHASES = frozenset(
+    {"before_host_call", "host_return", "model_observation_emit", "adapter_event"}
+)
+_HOST_SOCKET_PHASES = frozenset({"accept", "read", "invoke", "serialize", "write"})
+_HOST_SOCKET_STATES = frozenset({"failed", "closed"})
+_CODE_MODE_HOST_STATUSES = frozenset(
+    {"ok", "replayed", "denied", "conflict", "unavailable", "invalid"}
+)
+_CODE_MODE_FAILURE_CLASSES = frozenset(
+    {"code_mode", "callback", "transport", "contract", "unknown"}
+)
+_PREPARED_HANDOFF_STAGES = frozenset(
+    {"register", "runtime_auto_read", "hermes_model_read", "host_normalize", "registry_resolve", "registry_consume"}
+)
+_PREPARED_HANDOFF_FORMS = frozenset(
+    {"canonical_ref", "malformed", "nested_wrapper", "json_string", "ready_envelope", "absent"}
+)
+_PREPARED_HANDOFF_REGISTRY_STATES = frozenset({"absent", "unconsumed", "consumed"})
+_PREPARED_HANDOFF_REASONS = frozenset(
+    {"none", "unknown", "malformed", "binding_mismatch", "digest_mismatch", "consumed"}
+)
+_PREPARED_HANDOFF_EVENT_FIELDS = frozenset(
+    {"stage", "form", "preparedRefDigest", "registryState", "reason", "operationRefDigest"}
+)
+
+
+def _bounded_prepared_handoff(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, Mapping) or set(value) != {"schemaVersion", "events"}:
+        return None
+    events = value.get("events")
+    if value.get("schemaVersion") != "plane.prepared-handoff/v1" or not isinstance(events, list):
+        return None
+    if not 1 <= len(events) <= 6:
+        return None
+    seen: set[str] = set()
+    bounded_events: list[dict[str, Any]] = []
+    for event in events:
+        if not isinstance(event, Mapping) or set(event) != _PREPARED_HANDOFF_EVENT_FIELDS:
+            return None
+        prepared_digest = event.get("preparedRefDigest")
+        operation_digest = event.get("operationRefDigest")
+        if (
+            event.get("stage") not in _PREPARED_HANDOFF_STAGES
+            or event["stage"] in seen
+            or event.get("form") not in _PREPARED_HANDOFF_FORMS
+            or event.get("registryState") not in _PREPARED_HANDOFF_REGISTRY_STATES
+            or event.get("reason") not in _PREPARED_HANDOFF_REASONS
+            or not isinstance(prepared_digest, str)
+            or not isinstance(operation_digest, str)
+            or len(prepared_digest) != 64
+            or len(operation_digest) != 64
+            or any(char not in "0123456789abcdef" for char in prepared_digest)
+            or any(char not in "0123456789abcdef" for char in operation_digest)
+        ):
+            return None
+        seen.add(event["stage"])
+        bounded_events.append(
+            {
+                "stage": event["stage"],
+                "form": event["form"],
+                "preparedRefDigest": prepared_digest,
+                "registryState": event["registryState"],
+                "reason": event["reason"],
+                "operationRefDigest": operation_digest,
+            }
+        )
+    bounded = {"schemaVersion": "plane.prepared-handoff/v1", "events": bounded_events}
+    if len(_canonical(bounded)) > 4096:
+        return None
+    return bounded
+
+
+def _bounded_host_operation_diagnostic(value: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(value, Mapping):
+        return None
+    allowed = {
+        "callbackPhase",
+        "operationRefDigest",
+        "codeModeHostStatus",
+        "codeModeFailureClass",
+        "socketPhase",
+        "socketState",
+        "preparedHandoff",
+    }
+    if set(value).difference(allowed):
+        return None
+    phase = value.get("callbackPhase")
+    operation_ref_digest = value.get("operationRefDigest")
+    if (
+        phase not in _HOST_CALLBACK_PHASES
+        or not isinstance(operation_ref_digest, str)
+        or len(operation_ref_digest) != 64
+        or any(char not in "0123456789abcdef" for char in operation_ref_digest)
+    ):
+        return None
+    result: dict[str, Any] = {
+        "callbackPhase": phase,
+        "operationRefDigest": operation_ref_digest,
+    }
+    code_mode_fields = {"codeModeHostStatus", "codeModeFailureClass"}
+    present = code_mode_fields.intersection(value)
+    if present and present != code_mode_fields:
+        return None
+    if present:
+        if (
+            value["codeModeHostStatus"] not in _CODE_MODE_HOST_STATUSES
+            or value["codeModeFailureClass"] not in _CODE_MODE_FAILURE_CLASSES
+        ):
+            return None
+        result.update({field: value[field] for field in code_mode_fields})
+    socket_fields = {"socketPhase", "socketState"}
+    present = socket_fields.intersection(value)
+    if present and present != socket_fields:
+        return None
+    if present and (
+        value["socketPhase"] not in _HOST_SOCKET_PHASES
+        or value["socketState"] not in _HOST_SOCKET_STATES
+    ):
+        return None
+    if present:
+        result.update({field: value[field] for field in socket_fields})
+    if "preparedHandoff" in value:
+        prepared_handoff = _bounded_prepared_handoff(value["preparedHandoff"])
+        if prepared_handoff is None:
+            return None
+        result["preparedHandoff"] = prepared_handoff
+    return result
 
 
 class G1ContractError(ValueError):
@@ -730,6 +857,9 @@ def _validate_failure(value: Any, name: str = "failure") -> dict[str, Any]:
             "codeModeFailureClass",
             "runtimePhase",
             "exceptionClass",
+            "socketPhase",
+            "socketState",
+            "preparedHandoff",
         },
         name,
     )
@@ -770,6 +900,17 @@ def _validate_failure(value: Any, name: str = "failure") -> dict[str, Any]:
             "code_mode", "callback", "transport", "contract", "unknown"
         }:
             raise G1ContractError(f"{name} Code Mode diagnostic fields are invalid")
+    socket_fields = {"socketPhase", "socketState"}
+    present_socket_fields = socket_fields.intersection(data)
+    if present_socket_fields and present_socket_fields != socket_fields:
+        raise G1ContractError(f"{name} socket diagnostic fields must be provided together")
+    if present_socket_fields and (
+        data["socketPhase"] not in _HOST_SOCKET_PHASES
+        or data["socketState"] not in _HOST_SOCKET_STATES
+    ):
+        raise G1ContractError(f"{name} socket diagnostic fields are invalid")
+    if "preparedHandoff" in data and _bounded_prepared_handoff(data["preparedHandoff"]) is None:
+        raise G1ContractError(f"{name}.preparedHandoff is invalid")
     runtime_diagnostic_fields = {"runtimePhase", "exceptionClass"}
     present_runtime_diagnostic_fields = runtime_diagnostic_fields.intersection(data)
     if present_runtime_diagnostic_fields and present_runtime_diagnostic_fields != runtime_diagnostic_fields:
