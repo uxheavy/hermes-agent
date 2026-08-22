@@ -1703,6 +1703,7 @@ class PlaneHostBinding:
                     result = replace(result, output=serialized_output)
                     for prepared_ref in serialized_refs:
                         self._prepared_call_registry.setdefault(prepared_ref, False)
+            record_index = len(self.records)
             self.records.append(HostCallRecord(request, result))
             if operation_ref not in {PLANE_OUTCOME_SUBMIT_OPERATION, PLANE_OUTCOME_PUBLISH_OPERATION}:
                 self._advance_standard_route(request, result)
@@ -1723,7 +1724,8 @@ class PlaneHostBinding:
                 and result.status in {"ok", "replayed"}
             ):
                 self._catalog_describe_discovered = True
-            self._emit_call_observation(request, result)
+            if operation_ref != "operation:search_workspace":
+                self._emit_call_observation(request, result)
             try:
                 result = self._observe_publication(request, result)
             except Exception:
@@ -1763,13 +1765,22 @@ class PlaneHostBinding:
                     self._code_mode_outcome_continuation_pending = True
             prepared_ref: str | None = None
             if (
-                operation_ref == "operation:search_workspace"
+                request.action == "read"
+                and operation_ref == "operation:search_workspace"
                 and result.status in {"ok", "replayed"}
+                and self.standard_route
+                and self._standard_route_index < len(self._standard_route_steps)
+                and self._standard_route_steps[self._standard_route_index][0]
+                == "operation:work_item.read"
+                and not self._standard_route_steps[self._standard_route_index][1]
             ):
                 prepared_refs = _prepared_read_refs_from_search_result(result.output)
                 if prepared_refs or _assignment_read_decision_requires_followup(result.output):
                     self._prepared_read_handoff_pending = True
-                if len(prepared_refs) == 1:
+                if (
+                    len(prepared_refs) == 1
+                    and self._prepared_call_registry.get(prepared_refs[0]) is False
+                ):
                     prepared_ref = prepared_refs[0]
                 if prepared_ref is not None:
                     # The gateway has already prepared and authorized this
@@ -1787,9 +1798,12 @@ class PlaneHostBinding:
                     combined_output = dict(result.output) if isinstance(result.output, Mapping) else {}
                     combined_output["preparedReadResult"] = prepared_read.to_dict()
                     result = replace(result, output=combined_output)
+                    self.records[record_index] = HostCallRecord(request, result)
                     if prepared_read.status in {"ok", "replayed"} and self.code_mode_phase == "post_search":
                         with self._lock:
                             self._code_mode_phase_hint = "post_search"
+            if operation_ref == "operation:search_workspace":
+                self._emit_call_observation(request, result)
             if (
                 operation_ref == "operation:work_item.read"
                 and isinstance(request.input.get("preparedCallRef"), str)

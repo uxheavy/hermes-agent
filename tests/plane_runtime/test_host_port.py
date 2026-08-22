@@ -1011,6 +1011,14 @@ binding = PlaneHostBinding(
     invocation_id="invocation:cross-process",
     correlation_id="correlation:cross-process",
     cancellation=lambda: False,
+    standard_route=True,
+    standard_route_contract={
+        "schemaVersion": "plane.standard-route/v1",
+        "steps": [
+            {"operationRef": "operation:search_workspace"},
+            {"operationRef": "operation:work_item.read"},
+        ],
+    },
     eager_operation_refs=frozenset({"operation:search_workspace", "operation:work_item.read"}),
 )
 install_plane_tools()
@@ -1077,7 +1085,15 @@ print("text_response")
             invocation_id="invocation:direct-search",
             correlation_id="correlation:direct-search",
             cancellation=lambda: False,
-            eager_operation_refs=frozenset({"operation:search_workspace"}),
+            standard_route=True,
+            standard_route_contract={
+                "schemaVersion": "plane.standard-route/v1",
+                "steps": [
+                    {"operationRef": "operation:search_workspace"},
+                    {"operationRef": "operation:work_item.read"},
+                ],
+            },
+            eager_operation_refs=frozenset({"operation:search_workspace", "operation:work_item.read"}),
         )
 
         search = binding.call(
@@ -1130,7 +1146,14 @@ print("text_response")
             correlation_id="correlation:bare-search",
             cancellation=lambda: False,
             standard_route=True,
-            eager_operation_refs=frozenset({"operation:search_workspace"}),
+            standard_route_contract={
+                "schemaVersion": "plane.standard-route/v1",
+                "steps": [
+                    {"operationRef": "operation:search_workspace"},
+                    {"operationRef": "operation:work_item.read"},
+                ],
+            },
+            eager_operation_refs=frozenset({"operation:search_workspace", "operation:work_item.read"}),
         )
 
         search = binding.call(
@@ -1145,7 +1168,7 @@ print("text_response")
             ["operation:search_workspace", "operation:work_item.read"],
         )
         self.assertFalse(binding.prepared_read_handoff_pending())
-        self.assertEqual(binding.standard_route_required_tool(), "plane_operation")
+        self.assertIsNone(binding.standard_route_required_tool())
         self.assertEqual(
             search.output["preparedReadResult"]["output"]["result"]["work_item"]["title"],
             "assigned",
@@ -3544,6 +3567,17 @@ print("text_response")
             invocation_id="invocation:prepared-registry",
             correlation_id="correlation:prepared-registry",
             cancellation=lambda: False,
+            standard_route=True,
+            standard_route_contract={
+                "schemaVersion": "plane.standard-route/v1",
+                "steps": [
+                    {"operationRef": "operation:search_workspace"},
+                    {"operationRef": "operation:work_item.read"},
+                ],
+            },
+            eager_operation_refs=frozenset(
+                {"operation:search_workspace", "operation:work_item.read"}
+            ),
         )
         with bind_plane_host(binding):
             result = registry.dispatch(

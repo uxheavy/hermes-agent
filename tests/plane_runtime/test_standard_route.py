@@ -55,7 +55,65 @@ def _binding(responder):
     )
 
 
-def test_standard_route_uses_the_single_trusted_ref_when_model_does_not_copy_it():
+def test_standard_route_auto_reads_one_trusted_ref_and_advances_route():
+    route = {
+        "schemaVersion": "plane.standard-route/v1",
+        "steps": [
+            {"operationRef": "operation:search_workspace"},
+            {"operationRef": "operation:work_item.read"},
+            {"operationRef": "operation:agent.outcome.evaluate"},
+        ],
+    }
+    requests = []
+
+    def respond(request):
+        requests.append(request)
+        if request["operationRef"] == "operation:search_workspace":
+            return _result(
+                request,
+                output={
+                    "result": {
+                        "results": [
+                            {
+                                "objectType": "work_item",
+                                "workItemReadCall": "prepared-call:trusted",
+                            }
+                        ]
+                    }
+                },
+            )
+        assert request["operationRef"] == "operation:work_item.read"
+        assert request["input"] == {"preparedCallRef": "prepared-call:trusted"}
+        return _result(request, output={"work_item": {"title": "assigned"}})
+
+    binding = PlaneHostBinding(
+        port=CallablePlaneHostPort(respond),
+        run_id="run:trusted-auto-read",
+        invocation_id="invocation:trusted-auto-read",
+        correlation_id="correlation:trusted-auto-read",
+        cancellation=lambda: False,
+        standard_route=True,
+        standard_route_contract=route,
+        eager_operation_refs=frozenset(step["operationRef"] for step in route["steps"]),
+    )
+    result = binding.call(
+        action="read",
+        operation_ref="operation:search_workspace",
+        input={},
+        source="model",
+    )
+
+    assert result.status == "ok"
+    assert [request["operationRef"] for request in requests] == [
+        "operation:search_workspace",
+        "operation:work_item.read",
+    ]
+    assert result.output["preparedReadResult"]["output"]["work_item"]["title"] == "assigned"
+    assert binding.standard_route_required_tool() == "plane_operation"
+    assert binding._prepared_call_registry == {"prepared-call:trusted": True}
+
+
+def test_standard_route_read_failure_is_attached_and_stays_pending():
     route = {
         "schemaVersion": "plane.standard-route/v1",
         "steps": [
@@ -68,36 +126,121 @@ def test_standard_route_uses_the_single_trusted_ref_when_model_does_not_copy_it(
     def respond(request):
         requests.append(request)
         if request["operationRef"] == "operation:search_workspace":
-            return _result(request, output={"result": {"results": []}})
-        assert request["input"] == {"preparedCallRef": "prepared-call:trusted"}
-        return _result(request, output={"work_item": {"title": "assigned"}})
+            output = {"result": {"results": [{"workItemReadCall": "prepared-call:failure"}]}}
+            return _result(request, output=output)
+        return _result(
+            request,
+            status="invalid",
+            errorCode="NOT_AUTHORIZED",
+            errorMessage="read denied",
+        )
 
     binding = PlaneHostBinding(
         port=CallablePlaneHostPort(respond),
-        run_id="run:trusted-fallback",
-        invocation_id="invocation:trusted-fallback",
-        correlation_id="correlation:trusted-fallback",
+        run_id="run:read-failure",
+        invocation_id="invocation:read-failure",
+        correlation_id="correlation:read-failure",
         cancellation=lambda: False,
         standard_route=True,
         standard_route_contract=route,
         eager_operation_refs=frozenset(step["operationRef"] for step in route["steps"]),
     )
-    binding.call(
+
+    result = binding.call(
         action="read",
         operation_ref="operation:search_workspace",
         input={},
         source="model",
     )
-    binding._prepared_call_registry["prepared-call:trusted"] = False
+
+    assert result.status == "ok"
+    assert result.output["preparedReadResult"]["errorCode"] == "NOT_AUTHORIZED"
+    assert binding.prepared_read_handoff_pending() is True
+    assert [request["operationRef"] for request in requests] == [
+        "operation:search_workspace",
+        "operation:work_item.read",
+    ]
+
+
+def test_standard_route_does_not_auto_read_ambiguous_refs():
+    route = {
+        "schemaVersion": "plane.standard-route/v1",
+        "steps": [
+            {"operationRef": "operation:search_workspace"},
+            {"operationRef": "operation:work_item.read"},
+        ],
+    }
+    requests = []
+
+    def respond(request):
+        requests.append(request)
+        return _result(
+            request,
+            output={
+                "result": {
+                    "results": [
+                        {"workItemReadCall": "prepared-call:first"},
+                        {"workItemReadCall": "prepared-call:second"},
+                    ]
+                }
+            },
+        )
+
+    binding = PlaneHostBinding(
+        port=CallablePlaneHostPort(respond),
+        run_id="run:ambiguous-auto-read",
+        invocation_id="invocation:ambiguous-auto-read",
+        correlation_id="correlation:ambiguous-auto-read",
+        cancellation=lambda: False,
+        standard_route=True,
+        standard_route_contract=route,
+        eager_operation_refs=frozenset(step["operationRef"] for step in route["steps"]),
+    )
+
     result = binding.call(
         action="read",
-        operation_ref="operation:work_item.read",
-        input={"issue_id": "model-shaped-but-untrusted"},
+        operation_ref="operation:search_workspace",
+        input={},
         source="model",
     )
 
     assert result.status == "ok"
-    assert requests[-1]["input"] == {"preparedCallRef": "prepared-call:trusted"}
+    assert "preparedReadResult" not in result.output
+    assert binding.prepared_read_handoff_pending() is True
+    assert len(requests) == 1
+
+
+def test_non_standard_search_does_not_auto_read_prepared_ref():
+    requests = []
+
+    def respond(request):
+        requests.append(request)
+        return _result(
+            request,
+            output={"result": {"results": [{"workItemReadCall": "prepared-call:non-standard"}]}},
+        )
+
+    binding = PlaneHostBinding(
+        port=CallablePlaneHostPort(respond),
+        run_id="run:non-standard",
+        invocation_id="invocation:non-standard",
+        correlation_id="correlation:non-standard",
+        cancellation=lambda: False,
+        eager_operation_refs=frozenset({"operation:search_workspace"}),
+    )
+
+    result = binding.call(
+        action="read",
+        operation_ref="operation:search_workspace",
+        input={},
+        source="model",
+    )
+
+    assert result.status == "ok"
+    assert "preparedReadResult" not in result.output
+    assert [request["operationRef"] for request in requests] == [
+        "operation:search_workspace"
+    ]
 
 
 @pytest.mark.parametrize(

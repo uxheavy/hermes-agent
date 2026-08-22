@@ -61,9 +61,8 @@ _FALLBACK_EXHAUSTED_COOLDOWN_S = 5.0
 # is presentation state installed by the Plane runtime adapter, not a caller
 # supplied provider override.  Keep the transport override derived here so
 # the existing Codex Responses path requires a tool for only the first
-# productive request. Code Mode exposes exactly one model tool, so the
-# Responses ``required`` mode selects it without provider-specific function
-# object syntax; once the adapter consumes the hint, normal ``auto`` resumes.
+# productive request. Code Mode exposes exactly one model tool; once the
+# adapter consumes the hint, normal ``auto`` resumes.
 _PLANE_FIRST_REQUIRED_TOOL = "plane_execute_typescript"
 _PLANE_CODE_MODE_TOOL = "plane_execute_typescript"
 _PLANE_PREPARED_READ_TOOL = "plane_operation"
@@ -157,9 +156,14 @@ def _plane_codex_request_overrides(agent, tools):
     """
     configured = getattr(agent, "request_overrides", None)
     overrides = dict(configured) if isinstance(configured, dict) else {}
-    if _plane_required_tool(agent) is not None:
-        if _plane_first_tool_available(agent, tools):
-            overrides["tool_choice"] = "required"
+    required = _plane_required_tool(agent)
+    if required is not None:
+        if required in {
+            _PLANE_CODE_MODE_TOOL,
+            _PLANE_PREPARED_READ_TOOL,
+            _PLANE_PUBLISH_TOOL,
+        } and _plane_first_tool_available(agent, tools):
+            overrides["tool_choice"] = {"type": "function", "name": required}
         return overrides
 
     if getattr(agent, "provider", None) != "openai-codex":

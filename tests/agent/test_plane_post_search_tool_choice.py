@@ -260,7 +260,10 @@ def test_first_tool_precedence_is_preserved_over_post_search_hint():
 
     request = _request(agent, [_EXECUTE_TOOL, _PUBLISH_TOOL])
 
-    assert request["tool_choice"] == "required"
+    assert request["tool_choice"] == {
+        "type": "function",
+        "name": "plane_execute_typescript",
+    }
 
 
 def test_successful_submit_requires_explicit_publish_tool():
@@ -273,7 +276,10 @@ def test_successful_submit_requires_explicit_publish_tool():
 
     request = _request(agent, [_EXECUTE_TOOL, _PUBLISH_TOOL])
 
-    assert request["tool_choice"] == "required"
+    assert request["tool_choice"] == {
+        "type": "function",
+        "name": "plane_publish",
+    }
     assert agent._plane_first_required_tool == "plane_publish"
     assert _plane_first_tool_tools(agent, [_EXECUTE_TOOL, _PUBLISH_TOOL]) == [_PUBLISH_TOOL]
 
@@ -293,6 +299,21 @@ def test_code_mode_ref_recovery_requires_one_named_execute_continuation():
         "function": {"name": "plane_execute_typescript"},
     }
     assert agent._plane_first_required_tool == "plane_execute_typescript"
+
+
+def test_codex_responses_requires_named_standard_plane_operation_tool():
+    agent = SimpleNamespace(
+        model="gpt-5.6",
+        request_overrides={},
+        _plane_runtime_required_tool_check=lambda: "plane_operation",
+    )
+
+    request = _request(agent, [_PLANE_OPERATION_TOOL, _PUBLISH_TOOL])
+
+    assert request["tool_choice"] == {
+        "type": "function",
+        "name": "plane_operation",
+    }
 
 
 def test_publish_requirement_is_not_created_for_ordinary_plane_or_non_plane_turns():
