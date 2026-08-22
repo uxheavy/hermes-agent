@@ -711,6 +711,12 @@ class HostPortTests(unittest.TestCase):
             input={"preparedCallRef": "prepared-call:opaque"},
             source="model",
         )
+        canonical_duplicate = binding.call(
+            action="read",
+            operation_ref="operation:work_item.read",
+            input={"preparedCallRef": "prepared-call:opaque"},
+            source="model",
+        )
         duplicate = binding.call(
             action="read",
             operation_ref="operation:work_item.read",
@@ -727,6 +733,8 @@ class HostPortTests(unittest.TestCase):
         )
 
         self.assertEqual(first.status, "ok")
+        self.assertEqual(canonical_duplicate.status, "invalid")
+        self.assertEqual(canonical_duplicate.error_code, "READ_ALREADY_CONSUMED")
         self.assertEqual(duplicate.status, "invalid")
         self.assertFalse(duplicate.replayed)
         self.assertEqual(duplicate.error_code, "READ_ALREADY_CONSUMED")

@@ -922,6 +922,7 @@ class PlaneHostBinding:
     _terminal_action_request: HostCallRequest | None = field(default=None, init=False, repr=False)
     _prepared_read_handoff_pending: bool = field(default=False, init=False, repr=False)
     _prepared_read_completion: HostCallResult | None = field(default=None, init=False, repr=False)
+    _prepared_read_ref: str | None = field(default=None, init=False, repr=False)
     _catalog_search_discovered: bool = field(default=False, init=False, repr=False)
     _catalog_describe_discovered: bool = field(default=False, init=False, repr=False)
     _code_mode_phase_hint: str | None = field(default=None, init=False, repr=False)
@@ -1420,6 +1421,7 @@ class PlaneHostBinding:
             ):
                 self._prepared_read_handoff_pending = False
                 self._prepared_read_completion = result
+                self._prepared_read_ref = input["preparedCallRef"]
             if action == "code":
                 prepared_refs = ()
                 prepared_read_succeeded = False
@@ -1493,10 +1495,15 @@ class PlaneHostBinding:
         """Absorb one stray post-consume read without another host callback."""
 
         completion = self._prepared_read_completion
+        canonical_duplicate = (
+            isinstance(request.input, Mapping)
+            and set(request.input) == {"preparedCallRef"}
+            and request.input.get("preparedCallRef") == self._prepared_read_ref
+        )
         if (
             completion is None
             or request.action != "read"
-            or not _is_stray_prepared_read_shape(request.input)
+            or not (canonical_duplicate or _is_stray_prepared_read_shape(request.input))
         ):
             return None
         return HostCallResult(
