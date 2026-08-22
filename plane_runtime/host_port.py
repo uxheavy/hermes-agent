@@ -96,6 +96,7 @@ _HOST_RESULT_DISPOSITIONS: Mapping[tuple[str, str | None], HostResultDisposition
         ("replayed", None): "continue_with_tool_result",
         ("invalid", "VALIDATION_ERROR"): "continue_with_tool_result",
         ("invalid", "READ_ALREADY_CONSUMED"): "continue_with_tool_result",
+        ("invalid", "STANDARD_ROUTE_MISMATCH"): "continue_with_tool_result",
         # A generated Code Mode module may fail in the restricted isolate.
         # Return that finite, bounded result to the model so it can correct
         # the module in the same invocation; host/transport failures remain
@@ -1218,7 +1219,7 @@ class PlaneHostBinding:
         )
         return True, refs[0] if len(refs) == 1 else None
 
-    def _check_standard_route(self, request: HostCallRequest) -> None:
+    def _check_standard_route(self, request: HostCallRequest) -> HostCallResult | None:
         if not self._standard_route_steps:
             return
         while (
@@ -1237,8 +1238,17 @@ class PlaneHostBinding:
             or ((expected_ref == PLANE_OUTCOME_PUBLISH_OPERATION) != (request.action == "publish"))
             or (expected_read and request.action != "read")
         ):
-            self._fail("standard route operation does not match the remaining Plane step")
-            raise PlaneHostUnavailable("standard route operation does not match the remaining Plane step")
+            return HostCallResult(
+                request_ref=request.request_ref,
+                correlation_id=request.correlation_id,
+                idempotency_key=request.idempotency_key,
+                status="invalid",
+                replayed=False,
+                output=None,
+                error_code="STANDARD_ROUTE_MISMATCH",
+                error_message="requested operation is not the next standard-route step",
+            )
+        return None
 
     def _advance_standard_route(self, request: HostCallRequest, result: HostCallResult) -> None:
         if not self._standard_route_steps or self._standard_route_index >= len(self._standard_route_steps):
@@ -1722,7 +1732,9 @@ class PlaneHostBinding:
                 operation_ref=operation_ref,
                 input_value=request.input,
             )
-            self._check_standard_route(request)
+            route_result = self._check_standard_route(request)
+            if route_result is not None:
+                return route_result
             terminal_result = self._terminal_result_for(request)
             if terminal_result is not None:
                 return terminal_result
@@ -2024,6 +2036,8 @@ class PlaneHostBinding:
         )
         if result.status not in {"ok", "replayed"}:
             if result.error_code == "OUTCOME_UNKNOWN":
+                return result
+            if result.error_code == "STANDARD_ROUTE_MISMATCH":
                 return result
             if _recoverable_outcome_publication_rejection(
                 self.records[-1].request, result

@@ -564,14 +564,89 @@ def test_bound_standard_route_advances_denial_then_uses_existing_publish_guard()
     assert binding.standard_route_required_tool() is None
 
 
-def test_wrong_step_does_not_reach_host():
+def test_standard_route_mismatch_is_recoverable_and_does_not_advance_or_dispatch():
     calls = []
+    route = {
+        "schemaVersion": "plane.standard-route/v1",
+        "steps": [
+            {"operationRef": "operation:work_item.read"},
+            {
+                "operationRef": "operation:agent.outcome.evaluate",
+                "expectedStatus": "denied",
+                "expectedErrorCode": "NOT_AUTHORIZED",
+            },
+            {"operationRef": PLANE_OUTCOME_PUBLISH_OPERATION},
+        ],
+    }
 
     def respond(request):
         calls.append(request)
+        if request["operationRef"] == "operation:work_item.read":
+            return _result(request)
+        if request["operationRef"] == "operation:agent.outcome.evaluate":
+            return _result(
+                request, status="denied", errorCode="NOT_AUTHORIZED", errorMessage="not authorized"
+            )
         return _result(request, status="denied", errorCode="WRONG_DENIAL")
 
-    binding = _binding(respond)
-    with pytest.raises(PlaneHostUnavailable):
-        binding.call(action="read", operation_ref="operation:search_workspace", input={}, source="model")
-    assert calls == []
+    binding = PlaneHostBinding(
+        port=CallablePlaneHostPort(respond),
+        run_id="run:route-mismatch",
+        invocation_id="invocation:route-mismatch",
+        correlation_id="correlation:route-mismatch",
+        cancellation=lambda: False,
+        standard_route=True,
+        standard_route_contract=route,
+        eager_operation_refs=frozenset(step["operationRef"] for step in route["steps"]),
+    )
+    binding._prepared_call_registry["prepared-call:trusted"] = False
+
+    result = binding.call(
+        action="mutate", operation_ref="operation:agent.outcome.evaluate", input={}, source="model"
+    )
+
+    assert result.status == "invalid"
+    assert result.error_code == "STANDARD_ROUTE_MISMATCH"
+    assert binding.fatal_error is None
+    assert binding._standard_route_index == 0
+    assert binding.standard_route_required_tool() == "plane_operation"
+
+    publication = binding.publish(
+        kind="conversation",
+        operation_ref=PLANE_OUTCOME_PUBLISH_OPERATION,
+        resource_ref="conversation:blocked",
+        content="blocked",
+    )
+    assert publication.error_code == "STANDARD_ROUTE_MISMATCH"
+    assert binding.fatal_error is None
+
+    read = binding.call(
+        action="read",
+        operation_ref="operation:work_item.read",
+        input={"preparedCallRef": "prepared-call:trusted"},
+        source="model",
+    )
+    assert read.status == "ok"
+    assert binding._standard_route_index == 1
+
+    early_publication = binding.publish(
+        kind="conversation",
+        operation_ref=PLANE_OUTCOME_PUBLISH_OPERATION,
+        resource_ref="conversation:early",
+        content="early",
+    )
+    assert early_publication.error_code == "STANDARD_ROUTE_MISMATCH"
+
+    denial = binding.call(
+        action="mutate",
+        operation_ref="operation:agent.outcome.evaluate",
+        input={},
+        source="model",
+    )
+    assert denial.status == "denied"
+    assert binding._standard_route_index == 2
+    assert binding.fatal_error is None
+    assert [request["operationRef"] for request in calls] == [
+        "operation:work_item.read",
+        "operation:agent.outcome.evaluate",
+    ]
