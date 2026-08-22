@@ -212,6 +212,7 @@ _STRUCTURED_FAILURE_EXCEPTION_CLASSES = MappingProxyType(
         "outcome_unknown": "RuntimeError",
         "budget_exhausted": "RuntimeError",
         "required_tool_not_used": "RuntimeError",
+        "plane_code_mode_continuation_failed": "RuntimeError",
     }
 )
 
@@ -1531,6 +1532,20 @@ class HermesKernelAdapter:
                     kind="failed",
                     failure_code="budget_exhausted",
                     failure_message="model-call allowance is exhausted",
+                    retryable=False,
+                    usage=usage,
+                    model_calls=model_calls,
+                    runtime_phase="conversation",
+                    exception_class=_structured_failure_exception_class(
+                        result.get("failure_reason")
+                    ),
+                )
+            if result.get("failure_reason") == "plane_code_mode_continuation_failed":
+                return HermesKernelResult(
+                    kind="failed",
+                    failure_code="runtime_error",
+                    failure_message="Plane Code Mode continuation failed closed",
+                    failure_cause="code_mode_continuation_failed",
                     retryable=False,
                     usage=usage,
                     model_calls=model_calls,

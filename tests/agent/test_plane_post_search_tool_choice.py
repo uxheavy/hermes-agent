@@ -1,6 +1,9 @@
 from types import SimpleNamespace
 
+import pytest
+
 from agent.chat_completion_helpers import (
+    PlaneCodeModeContinuationError,
     _plane_codex_request_overrides,
     _plane_first_tool_tools,
     _plane_standard_request_overrides,
@@ -137,9 +140,10 @@ def test_post_search_phase_requires_atomic_consumer():
         _plane_runtime_code_mode_phase_hint=lambda: "post_search",
     )
 
-    request = _request(agent, [_EXECUTE_TOOL, _PUBLISH_TOOL])
+    with pytest.raises(PlaneCodeModeContinuationError) as error:
+        _request(agent, [_EXECUTE_TOOL, _PUBLISH_TOOL])
 
-    assert request["tool_choice"] == "auto"
+    assert error.value.reason == "phase_consumer_unavailable"
 
 
 def test_post_search_phase_consumer_must_return_trusted_phase():
@@ -148,12 +152,14 @@ def test_post_search_phase_consumer_must_return_trusted_phase():
         provider="openai-codex",
         model="gpt-5.6-codex",
         request_overrides={},
+        _plane_runtime_code_mode_phase_hint=lambda: "post_search",
         _plane_runtime_code_mode_phase_consume=lambda: consumed.append(True),
     )
 
-    request = _request(agent, [_EXECUTE_TOOL, _PUBLISH_TOOL])
+    with pytest.raises(PlaneCodeModeContinuationError) as error:
+        _request(agent, [_EXECUTE_TOOL, _PUBLISH_TOOL])
 
-    assert request["tool_choice"] == "auto"
+    assert error.value.reason == "phase_consumer_invalid"
     assert consumed == [True]
 
 
@@ -163,13 +169,31 @@ def test_post_search_phase_is_not_consumed_without_execute_tool():
         provider="openai-codex",
         model="gpt-5.6-codex",
         request_overrides={},
+        _plane_runtime_code_mode_phase_hint=lambda: "post_search",
         _plane_runtime_code_mode_phase_consume=lambda: phase.pop(0),
     )
 
-    request = _request(agent, [_PUBLISH_TOOL])
+    with pytest.raises(PlaneCodeModeContinuationError) as error:
+        _request(agent, [_PUBLISH_TOOL])
 
-    assert request["tool_choice"] == "auto"
+    assert error.value.reason == "execute_tool_unavailable"
     assert phase == ["post_search"]
+
+
+def test_post_search_phase_consumer_failure_fails_closed_without_provider_request():
+    agent = SimpleNamespace(
+        provider="openai-codex",
+        model="gpt-5.6-codex",
+        request_overrides={},
+        _plane_runtime_code_mode_phase_consume=lambda: (_ for _ in ()).throw(
+            RuntimeError("broken phase state")
+        ),
+    )
+
+    with pytest.raises(PlaneCodeModeContinuationError) as error:
+        _plane_codex_request_overrides(agent, [_EXECUTE_TOOL])
+
+    assert error.value.reason == "phase_consume_failed"
 
 
 def test_first_tool_precedence_is_preserved_over_post_search_hint():
@@ -223,7 +247,6 @@ def test_publish_requirement_is_not_created_for_ordinary_plane_or_non_plane_turn
 def test_pre_search_invalid_and_out_of_policy_hints_fail_closed_to_auto():
     for hint, provider, model in (
         (None, "openai-codex", "gpt-5.6-codex"),
-        ("invalid", "openai-codex", "gpt-5.6-codex"),
         ("post_search", "other-provider", "gpt-5.6-codex"),
         ("post_search", "openai-codex", "gpt-5.5-codex"),
     ):
@@ -235,3 +258,17 @@ def test_pre_search_invalid_and_out_of_policy_hints_fail_closed_to_auto():
         )
         request = _request(agent, [_EXECUTE_TOOL, _PUBLISH_TOOL])
         assert request["tool_choice"] == "auto"
+
+
+def test_invalid_plane_phase_hint_fails_closed():
+    agent = SimpleNamespace(
+        provider="openai-codex",
+        model="gpt-5.6-codex",
+        request_overrides={},
+        _plane_runtime_code_mode_phase_hint=lambda: "invalid",
+    )
+
+    with pytest.raises(PlaneCodeModeContinuationError) as error:
+        _plane_codex_request_overrides(agent, [_EXECUTE_TOOL])
+
+    assert error.value.reason == "phase_hint_invalid"

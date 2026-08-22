@@ -67,6 +67,7 @@ _DIAGNOSTIC_EXIT_CATEGORIES = frozenset(
         "error_near_max_iterations",
         "partial_stream_recovery",
         "required_tool_not_used",
+        "plane_code_mode_continuation_failed",
         "other",
     }
 )
@@ -713,6 +714,9 @@ def finalize_turn(
     if _turn_exit_reason == "required_tool_not_used":
         result["failure_reason"] = "required_tool_not_used"
         result["error"] = "required Code Mode tool was not invoked"
+    if _turn_exit_reason == "plane_code_mode_continuation_failed":
+        result["failure_reason"] = "plane_code_mode_continuation_failed"
+        result["error"] = "Plane Code Mode continuation failed closed"
     if agent._tool_guardrail_halt_decision is not None:
         result["guardrail"] = agent._tool_guardrail_halt_decision.to_metadata()
     # Surface any post-loop cleanup failures so the caller can distinguish a

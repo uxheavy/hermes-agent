@@ -69,6 +69,18 @@ _PLANE_CODE_MODE_TOOL = "plane_execute_typescript"
 _PLANE_PREPARED_READ_TOOL = "plane_operation"
 
 
+class PlaneCodeModeContinuationError(RuntimeError):
+    """Bounded local failure for an armed Plane Code Mode continuation."""
+
+    code = "plane_code_mode_continuation_failed"
+    retryable = False
+    plane_runtime_fail_closed = True
+
+    def __init__(self, reason: str):
+        self.reason = reason
+        super().__init__("Plane Code Mode continuation failed closed")
+
+
 def _plane_tool_name(tool):
     if not isinstance(tool, dict):
         return None
@@ -132,24 +144,41 @@ def _plane_codex_request_overrides(agent, tools):
         return overrides
     if not str(getattr(agent, "model", "")).lower().startswith("gpt-5.6"):
         return overrides
-    if not any(
+    phase_hint_check = getattr(agent, "_plane_runtime_code_mode_phase_hint", None)
+    phase_hint = None
+    if callable(phase_hint_check):
+        try:
+            phase_hint = phase_hint_check()
+        except Exception as exc:
+            raise PlaneCodeModeContinuationError("phase_hint_failed") from exc
+        if phase_hint not in (None, "post_search"):
+            raise PlaneCodeModeContinuationError("phase_hint_invalid")
+
+    execute_available = any(
         _plane_tool_name(tool) == _PLANE_CODE_MODE_TOOL for tool in (tools or [])
-    ):
-        return overrides
+    )
+    if phase_hint == "post_search" and not execute_available:
+        raise PlaneCodeModeContinuationError("execute_tool_unavailable")
 
     # The host binding's take method is the atomic phase read-and-consume
-    # boundary. Do not observe the phase through one callback and consume it
-    # through another: concurrent request construction could otherwise turn
-    # one trusted handoff into multiple continuations.
+    # boundary. A trusted phase must never silently fall back to auto: that
+    # would spend another provider turn without performing the commissioned
+    # Code Mode action.
     consume_phase = getattr(agent, "_plane_runtime_code_mode_phase_consume", None)
     if not callable(consume_phase):
+        if phase_hint == "post_search":
+            raise PlaneCodeModeContinuationError("phase_consumer_unavailable")
         return overrides
     try:
         phase = consume_phase()
-    except Exception:
+    except Exception as exc:
+        raise PlaneCodeModeContinuationError("phase_consume_failed") from exc
+    if phase is None:
         return overrides
     if phase != "post_search":
-        return overrides
+        raise PlaneCodeModeContinuationError("phase_consume_invalid")
+    if not execute_available:
+        raise PlaneCodeModeContinuationError("execute_tool_unavailable")
     overrides["tool_choice"] = {
         "type": "function",
         "name": _PLANE_CODE_MODE_TOOL,

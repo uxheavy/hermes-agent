@@ -7204,6 +7204,23 @@ def run_conversation(
                 break
             
         except Exception as e:
+            if getattr(e, "plane_runtime_fail_closed", False) is True:
+                # A trusted Plane continuation must stop locally when its
+                # phase state or required tool is invalid. Retrying this
+                # request would spend turns without a valid commissioned
+                # action and could never repair the missing authority.
+                _turn_exit_reason = "plane_code_mode_continuation_failed"
+                final_response = "Plane Code Mode continuation failed closed."
+                failed = True
+                messages.append({"role": "assistant", "content": final_response})
+                api_call_count -= 1
+                agent._api_call_count = api_call_count
+                try:
+                    agent.iteration_budget.refund()
+                except Exception:
+                    pass
+                break
+
             # Phase-aware error classification. The huge outer try/except spans
             # both the actual API request and all local post-processing of the
             # returned assistant message. Deterministic local bugs (e.g.
