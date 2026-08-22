@@ -650,6 +650,49 @@ class HostPortTests(unittest.TestCase):
         self.assertNotIn(raw_result, serialized)
         self.assertNotIn("provider-secret", serialized)
 
+    def test_pre_host_failure_uses_current_operation_diagnostic(self) -> None:
+        search_ref = "operation:search_workspace"
+        failing_ref = "operation:current-request"
+        binding = PlaneHostBinding(
+            port=CallablePlaneHostPort(
+                lambda request: _result(request, output={"results": []})
+            ),
+            run_id="run:diagnostic-pre-host",
+            invocation_id="invocation:diagnostic-pre-host",
+            correlation_id="correlation:diagnostic-pre-host",
+            cancellation=lambda: False,
+            standard_route=True,
+            standard_route_contract={
+                "schemaVersion": "plane.standard-route/v1",
+                "steps": [{"operationRef": search_ref}],
+            },
+            eager_operation_refs=frozenset({search_ref, failing_ref}),
+        )
+
+        binding.call(
+            action="read",
+            operation_ref=search_ref,
+            input={},
+            source="model",
+        )
+        with self.assertRaises(PlaneHostUnavailable):
+            binding.call(
+                action="read",
+                operation_ref=failing_ref,
+                input={},
+                source="model",
+            )
+
+        self.assertEqual(
+            binding.host_operation_diagnostic,
+            {
+                "callbackPhase": "before_host_call",
+                "operationRefDigest": hashlib.sha256(
+                    failing_ref.encode("utf-8")
+                ).hexdigest(),
+            },
+        )
+
     def test_ambiguous_prepared_search_handoff_stays_pending_until_read(self) -> None:
         """A multi-result search cannot silently become an ordinary text exit."""
 

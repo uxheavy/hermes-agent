@@ -1716,6 +1716,7 @@ class PlaneHostBinding:
                     input=normalized_input,
                     source=source,
                 )
+            self._set_callback_phase("before_host_call", request)
             self._require_schema_disclosure(
                 action=action,
                 operation_ref=operation_ref,
@@ -1728,7 +1729,6 @@ class PlaneHostBinding:
             if len(self.records) >= self.max_calls:
                 self._fail("Plane host call budget exhausted")
                 raise PlaneHostBoundsError("Plane host call budget exhausted")
-            self._set_callback_phase("before_host_call", request)
             try:
                 result = self.port.invoke(request)
             except PlaneHostError as exc:
