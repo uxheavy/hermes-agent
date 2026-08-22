@@ -995,8 +995,9 @@ def _consume_codex_event_stream(
       if no message item was emitted directly.
     * ``output_text``: assembled text from ``response.output_text.delta`` deltas.
     * ``usage``: copied from the terminal event's ``response.usage`` (when present).
-    * ``status``: ``completed`` / ``incomplete`` / ``failed`` (or ``completed`` if
-      the stream ended without a terminal frame but produced content).
+    * ``status``: ``completed`` / ``incomplete`` / ``failed``. A stream that
+      ends without a terminal frame is rejected, even when it produced partial
+      content, because EOF is not proof that the provider completed the turn.
     * ``id``: ``response.id`` when present.
     * ``incomplete_details``: passed through for ``response.incomplete`` frames.
     * ``error``: passed through for ``response.failed`` frames.
@@ -1202,13 +1203,11 @@ def _consume_codex_event_stream(
     else:
         output = []
 
-    # If the stream ended without any terminal event AND produced no usable
-    # content (no items, no text deltas), surface that as a RuntimeError so
-    # callers can distinguish "stream truncated mid-flight / provider rejected
-    # the call" from "stream completed with empty body".  This preserves the
-    # signal the SDK's high-level helper used to raise as
-    # ``RuntimeError("Didn't receive a `response.completed` event.")``.
-    if not saw_terminal and not output:
+    # A provider SSE stream is complete only after an explicit terminal event.
+    # Partial output followed by EOF is still ambiguous: the provider may have
+    # accepted the request and lost the channel before publishing its result.
+    # Never promote that partial output to a successful response.
+    if not saw_terminal:
         raise RuntimeError(
             "Codex Responses stream did not emit a terminal response"
         )

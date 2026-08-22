@@ -418,15 +418,8 @@ def _build_xai_agent_with_slash_enum_tool(monkeypatch):
 
 
 
-def test_run_codex_stream_returns_collected_items_when_stream_ends_without_terminal(monkeypatch):
-    """The event-driven path tolerates streams that end without a terminal frame.
-
-    Previously the SDK's ``responses.stream(...)`` helper raised
-    ``RuntimeError("Didn't receive a `response.completed` event.")`` which the
-    primary path caught and retried/fell back through. The new
-    ``responses.create(stream=True)`` path consumes events directly and just
-    returns whatever it collected — no retry, no separate fallback path.
-    """
+def test_run_codex_stream_rejects_partial_output_without_terminal(monkeypatch):
+    """EOF after output is incomplete, not a successful Responses turn."""
     agent = _build_agent(monkeypatch)
     output_item = SimpleNamespace(
         type="message",
@@ -448,10 +441,99 @@ def test_run_codex_stream_returns_collected_items_when_stream_ends_without_termi
         responses=SimpleNamespace(create=_fake_create),
     )
 
-    response = agent._run_codex_stream(_codex_request_kwargs())
+    with pytest.raises(RuntimeError, match="did not emit a terminal response"):
+        agent._run_codex_stream(_codex_request_kwargs())
     assert calls["create"] == 1
+
+
+def test_consume_codex_stream_accepts_terminal_before_normal_eof():
+    from agent.codex_runtime import _consume_codex_event_stream
+
+    output_item = SimpleNamespace(
+        type="message",
+        status="completed",
+        content=[SimpleNamespace(type="output_text", text="complete")],
+    )
+
+    response = _consume_codex_event_stream(
+        iter([
+            SimpleNamespace(type="response.output_item.done", item=output_item),
+            SimpleNamespace(
+                type="response.completed",
+                response=SimpleNamespace(status="completed"),
+            ),
+        ]),
+        model="gpt-5.6-luna",
+    )
+
     assert response.status == "completed"
     assert response.output == [output_item]
+
+
+def test_consume_codex_stream_rejects_incomplete_eof_after_partial_output():
+    from agent.codex_runtime import _consume_codex_event_stream
+
+    output_item = SimpleNamespace(
+        type="message",
+        status="completed",
+        content=[SimpleNamespace(type="output_text", text="partial")],
+    )
+
+    with pytest.raises(RuntimeError, match="did not emit a terminal response"):
+        _consume_codex_event_stream(
+            iter([SimpleNamespace(type="response.output_item.done", item=output_item)]),
+            model="gpt-5.6-luna",
+        )
+
+
+def test_consume_codex_stream_propagates_provider_error_frame():
+    from agent.codex_runtime import _consume_codex_event_stream
+
+    with pytest.raises(run_agent._StreamErrorEvent, match="fixture provider error"):
+        _consume_codex_event_stream(
+            iter([
+                SimpleNamespace(
+                    type="error",
+                    code="server_error",
+                    message="fixture provider error",
+                ),
+            ]),
+            model="gpt-5.6-luna",
+        )
+
+
+def test_consume_codex_stream_treats_duplicate_terminal_as_non_authoritative_tail():
+    from agent.codex_runtime import _consume_codex_event_stream
+
+    response = _consume_codex_event_stream(
+        iter([
+            SimpleNamespace(
+                type="response.completed",
+                response=SimpleNamespace(status="completed"),
+            ),
+            # The consumer stops at the first terminal frame; a later
+            # duplicate cannot create a second logical completion.
+            SimpleNamespace(
+                type="response.completed",
+                response=SimpleNamespace(status="completed"),
+            ),
+        ]),
+        model="gpt-5.6-luna",
+    )
+
+    assert response.status == "completed"
+    assert response.output == []
+
+
+def test_consume_codex_stream_propagates_truncated_frame_failure():
+    from agent.codex_runtime import _consume_codex_event_stream
+
+    def truncated_stream():
+        yield SimpleNamespace(type="response.created")
+        raise ValueError("fixture truncated frame")
+
+    with pytest.raises(ValueError, match="fixture truncated frame"):
+        _consume_codex_event_stream(truncated_stream(), model="gpt-5.6-luna")
 
 
 def test_consume_codex_stream_routes_commentary_phase_deltas_to_reasoning(monkeypatch):
@@ -1740,8 +1822,6 @@ def test_duplicate_detection_uses_commentary_when_hidden_reasoning_changes(monke
     reasoning_items = interim_msgs[0].get("codex_reasoning_items")
     if reasoning_items:
         assert reasoning_items[0].get("id") == "rs_second"
-
-
 
 
 
