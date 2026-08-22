@@ -188,6 +188,20 @@ def finalize_turn(
                 )
             final_response = agent._handle_max_iterations(messages, api_call_count)
 
+    # A standard Plane route is not complete until its next required tool has
+    # run. Keep error/iteration exits from being mapped to a completed text
+    # response when the route is still pending.
+    required_route_check = getattr(agent, "_plane_runtime_required_tool_check", None)
+    if callable(required_route_check):
+        try:
+            required_route_tool = required_route_check()
+        except Exception:
+            required_route_tool = "plane_operation"
+        if required_route_tool in {"plane_operation", "plane_publish"}:
+            failed = True
+            final_response = None
+            _turn_exit_reason = "required_tool_not_used"
+
     if iteration_limit_fallback:
         # If running as a kanban worker, signal the dispatcher that the
         # worker could not complete (rather than treating it as a

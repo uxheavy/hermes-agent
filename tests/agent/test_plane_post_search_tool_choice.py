@@ -9,6 +9,7 @@ from agent.chat_completion_helpers import (
     _plane_required_tool,
     _plane_standard_request_overrides,
 )
+from agent.conversation_loop import _record_plane_runtime_request
 from agent.transports import get_transport
 
 
@@ -314,6 +315,31 @@ def test_codex_responses_requires_named_standard_plane_operation_tool():
         "type": "function",
         "name": "plane_operation",
     }
+
+
+def test_standard_route_rearms_evaluate_submit_publish_and_records_named_choices():
+    required_tools = iter(("plane_operation", "plane_operation", "plane_publish"))
+    agent = SimpleNamespace(
+        model="gpt-5.6",
+        request_overrides={},
+        _plane_runtime_required_tool_check=lambda: next(required_tools, None),
+        _plane_runtime_diagnostics={"requests": []},
+    )
+
+    for expected in ("plane_operation", "plane_operation", "plane_publish"):
+        agent._plane_first_required_tool = None
+        request = _request(agent, [_PLANE_OPERATION_TOOL, _PUBLISH_TOOL])
+        _record_plane_runtime_request(agent, request)
+        assert request["tool_choice"] == {
+            "type": "function",
+            "name": expected,
+        }
+
+    assert [row["toolChoice"] for row in agent._plane_runtime_diagnostics["requests"]] == [
+        "required",
+        "required",
+        "required",
+    ]
 
 
 def test_publish_requirement_is_not_created_for_ordinary_plane_or_non_plane_turns():

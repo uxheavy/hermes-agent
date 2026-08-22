@@ -210,6 +210,24 @@ def test_plane_runtime_budget_failure_does_not_request_summary(monkeypatch):
     assert result["error"] == "model-call allowance is exhausted"
 
 
+def test_pending_standard_route_fails_closed_at_iteration_end(monkeypatch):
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    agent = _LimitAgent()
+    agent._plane_runtime_required_tool_check = lambda: "plane_operation"
+
+    result = _finalize(
+        agent,
+        final_response="provider error near the limit",
+        exit_reason="error_near_max_iterations(provider error)",
+    )
+
+    assert result["failed"] is True
+    assert result["completed"] is False
+    assert result["final_response"] is None
+    assert result["turn_exit_reason"] == "required_tool_not_used"
+    assert result["failure_reason"] == "required_tool_not_used"
+
+
 def test_published_pending_candidate_is_not_duplicated_by_finalizer(monkeypatch):
     """When budget exhaustion preserves a verification candidate that is
     already the tail assistant message, the finalizer must NOT append a
@@ -247,4 +265,3 @@ def test_published_pending_candidate_is_not_duplicated_by_finalizer(monkeypatch)
     assert agent.persisted_messages is not None
     persisted_roles = [m["role"] for m in agent.persisted_messages]
     assert persisted_roles == ["user", "assistant"]
-

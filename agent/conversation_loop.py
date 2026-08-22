@@ -116,6 +116,9 @@ _PLANE_FIRST_REQUIRED_TOOL_MAX_RECALLS = 2
 _PLANE_RUNTIME_DIAGNOSTIC_TOOL_NAMES = frozenset(
     {"plane_execute_typescript", "plane_publish"}
 )
+_PLANE_RUNTIME_REQUIRED_TOOL_NAMES = frozenset(
+    {"plane_operation", "plane_execute_typescript", "plane_publish"}
+)
 
 
 def _plane_runtime_toolset_class(tools: Any) -> str:
@@ -177,7 +180,13 @@ def _record_plane_runtime_request(agent: Any, api_kwargs: Any) -> None:
     if len(requests) >= 32 or not isinstance(api_kwargs, dict):
         return
     choice = api_kwargs.get("tool_choice")
-    if choice not in {"required", "auto"}:
+    if isinstance(choice, dict):
+        named = choice.get("name")
+        if not isinstance(named, str):
+            function = choice.get("function")
+            named = function.get("name") if isinstance(function, dict) else None
+        choice = "required" if named in _PLANE_RUNTIME_REQUIRED_TOOL_NAMES else "absent"
+    elif choice not in {"required", "auto"}:
         choice = "absent"
     tools = api_kwargs.get("tools")
     requests.append(
