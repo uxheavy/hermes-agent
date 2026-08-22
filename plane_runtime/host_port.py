@@ -446,7 +446,7 @@ def _recoverable_outcome_publication_rejection(
 
 
 def _prepared_read_refs_from_search_result(output: Any) -> tuple[str, ...]:
-    """Return only Plane's top-level assignment-scoped opaque handoff."""
+    """Return the finite opaque handoffs serialized by a workspace search."""
 
     if not isinstance(output, Mapping) or "preparedReadResult" in output:
         return ()
@@ -458,8 +458,28 @@ def _prepared_read_refs_from_search_result(output: Any) -> tuple[str, ...]:
     decision = result.get("assignmentWorkItemReadDecision")
     if decision is not None and not _bounded_assignment_read_decision(decision):
         return ()
-    prepared_ref = _opaque_prepared_ref(result.get("assignmentWorkItemReadCall"))
-    return (prepared_ref,) if prepared_ref is not None else ()
+    raw_results = result.get("results")
+    if raw_results is None:
+        raw_results = []
+    elif not isinstance(raw_results, list):
+        return ()
+    refs: list[str] = []
+    prepared_ref = _canonical_prepared_ref_value(result.get("assignmentWorkItemReadCall"))
+    if prepared_ref is not None:
+        refs.append(prepared_ref)
+    for item in raw_results:
+        if (
+            not isinstance(item, Mapping)
+            or (
+                item.get("objectType") is not None
+                and item.get("objectType") != "work_item"
+            )
+        ):
+            continue
+        prepared_ref = _canonical_prepared_ref_value(item.get("workItemReadCall"))
+        if prepared_ref is not None and prepared_ref not in refs:
+            refs.append(prepared_ref)
+    return tuple(refs)
 
 
 def _bounded_assignment_read_decision(value: Any) -> bool:
@@ -707,6 +727,110 @@ def _normalize_prepared_read_input(
     return normalized if normalized is not None else input_value
 
 
+def _canonical_prepared_ref_value(value: Any) -> str | None:
+    """Collapse one accepted read-call wrapper to its opaque reference."""
+
+    if (
+        isinstance(value, Mapping)
+        and set(value) == {"preparedCallRef"}
+        and isinstance(value.get("preparedCallRef"), Mapping)
+    ):
+        # A nested canonical ref is a model-side compatibility form. It is
+        # accepted only after the invocation registry has bound the ref; a
+        # producer must serialize the canonical opaque string itself.
+        return None
+    candidate = value if isinstance(value, Mapping) else {"preparedCallRef": value}
+    normalized = _normalize_prepared_read_input(
+        "read", "operation:work_item.read", candidate
+    )
+    if (
+        isinstance(normalized, Mapping)
+        and set(normalized) == {"preparedCallRef"}
+    ):
+        return _opaque_prepared_ref(normalized.get("preparedCallRef"))
+    return None
+
+
+def _contains_prepared_read_marker(value: Any, *, depth: int = 0) -> bool:
+    """Detect a bounded prepared-read claim before normalizing it."""
+
+    if depth > 4:
+        return False
+    if isinstance(value, Mapping):
+        if "preparedCallRef" in value or "workItemReadCall" in value:
+            return True
+        return any(
+            _contains_prepared_read_marker(child, depth=depth + 1)
+            for child in value.values()
+            if isinstance(child, (Mapping, list, tuple))
+        )
+    if isinstance(value, (list, tuple)):
+        return any(
+            _contains_prepared_read_marker(child, depth=depth + 1)
+            for child in value
+            if isinstance(child, (Mapping, list, tuple))
+        )
+    return False
+
+
+def _canonicalize_search_handoff_output(
+    output: Any,
+) -> tuple[Any, tuple[str, ...]]:
+    """Serialize search read calls canonically without exposing raw read input."""
+
+    if not isinstance(output, Mapping) or "preparedReadResult" in output:
+        return output, ()
+    if (
+        output.get("schemaVersion") == PLANE_CODE_MODE_SCHEMA_VERSION
+        and isinstance(output.get("result"), Mapping)
+    ):
+        normalized_inner, refs = _canonicalize_search_handoff_output(output["result"])
+        if not refs:
+            return output, ()
+        normalized_output = dict(output)
+        normalized_output["result"] = normalized_inner
+        return normalized_output, refs
+    result = output.get("result")
+    if isinstance(output.get("results"), list):
+        result = output
+    if not isinstance(result, Mapping):
+        return output, ()
+    refs: list[str] = []
+    normalized_result = dict(result)
+    assignment_ref = _canonical_prepared_ref_value(
+        result.get("assignmentWorkItemReadCall")
+    )
+    if assignment_ref is not None:
+        refs.append(assignment_ref)
+        normalized_result["assignmentWorkItemReadCall"] = assignment_ref
+    raw_results = result.get("results")
+    if isinstance(raw_results, list):
+        normalized_results: list[Any] = []
+        for item in raw_results:
+            if (
+                not isinstance(item, Mapping)
+                or (
+                    item.get("objectType") is not None
+                    and item.get("objectType") != "work_item"
+                )
+            ):
+                normalized_results.append(item)
+                continue
+            normalized_item = dict(item)
+            item_ref = _canonical_prepared_ref_value(item.get("workItemReadCall"))
+            if item_ref is not None:
+                if item_ref not in refs:
+                    refs.append(item_ref)
+                normalized_item["workItemReadCall"] = item_ref
+            normalized_results.append(normalized_item)
+        normalized_result["results"] = normalized_results
+    if isinstance(output.get("results"), list):
+        return normalized_result, tuple(refs)
+    normalized_output = dict(output)
+    normalized_output["result"] = normalized_result
+    return normalized_output, tuple(refs)
+
+
 def _is_stray_prepared_read_shape(input_value: Mapping[str, Any]) -> bool:
     """Recognize only a ref-free or unrecognized wrapper after completion."""
 
@@ -923,6 +1047,8 @@ class PlaneHostBinding:
     _prepared_read_handoff_pending: bool = field(default=False, init=False, repr=False)
     _prepared_read_completion: HostCallResult | None = field(default=None, init=False, repr=False)
     _prepared_read_ref: str | None = field(default=None, init=False, repr=False)
+    _prepared_call_registry: dict[str, bool] = field(default_factory=dict, init=False, repr=False)
+    _outcome_unknown: bool = field(default=False, init=False, repr=False)
     _catalog_search_discovered: bool = field(default=False, init=False, repr=False)
     _catalog_describe_discovered: bool = field(default=False, init=False, repr=False)
     _code_mode_phase_hint: str | None = field(default=None, init=False, repr=False)
@@ -989,6 +1115,16 @@ class PlaneHostBinding:
 
         with self._lock:
             return self._prepared_read_handoff_pending
+
+    def mark_outcome_unknown(self) -> None:
+        """Latch durable provider uncertainty for this invocation."""
+
+        with self._lock:
+            self._outcome_unknown = True
+
+    def outcome_unknown(self) -> bool:
+        with self._lock:
+            return self._outcome_unknown
 
     def code_mode_phase_hint(self) -> str | None:
         """Return the one trusted Code Mode phase hint, if armed."""
@@ -1287,6 +1423,17 @@ class PlaneHostBinding:
             if self._is_cancelled():
                 self._fail("Plane host callback cancelled")
                 raise PlaneHostCancelled("Plane host callback cancelled")
+            if self._outcome_unknown:
+                return HostCallResult(
+                    request_ref=f"host-request:outcome-unknown:{self.invocation_id}",
+                    correlation_id=self.correlation_id,
+                    idempotency_key=f"host-idempotency:outcome-unknown:{self.invocation_id}",
+                    status="invalid",
+                    replayed=False,
+                    output=None,
+                    error_code="OUTCOME_UNKNOWN",
+                    error_message="provider outcome is unknown; reconciliation is required",
+                )
             try:
                 request = HostCallRequest(
                     run_id=self.run_id,
@@ -1308,10 +1455,55 @@ class PlaneHostBinding:
             catalog_search_replay = self._catalog_search_replay_for(request)
             if catalog_search_replay is not None:
                 return catalog_search_replay
+            prepared_read_input = (
+                action == "read"
+                and operation_ref == "operation:work_item.read"
+                and _contains_prepared_read_marker(input)
+            )
+            if prepared_read_input:
+                normalized_input = _normalize_prepared_read_input(
+                    action, operation_ref, input
+                )
+                prepared_ref = normalized_input.get("preparedCallRef")
+                if (
+                    set(normalized_input) != {"preparedCallRef"}
+                    or not isinstance(prepared_ref, str)
+                    or prepared_ref not in self._prepared_call_registry
+                ):
+                    return HostCallResult(
+                        request_ref=request.request_ref,
+                        correlation_id=request.correlation_id,
+                        idempotency_key=request.idempotency_key,
+                        status="invalid",
+                        replayed=False,
+                        output=None,
+                        error_code="PREPARED_CALL_INVALID",
+                        error_message="prepared work-item read reference is invalid",
+                    )
+                if self._prepared_call_registry[prepared_ref]:
+                    return HostCallResult(
+                        request_ref=request.request_ref,
+                        correlation_id=request.correlation_id,
+                        idempotency_key=request.idempotency_key,
+                        status="invalid",
+                        replayed=False,
+                        output=None,
+                        error_code="READ_ALREADY_CONSUMED",
+                        error_message="the invocation already consumed its prepared work-item read",
+                    )
+                request = HostCallRequest(
+                    run_id=self.run_id,
+                    invocation_id=self.invocation_id,
+                    correlation_id=self.correlation_id,
+                    action=action,
+                    operation_ref=operation_ref,
+                    input=normalized_input,
+                    source=source,
+                )
             self._require_schema_disclosure(
                 action=action,
                 operation_ref=operation_ref,
-                input_value=input,
+                input_value=request.input,
             )
             terminal_result = self._terminal_result_for(request)
             if terminal_result is not None:
@@ -1342,6 +1534,20 @@ class PlaneHostBinding:
             self._set_code_mode_diagnostic(
                 request, status=result.status, error_code=result.error_code
             )
+            if (
+                result.status in {"ok", "replayed"}
+                and (
+                    operation_ref == "operation:search_workspace"
+                    or action == "code"
+                )
+            ):
+                serialized_output, serialized_refs = _canonicalize_search_handoff_output(
+                    result.output
+                )
+                if serialized_refs:
+                    result = replace(result, output=serialized_output)
+                    for prepared_ref in serialized_refs:
+                        self._prepared_call_registry.setdefault(prepared_ref, False)
             self.records.append(HostCallRecord(request, result))
             try:
                 self._record_catalog_description(request, result)
@@ -1415,13 +1621,14 @@ class PlaneHostBinding:
                             self._code_mode_phase_hint = "post_search"
             if (
                 operation_ref == "operation:work_item.read"
-                and isinstance(input.get("preparedCallRef"), str)
-                and _opaque_prepared_ref(input.get("preparedCallRef")) is not None
+                and isinstance(request.input.get("preparedCallRef"), str)
+                and _opaque_prepared_ref(request.input.get("preparedCallRef")) is not None
                 and result.status in {"ok", "replayed"}
             ):
                 self._prepared_read_handoff_pending = False
                 self._prepared_read_completion = result
-                self._prepared_read_ref = input["preparedCallRef"]
+                self._prepared_read_ref = request.input["preparedCallRef"]
+                self._prepared_call_registry[request.input["preparedCallRef"]] = True
             if action == "code":
                 prepared_refs = ()
                 prepared_read_succeeded = False
@@ -1559,6 +1766,8 @@ class PlaneHostBinding:
             source="model",
         )
         if result.status not in {"ok", "replayed"}:
+            if result.error_code == "OUTCOME_UNKNOWN":
+                return result
             if _recoverable_outcome_publication_rejection(
                 self.records[-1].request, result
             ):

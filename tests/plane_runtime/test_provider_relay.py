@@ -23,6 +23,7 @@ from plane_runtime.hermes_adapter import (
     HermesKernelResult,
     InlineCredentialSource,
     PROVIDER_RELAY_BASE_URL,
+    ProviderOutcomeUnknownError,
     prepare_provider_relay_credentials,
     provider_relay_base_url,
 )
@@ -449,6 +450,28 @@ def test_openai_codex_outcome_unknown_stops_without_replay_or_fallback() -> None
     assert '"modelCalls":' in diagnostics.getvalue()
     assert "relay-secret" not in output.getvalue()
     assert "Return a deterministic runtime outcome." not in output.getvalue()
+
+
+def test_provider_relay_latches_outcome_unknown_before_next_request() -> None:
+    with _LocalCodexRelay(response=_outcome_unknown_response()) as relay:
+        credentials = _relay_credentials(relay.path, provider="openai-codex")
+        _source_credentials, factory = prepare_provider_relay_credentials(
+            credentials,
+            expected_provider="openai-codex",
+            provider_relay_socket=relay.path,
+        )
+        client = factory()
+        try:
+            with pytest.raises(ProviderOutcomeUnknownError):
+                client.post("/responses", json={"input": "first"})
+            with pytest.raises(ProviderOutcomeUnknownError):
+                client.post("/responses", json={"input": "must-not-send"})
+        finally:
+            client.close()
+
+    assert len(relay.requests) == 1
+    latch = getattr(factory, "_plane_provider_relay_outcome_unknown_latch")
+    assert latch.is_set() is True
 
 
 def test_openai_codex_midstream_failure_stops_without_replay_fallback_or_dump() -> None:

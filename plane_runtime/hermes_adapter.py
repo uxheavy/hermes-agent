@@ -238,20 +238,66 @@ class ProviderOutcomeUnknownError(RuntimeError):
         super().__init__("provider outcome is unknown; reconcile before retrying")
 
 
+class _ProviderOutcomeUnknownLatch:
+    """Invocation-local no-replay latch shared by every relay client."""
+
+    def __init__(self) -> None:
+        self._event = threading.Event()
+        self._callbacks: list[Callable[[], None]] = []
+        self._lock = threading.Lock()
+
+    def mark(self) -> None:
+        self._event.set()
+        with self._lock:
+            callbacks = tuple(self._callbacks)
+        for callback in callbacks:
+            try:
+                callback()
+            except Exception:
+                pass
+
+    def bind(self, callback: Callable[[], None]) -> None:
+        if not callable(callback):
+            raise TypeError("provider outcome latch callback must be callable")
+        with self._lock:
+            self._callbacks.append(callback)
+            already_set = self._event.is_set()
+        if already_set:
+            try:
+                callback()
+            except Exception:
+                pass
+
+    def is_set(self) -> bool:
+        return self._event.is_set()
+
+
 class _ProviderRelayBodyStream(httpx.SyncByteStream):
     """Turn post-header relay read failures into the typed terminal signal."""
 
-    def __init__(self, stream: Any, *, status_code: int) -> None:
+    def __init__(
+        self,
+        stream: Any,
+        *,
+        status_code: int,
+        outcome_unknown_latch: _ProviderOutcomeUnknownLatch | None = None,
+    ) -> None:
         self._stream = stream
         self._status_code = status_code
+        self._outcome_unknown_latch = outcome_unknown_latch
+
+    def _mark_and_raise(self, exc: BaseException) -> None:
+        if self._outcome_unknown_latch is not None:
+            self._outcome_unknown_latch.mark()
+        if isinstance(exc, ProviderOutcomeUnknownError):
+            raise exc
+        raise ProviderOutcomeUnknownError(status_code=self._status_code) from exc
 
     def __iter__(self):
         try:
             yield from self._stream
-        except ProviderOutcomeUnknownError:
-            raise
         except Exception as exc:
-            raise ProviderOutcomeUnknownError(status_code=self._status_code) from exc
+            self._mark_and_raise(exc)
 
     def close(self) -> None:
         close = getattr(self._stream, "close", None)
@@ -259,18 +305,21 @@ class _ProviderRelayBodyStream(httpx.SyncByteStream):
             return
         try:
             close()
-        except ProviderOutcomeUnknownError:
-            raise
         except Exception as exc:
-            raise ProviderOutcomeUnknownError(status_code=self._status_code) from exc
+            self._mark_and_raise(exc)
 
 
-def _raise_on_provider_outcome_unknown(response: Any) -> None:
+def _raise_on_provider_outcome_unknown(
+    response: Any,
+    *,
+    outcome_unknown_latch: _ProviderOutcomeUnknownLatch | None = None,
+) -> None:
     """Decode the relay's bounded ambiguity marker at the HTTP boundary."""
 
     response.stream = _ProviderRelayBodyStream(
         response.stream,
         status_code=int(response.status_code),
+        outcome_unknown_latch=outcome_unknown_latch,
     )
     if response.status_code < 400:
         return
@@ -299,6 +348,8 @@ def _raise_on_provider_outcome_unknown(response: Any) -> None:
         and payload.get("retryable") is False
         and payload.get("upstreamInitiated") is True
     ):
+        if outcome_unknown_latch is not None:
+            outcome_unknown_latch.mark()
         raise ProviderOutcomeUnknownError(status_code=int(response.status_code))
 
 
@@ -386,12 +437,20 @@ class _ProviderRelayConfig:
     relay_token: str = field(repr=False)
     invocation_socket: str = field(repr=False)
     base_url: str
+    outcome_unknown_latch: _ProviderOutcomeUnknownLatch = field(
+        default_factory=_ProviderOutcomeUnknownLatch,
+        repr=False,
+    )
 
     def http_client_factory(self) -> Callable[[], Any]:
         """Build fresh SDK-owned HTTP clients bound to this invocation relay."""
 
         def create_client() -> Any:
             client_request_id = str(uuid.uuid4())
+
+            def reject_after_outcome_unknown(_request: Any) -> None:
+                if self.outcome_unknown_latch.is_set():
+                    raise ProviderOutcomeUnknownError(status_code=0)
 
             def apply_relay_headers(request: Any) -> None:
                 # OpenAI builds request-level headers from ``api_key``.  Apply
@@ -414,12 +473,18 @@ class _ProviderRelayConfig:
                 follow_redirects=False,
                 timeout=None,
                 event_hooks={
-                    "request": [apply_relay_headers],
-                    "response": [_raise_on_provider_outcome_unknown],
+                    "request": [reject_after_outcome_unknown, apply_relay_headers],
+                    "response": [
+                        lambda response: _raise_on_provider_outcome_unknown(
+                            response,
+                            outcome_unknown_latch=self.outcome_unknown_latch,
+                        )
+                    ],
                 },
             )
 
         setattr(create_client, "_plane_provider_relay", True)
+        setattr(create_client, "_plane_provider_relay_outcome_unknown_latch", self.outcome_unknown_latch)
         return create_client
 
 
@@ -1211,6 +1276,13 @@ class HermesKernelAdapter:
         agent: Any | None = None
         cancellation_monitor: _CancellationMonitor | None = None
         runtime_phase = "agent_initialization"
+        provider_outcome_unknown_latch = getattr(
+            self._http_client_factory,
+            "_plane_provider_relay_outcome_unknown_latch",
+            None,
+        )
+        if not isinstance(provider_outcome_unknown_latch, _ProviderOutcomeUnknownLatch):
+            provider_outcome_unknown_latch = None
 
         def record_host_callback(diagnostic: Mapping[str, str]) -> None:
             if agent is not None:
@@ -1238,6 +1310,8 @@ class HermesKernelAdapter:
             if self._host_port is not None
             else None
         )
+        if provider_outcome_unknown_latch is not None and host_binding is not None:
+            provider_outcome_unknown_latch.bind(host_binding.mark_outcome_unknown)
         try:
             agent = self._agent_factory(**agent_kwargs)
             runtime_phase = "tool_configuration"
@@ -1269,6 +1343,11 @@ class HermesKernelAdapter:
                 setattr(agent, "_plane_first_required_tool_retries", 0)
             if host_binding is not None:
                 setattr(agent, "_terminal_action_check", host_binding.terminal_action_reason)
+                setattr(
+                    agent,
+                    "_plane_runtime_mark_outcome_unknown",
+                    host_binding.mark_outcome_unknown,
+                )
                 setattr(
                     agent,
                     "_plane_runtime_prepared_read_pending_check",
@@ -1331,6 +1410,10 @@ class HermesKernelAdapter:
                 and getattr(exc, "retryable", None) is False
                 and getattr(exc, "upstream_initiated", False) is True
             ):
+                if provider_outcome_unknown_latch is not None:
+                    provider_outcome_unknown_latch.mark()
+                elif host_binding is not None:
+                    host_binding.mark_outcome_unknown()
                 _emit_plane_runtime_diagnostics(agent, emit_body)
                 return HermesKernelResult(
                     kind="failed",
@@ -1434,6 +1517,15 @@ class HermesKernelAdapter:
                 failure_code="cancelled",
                 failure_message="runtime cancellation was requested",
                 retryable=False,
+            )
+        if provider_outcome_unknown_latch is not None and provider_outcome_unknown_latch.is_set():
+            _emit_plane_runtime_diagnostics(agent, emit_body)
+            return HermesKernelResult(
+                kind="failed",
+                failure_code="outcome_unknown",
+                failure_message=_OUTCOME_UNKNOWN_RUNTIME_MESSAGE,
+                retryable=False,
+                model_calls=self._observed_model_calls(agent, result),
             )
         if (
             host_binding is not None

@@ -631,14 +631,16 @@ class HostPortTests(unittest.TestCase):
                 output = {
                     "ok": True,
                     "result": {
-                        "results": [],
-                        "assignmentWorkItemReadDecision": {
-                            "schemaVersion": "plane.assignment-read-handoff/v1",
-                            "recognizedCount": 2,
-                            "acceptedForm": "unrecognized",
-                            "failureClass": "multiple",
-                            "shape": {"nestingDepth": 0, "sizeClass": "large"},
-                        },
+                        "results": [
+                            {
+                                "objectType": "work_item",
+                                "workItemReadCall": "prepared-call:first",
+                            },
+                            {
+                                "objectType": "work_item",
+                                "workItemReadCall": "prepared-call:second",
+                            },
+                        ],
                     },
                 }
             else:
@@ -705,6 +707,7 @@ class HostPortTests(unittest.TestCase):
             correlation_id="correlation:duplicate-read",
             cancellation=lambda: False,
         )
+        binding._prepared_call_registry["prepared-call:opaque"] = False
         first = binding.call(
             action="read",
             operation_ref="operation:work_item.read",
@@ -754,7 +757,7 @@ class HostPortTests(unittest.TestCase):
         )
         self.assertEqual(tampered.status, "invalid")
         self.assertEqual(tampered.error_code, "PREPARED_CALL_INVALID")
-        self.assertEqual(len(requests), 2)
+        self.assertEqual(len(requests), 1)
 
         fresh_requests: list[dict] = []
 
@@ -781,7 +784,8 @@ class HostPortTests(unittest.TestCase):
             source="model",
         )
         self.assertEqual(first_use.status, "invalid")
-        self.assertEqual(len(fresh_requests), 1)
+        self.assertEqual(first_use.error_code, "PREPARED_CALL_INVALID")
+        self.assertEqual(len(fresh_requests), 0)
 
     def test_catalog_search_replays_locally_after_successful_discovery(self) -> None:
         requests: list[dict] = []
@@ -3455,6 +3459,7 @@ print("text_response")
             correlation_id="correlation:prepared-envelope",
             cancellation=lambda: False,
         )
+        binding._prepared_call_registry["prepared-call:opaque"] = False
         ready_to_call = {
             "action": "read",
             "operationRef": "operation:work_item.read",
@@ -3473,6 +3478,158 @@ print("text_response")
         self.assertIn('"status":"ok"', result)
         self.assertEqual(len(requests), 1)
         self.assertEqual(requests[0]["input"], {"preparedCallRef": "prepared-call:opaque"})
+
+    def test_search_serializes_and_binds_one_prepared_ref_for_same_invocation(self) -> None:
+        install_plane_tools()
+        requests: list[dict] = []
+        ready_to_call = {
+            "action": "read",
+            "operationRef": "operation:work_item.read",
+            "input": {"preparedCallRef": "prepared-call:search-bound"},
+        }
+
+        def rpc(request: dict) -> dict:
+            requests.append(request)
+            if request["operationRef"] == "operation:search_workspace":
+                return _result(
+                    request,
+                    output={
+                        "result": {
+                            "results": [
+                                {
+                                    "objectType": "work_item",
+                                    "workItemReadCall": ready_to_call,
+                                }
+                            ],
+                            "assignmentWorkItemReadCall": ready_to_call,
+                        }
+                    },
+                )
+            return _result(request, output={"work_item": {"title": "assigned"}})
+
+        binding = PlaneHostBinding(
+            port=CallablePlaneHostPort(rpc),
+            run_id="run:prepared-registry",
+            invocation_id="invocation:prepared-registry",
+            correlation_id="correlation:prepared-registry",
+            cancellation=lambda: False,
+        )
+        with bind_plane_host(binding):
+            result = registry.dispatch(
+                "plane_operation",
+                {
+                    "action": "read",
+                    "operationRef": "operation:search_workspace",
+                    "input": {"query": "assigned"},
+                },
+            )
+
+        self.assertIn('"status":"ok"', result)
+        self.assertEqual(len(requests), 2)
+        self.assertEqual(
+            requests[1]["input"], {"preparedCallRef": "prepared-call:search-bound"}
+        )
+        self.assertIn(
+            '"assignmentWorkItemReadCall":"prepared-call:search-bound"',
+            result,
+        )
+        self.assertIn(
+            '"workItemReadCall":"prepared-call:search-bound"',
+            result,
+        )
+        self.assertIn("preparedReadResult", result)
+
+    def test_prepared_ref_unknown_cross_invocation_and_tampered_shapes_fail_closed(self) -> None:
+        install_plane_tools()
+        requests: list[dict] = []
+
+        def rpc(request: dict) -> dict:
+            requests.append(request)
+            return _result(request, output={"accepted": True})
+
+        binding = PlaneHostBinding(
+            port=CallablePlaneHostPort(rpc),
+            run_id="run:prepared-registry-invalid",
+            invocation_id="invocation:prepared-registry-invalid",
+            correlation_id="correlation:prepared-registry-invalid",
+            cancellation=lambda: False,
+        )
+        other_binding = PlaneHostBinding(
+            port=CallablePlaneHostPort(rpc),
+            run_id="run:prepared-registry-other",
+            invocation_id="invocation:prepared-registry-other",
+            correlation_id="correlation:prepared-registry-other",
+            cancellation=lambda: False,
+        )
+        binding._prepared_call_registry["prepared-call:cross-invocation"] = False
+        with bind_plane_host(other_binding):
+            cross_invocation = registry.dispatch(
+                "plane_operation",
+                {
+                    "action": "read",
+                    "operationRef": "operation:work_item.read",
+                    "input": {"preparedCallRef": "prepared-call:cross-invocation"},
+                },
+            )
+        self.assertIn("PREPARED_CALL_INVALID", cross_invocation)
+        inputs = (
+            {"preparedCallRef": "prepared-call:other-invocation"},
+            {
+                "preparedCallRef": {
+                    "preparedCallRef": "prepared-call:tampered",
+                    "issue_id": "must-not-cross-the-seam",
+                }
+            },
+            {
+                "preparedCallRef": {
+                    "preparedCallRef": {"preparedCallRef": "prepared-call:deep"}
+                }
+            },
+        )
+        with bind_plane_host(binding):
+            for input_value in inputs:
+                result = registry.dispatch(
+                    "plane_operation",
+                    {
+                        "action": "read",
+                        "operationRef": "operation:work_item.read",
+                        "input": input_value,
+                    },
+                )
+                self.assertIn("PREPARED_CALL_INVALID", result)
+
+        self.assertEqual(requests, [])
+
+    def test_outcome_unknown_stops_later_host_actions(self) -> None:
+        requests: list[dict] = []
+
+        def rpc(request: dict) -> dict:
+            requests.append(request)
+            return _result(request, output={"accepted": True})
+
+        binding = PlaneHostBinding(
+            port=CallablePlaneHostPort(rpc),
+            run_id="run:outcome-unknown-host-stop",
+            invocation_id="invocation:outcome-unknown-host-stop",
+            correlation_id="correlation:outcome-unknown-host-stop",
+            cancellation=lambda: False,
+        )
+        binding.mark_outcome_unknown()
+
+        for action, operation_ref in (
+            ("read", "operation:search_workspace"),
+            ("mutate", "operation:agent.outcome.submit"),
+            ("publish", "operation:agent.outcome.publish"),
+            ("code", "operation:plane_execute_typescript"),
+        ):
+            result = binding.call(
+                action=action,
+                operation_ref=operation_ref,
+                input={},
+                source="model",
+            )
+            self.assertEqual(result.error_code, "OUTCOME_UNKNOWN")
+        self.assertEqual(requests, [])
 
     def test_prepared_read_normalization_fails_closed_for_tampered_envelope(self) -> None:
         install_plane_tools()
@@ -3507,9 +3664,8 @@ print("text_response")
                 },
             )
 
-        self.assertIn('"status":"ok"', result)
-        self.assertEqual(len(requests), 1)
-        self.assertEqual(requests[0]["input"], tampered)
+        self.assertIn('"errorCode":"PREPARED_CALL_INVALID"', result)
+        self.assertEqual(requests, [])
 
     def test_registry_normalizes_exact_prepared_read_wrappers(self) -> None:
         install_plane_tools()
@@ -3531,14 +3687,30 @@ print("text_response")
             "operationRef": "operation:work_item.read",
             "input": {"preparedCallRef": "prepared-call:opaque"},
         }
+        wrapped_forms = tuple(
+            (
+                {
+                    "workItemReadCall": {
+                        **ready_to_call,
+                        "input": {"preparedCallRef": f"prepared-call:wrapper-{index}"},
+                    }
+                },
+                f"prepared-call:wrapper-{index}",
+            )
+            for index in range(3)
+        )
+        for _, prepared_ref in wrapped_forms:
+            binding._prepared_call_registry[prepared_ref] = False
         wrapped_forms = (
-            {"workItemReadCall": ready_to_call},
-            {"preparedCallRef": ready_to_call},
-            {
-                "preparedCallRef": json.dumps(
-                    ready_to_call, sort_keys=True, separators=(",", ":")
-                )
-            },
+            wrapped_forms[0][0],
+            {"preparedCallRef": {
+                **ready_to_call,
+                "input": {"preparedCallRef": wrapped_forms[1][1]},
+            }},
+            {"preparedCallRef": json.dumps({
+                **ready_to_call,
+                "input": {"preparedCallRef": wrapped_forms[2][1]},
+            }, sort_keys=True, separators=(",", ":"))},
         )
         with bind_plane_host(binding):
             for wrapped in wrapped_forms:
@@ -3554,7 +3726,10 @@ print("text_response")
 
         self.assertEqual(
             [request["input"] for request in requests],
-            [{"preparedCallRef": "prepared-call:opaque"}] * len(wrapped_forms),
+            [
+                {"preparedCallRef": f"prepared-call:wrapper-{index}"}
+                for index in range(len(wrapped_forms))
+            ],
         )
 
     def test_registry_normalizes_sparse_prepared_ref_and_rejects_malformed_variants(self) -> None:
@@ -3715,6 +3890,10 @@ print("text_response")
             correlation_id="correlation:bare-prepared-envelope",
             cancellation=lambda: False,
         )
+        binding._prepared_call_registry.update({
+            "prepared-call:bare": False,
+            "prepared-call:input-wrapper": False,
+        })
         with bind_plane_host(binding):
             for input_value in (
                 {"preparedCallRef": "prepared-call:bare"},
@@ -3789,9 +3968,9 @@ print("text_response")
                         "input": shape,
                     },
                 )
-                self.assertIn('"status":"ok"', result)
+                self.assertIn('"errorCode":"PREPARED_CALL_INVALID"', result)
 
-        self.assertEqual([request["input"] for request in requests], list(shapes))
+        self.assertEqual(requests, [])
 
     def test_prepared_read_unwrap_rejects_extra_and_deep_wrappers(self) -> None:
         install_plane_tools()
@@ -3834,9 +4013,9 @@ print("text_response")
                         "input": shape,
                     },
                 )
-                self.assertIn('"status":"ok"', result)
+                self.assertIn('"errorCode":"PREPARED_CALL_INVALID"', result)
 
-        self.assertEqual([request["input"] for request in requests], list(shapes))
+        self.assertEqual(requests, [])
 
     def test_real_aiagent_loop_reaches_read_mutation_code_and_explicit_publication(self) -> None:
         """Use a deterministic provider boundary, not a fake Hermes agent."""
