@@ -286,6 +286,44 @@ class HostPortTests(unittest.TestCase):
         self.assertNotIn(raw_result, serialized)
         self.assertNotIn("provider-secret", serialized)
 
+    def test_code_mode_diagnostic_classification_is_finite_and_redacted(self) -> None:
+        operation_ref = "plane.code-mode.execute@1"
+        cases = (
+            ("invalid", "CODE_MODE_FAILED", "code_mode"),
+            ("invalid", "VALIDATION_ERROR", "contract"),
+            ("unavailable", "CALLBACK_FAILED", "callback"),
+        )
+        for status, error_code, failure_class in cases:
+            with self.subTest(status=status, error_code=error_code):
+                binding = PlaneHostBinding(
+                    port=CallablePlaneHostPort(
+                        lambda request, status=status, error_code=error_code: _result(
+                            request,
+                            status=status,
+                            errorCode=error_code,
+                            errorMessage="bounded host failure",
+                        )
+                    ),
+                    run_id="run:diagnostic",
+                    invocation_id="invocation:diagnostic",
+                    correlation_id="correlation:diagnostic",
+                    cancellation=lambda: False,
+                )
+                binding.call(
+                    action="code",
+                    operation_ref=operation_ref,
+                    input={"source": "opaque-module"},
+                    source="code",
+                )
+                diagnostic = binding.host_operation_diagnostic
+                self.assertIsNotNone(diagnostic)
+                assert diagnostic is not None
+                self.assertEqual(diagnostic["codeModeHostStatus"], status)
+                self.assertEqual(diagnostic["codeModeFailureClass"], failure_class)
+                encoded = json.dumps(diagnostic, sort_keys=True)
+                self.assertNotIn("opaque-module", encoded)
+                self.assertNotIn("bounded host failure", encoded)
+
     def test_ambiguous_prepared_search_handoff_stays_pending_until_read(self) -> None:
         """A multi-result search cannot silently become an ordinary text exit."""
 
@@ -352,6 +390,93 @@ class HostPortTests(unittest.TestCase):
         )
         assert read.status == "ok"
         assert binding.prepared_read_handoff_pending() is False
+
+    def test_opaque_prepared_search_forces_one_code_mode_turn(self) -> None:
+        responses = iter(
+            (
+                {
+                    "ok": True,
+                    "result": {
+                        "results": [
+                            {
+                                "objectType": "work_item",
+                                "workItemReadCall": "prepared-call:opaque",
+                            }
+                        ]
+                    },
+                },
+                {"ok": True, "result": {"work_item": {"title": "assigned"}}},
+                {"ok": True, "result": {"continued": True}},
+            )
+        )
+        binding = PlaneHostBinding(
+            port=CallablePlaneHostPort(lambda request: _result(request, output=next(responses))),
+            run_id="run:opaque",
+            invocation_id="invocation:opaque",
+            correlation_id="correlation:opaque",
+            cancellation=lambda: False,
+            code_mode_phase="post_search",
+        )
+        binding.call(
+            action="read",
+            operation_ref="operation:search_workspace",
+            input={"query": "assigned"},
+            source="model",
+        )
+        assert [record.request.operation_ref for record in binding.records] == [
+            "operation:search_workspace",
+            "operation:work_item.read",
+        ]
+        assert binding.prepared_read_handoff_pending() is False
+        assert binding.code_mode_phase_hint() == "post_search"
+
+        from agent.chat_completion_helpers import _plane_codex_request_overrides
+
+        agent = SimpleNamespace(
+            request_overrides={},
+            _plane_runtime_consume_code_mode_phase=binding.consume_code_mode_phase,
+        )
+        tools = [{"type": "function", "function": {"name": "plane_execute_typescript"}}]
+        assert _plane_codex_request_overrides(agent, tools)["tool_choice"] == {
+            "type": "function",
+            "name": "plane_execute_typescript",
+        }
+        with self.assertRaises(PlaneHostError):
+            _plane_codex_request_overrides(agent, tools)
+
+        binding.call(
+            action="code",
+            operation_ref="plane.code-mode.execute@1",
+            input={"source": "return 1"},
+            source="code",
+        )
+        assert binding.code_mode_phase_hint() is None
+        assert _plane_codex_request_overrides(agent, tools) == {}
+
+    def test_armed_code_mode_fails_closed_without_tool_and_standard_flow_is_unchanged(self) -> None:
+        from agent.chat_completion_helpers import _plane_codex_request_overrides
+
+        binding = PlaneHostBinding(
+            port=CallablePlaneHostPort(lambda request: _result(request)),
+            run_id="run:armed",
+            invocation_id="invocation:armed",
+            correlation_id="correlation:armed",
+            cancellation=lambda: False,
+            code_mode_phase="post_search",
+        )
+        binding._code_mode_phase_hint = "post_search"
+        agent = SimpleNamespace(
+            request_overrides={"speed": "fast"},
+            _plane_runtime_consume_code_mode_phase=binding.consume_code_mode_phase,
+        )
+
+        with self.assertRaises(PlaneHostError):
+            _plane_codex_request_overrides(agent, [])
+        assert binding.fatal_error == "Plane Code Mode continuation tool is unavailable"
+
+        ordinary = SimpleNamespace(request_overrides={"speed": "fast"})
+        assert _plane_codex_request_overrides(ordinary, []) == {"speed": "fast"}
+        assert _plane_codex_request_overrides(SimpleNamespace(request_overrides=None), []) is None
 
     def test_cross_process_model_search_consumes_prepared_read_before_text_exit(self) -> None:
         """A child using the real model-facing tool dispatch cannot exit after search."""

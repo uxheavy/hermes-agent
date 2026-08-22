@@ -35,7 +35,7 @@ G1_CONTRACT_DIGESTS = {
     "runSnapshot": "308101c6a2c9f56e7deb5c6a07c8bc74b59831b92cbbb5b07c5a7eefc21f4947",
     "invocationEnvelope": "b7a15d74406f1624cdb7cd95b42edfd1ffee596abe57e4f00ed60e2e23ded995",
     "runtimeEvent": "78da5ce9d112b6545ea471e5fcae25ff5dfeb2e5db74a8d5796d0ee026823a27",
-    "runtimeExit": "ed127d0ebec8f5d432ce87a6be1a8eb41b31caf808badc27ed23cd0ba9115a24",
+    "runtimeExit": "7b8fcefc9600eb1b4f8f0d4a383587489558b32ac27fa8a5d81bdf3e9443cf0b",
     "runtimeDurableState": "444c944ec8a5054f33c8662470529a1f4565d42ff06138438beceeef7967a0da",
 }
 G1_MANIFEST_DIGEST = "3e3d4f5b87777b613624076655d7c96e26057d29dfbf08e933762c858ac3577f"
@@ -653,7 +653,16 @@ def _validate_failure(value: Any, name: str = "failure") -> dict[str, Any]:
     data = _object(value, name)
     _reject_unknown(
         data,
-        {"code", "message", "retryable", "cause", "callbackPhase", "operationRefDigest"},
+        {
+            "code",
+            "message",
+            "retryable",
+            "cause",
+            "callbackPhase",
+            "operationRefDigest",
+            "codeModeHostStatus",
+            "codeModeFailureClass",
+        },
         name,
     )
     _required(data, {"code", "message", "retryable"}, name)
@@ -682,6 +691,28 @@ def _validate_failure(value: Any, name: str = "failure") -> dict[str, Any]:
             or any(char not in "0123456789abcdef" for char in operation_ref_digest)
         ):
             raise G1ContractError(f"{name}.operationRefDigest is invalid")
+    code_mode_fields = {"codeModeHostStatus", "codeModeFailureClass"}
+    present_code_mode_fields = code_mode_fields.intersection(data)
+    if present_code_mode_fields and present_code_mode_fields != code_mode_fields:
+        raise G1ContractError(f"{name} Code Mode diagnostic fields must be provided together")
+    if present_code_mode_fields:
+        if data["codeModeHostStatus"] not in {
+            "ok",
+            "replayed",
+            "denied",
+            "conflict",
+            "unavailable",
+            "invalid",
+        }:
+            raise G1ContractError(f"{name}.codeModeHostStatus is invalid")
+        if data["codeModeFailureClass"] not in {
+            "code_mode",
+            "callback",
+            "transport",
+            "contract",
+            "unknown",
+        }:
+            raise G1ContractError(f"{name}.codeModeFailureClass is invalid")
     _text(data["message"], f"{name}.message")
     return data
 

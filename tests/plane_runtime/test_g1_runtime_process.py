@@ -1637,6 +1637,37 @@ class G1RuntimeProcessTests(unittest.TestCase):
         self.assertEqual(budget_result.failure_code, "budget_exhausted")
         self.assertIsNone(budget_result.failure_cause)
 
+    def test_code_mode_failure_diagnostic_round_trips_through_runtime_exit(self) -> None:
+        snapshot_raw = make_snapshot()
+        snapshot_raw["contentDigest"] = _digest(
+            "snapshot", {key: value for key, value in snapshot_raw.items() if key != "contentDigest"}
+        )
+        snapshot = G1RunSnapshot.from_dict(snapshot_raw)
+        invocation = G1InvocationEnvelope.from_dict(make_invocation(snapshot.to_dict()))
+        result = HermesKernelResult(
+            kind="failed",
+            failure_code="runtime_error",
+            failure_message="bounded host failure",
+            failure_cause="host_operation_failure",
+            retryable=False,
+            host_operation_diagnostic={
+                "callbackPhase": "host_return",
+                "operationRefDigest": "a" * 64,
+                "codeModeHostStatus": "invalid",
+                "codeModeFailureClass": "code_mode",
+            },
+        )
+        exit_frame = _terminal_failure(snapshot, invocation, result, 0)
+        self.assertEqual(exit_frame["failure"]["codeModeHostStatus"], "invalid")
+        self.assertEqual(exit_frame["failure"]["codeModeFailureClass"], "code_mode")
+        self.assertNotIn("bounded host failure", json.dumps(exit_frame))
+
+        invalid = dict(exit_frame)
+        invalid["failure"] = dict(exit_frame["failure"])
+        invalid["failure"].pop("codeModeFailureClass")
+        with self.assertRaises(G1ContractError):
+            validate_g1_frames([invalid])
+
     def test_adapter_classifies_runtime_exceptions_without_content_leakage(self) -> None:
         snapshot_raw = make_snapshot()
         snapshot_raw["runtimePolicy"] = dict(snapshot_raw["runtimePolicy"])  # type: ignore[arg-type]

@@ -39,6 +39,7 @@ PLANE_PUBLISH_TOOL = "plane_publish"
 PLANE_CODE_MODE_TOOL = "plane_execute_typescript"
 PLANE_CODE_MODE_SCHEMA_VERSION = "plane.code-mode/v1"
 PLANE_CODE_MODE_EXECUTE_OPERATION = "plane.code-mode.execute@1"
+CODE_MODE_PHASES = frozenset({"none", "post_search"})
 PLANE_OUTCOME_PUBLISH_OPERATION = "operation:agent.outcome.publish"
 PLANE_DISCOVERY_OPERATION = "plane.operations.discover@1"
 PLANE_CATALOG_SEARCH_OPERATION = "operation:catalog.search"
@@ -62,6 +63,7 @@ HOST_CALLBACK_PHASES = frozenset(
     }
 )
 
+
 _ACTIONS = {"discover", "read", "mutate", "code", "publish"}
 _SOURCES = {"model", "code"}
 _RESULT_STATUSES = {
@@ -72,6 +74,17 @@ _RESULT_STATUSES = {
     "unavailable",
     "invalid",
 }
+
+_CODE_MODE_HOST_STATUSES = frozenset(_RESULT_STATUSES)
+_CODE_MODE_CONTRACT_ERRORS = frozenset(
+    {
+        "VALIDATION_ERROR",
+        "PREPARED_CALL_INVALID",
+        "PROTOCOL_ERROR",
+        "SOURCE_TOO_LARGE",
+        "BUDGET_EXCEEDED",
+    }
+)
 
 HostResultDisposition = Literal[
     "continue_with_tool_result",
@@ -411,6 +424,16 @@ def _host_result_disposition(result: HostCallResult) -> HostResultDisposition:
     )
 
 
+def _opaque_prepared_ref(value: Any) -> str | None:
+    if (
+        not isinstance(value, str)
+        or not value.startswith("prepared-call:")
+        or len(value.encode("utf-8")) > 256
+    ):
+        return None
+    return value
+
+
 def _prepared_read_refs_from_search_result(output: Any) -> tuple[str, ...]:
     """Return the one opaque read reference prepared for a model search.
 
@@ -433,22 +456,21 @@ def _prepared_read_refs_from_search_result(output: Any) -> tuple[str, ...]:
         if not isinstance(item, Mapping):
             continue
         call = item.get("workItemReadCall")
-        if not isinstance(call, Mapping):
-            continue
-        if (
-            call.get("action") != "read"
-            or call.get("operationRef") != "operation:work_item.read"
-        ):
-            return ()
-        input_value = call.get("input")
-        if (
-            not isinstance(input_value, Mapping)
-            or set(input_value) != {"preparedCallRef"}
-            or not isinstance(input_value.get("preparedCallRef"), str)
-            or not input_value["preparedCallRef"].startswith("prepared-call:")
-        ):
-            return ()
-        prepared_refs.append(input_value["preparedCallRef"])
+        prepared_ref: str | None = None
+        if isinstance(call, str):
+            prepared_ref = _opaque_prepared_ref(call)
+        elif isinstance(call, Mapping):
+            if (
+                call.get("action") == "read"
+                and call.get("operationRef") == "operation:work_item.read"
+            ):
+                input_value = call.get("input")
+                if isinstance(input_value, Mapping) and set(input_value) == {"preparedCallRef"}:
+                    prepared_ref = _opaque_prepared_ref(input_value.get("preparedCallRef"))
+            elif set(call) == {"preparedCallRef"}:
+                prepared_ref = _opaque_prepared_ref(call.get("preparedCallRef"))
+        if prepared_ref is not None:
+            prepared_refs.append(prepared_ref)
     return tuple(prepared_refs)
 
 
@@ -695,6 +717,9 @@ class PlaneHostBinding:
     _terminal_action_result: HostCallResult | None = field(default=None, init=False, repr=False)
     _terminal_action_request: HostCallRequest | None = field(default=None, init=False, repr=False)
     _prepared_read_handoff_pending: bool = field(default=False, init=False, repr=False)
+    code_mode_phase: str = "none"
+    _code_mode_phase_hint: str | None = field(default=None, init=False, repr=False)
+    _code_mode_phase_claimed: bool = field(default=False, init=False, repr=False)
     _outcome_publication_metadata: dict[str, Any] | None = field(
         default=None, init=False, repr=False
     )
@@ -717,6 +742,8 @@ class PlaneHostBinding:
             for operation_ref in self.eager_operation_refs
         ):
             raise ValueError("Plane host eager operation refs must be operation references")
+        if self.code_mode_phase not in CODE_MODE_PHASES:
+            raise ValueError("Plane host Code Mode phase is unsupported")
 
     @property
     def fatal_error(self) -> str | None:
@@ -754,6 +781,31 @@ class PlaneHostBinding:
         with self._lock:
             return self._prepared_read_handoff_pending
 
+    def code_mode_phase_hint(self) -> str | None:
+        with self._lock:
+            return self._code_mode_phase_hint
+
+    def consume_code_mode_phase(self, *, tool_available: bool) -> str | None:
+        """Atomically claim one forced Code Mode continuation request."""
+
+        with self._lock:
+            if not isinstance(tool_available, bool):
+                self._fail("Plane Code Mode continuation state is invalid")
+                raise PlaneHostError("Plane Code Mode continuation state is invalid")
+            if self._code_mode_phase_hint is None:
+                if self._code_mode_phase_claimed:
+                    self._fail("Plane Code Mode continuation state is invalid")
+                    raise PlaneHostError("Plane Code Mode continuation state is invalid")
+                return None
+            if self._code_mode_phase_hint != "post_search" or self._code_mode_phase_claimed:
+                self._fail("Plane Code Mode continuation state is invalid")
+                raise PlaneHostError("Plane Code Mode continuation state is invalid")
+            if not tool_available:
+                self._fail("Plane Code Mode continuation tool is unavailable")
+                raise PlaneHostError("Plane Code Mode continuation tool is unavailable")
+            self._code_mode_phase_claimed = True
+            return self._code_mode_phase_hint
+
     def outcome_publication_metadata(self) -> dict[str, Any] | None:
         """Return the last validated outcome publication's bounded facts."""
 
@@ -778,10 +830,46 @@ class PlaneHostBinding:
             operation_ref_digest = self._host_operation_diagnostic["operationRefDigest"]
         else:
             return
-        self._host_operation_diagnostic = {
-            "callbackPhase": phase,
-            "operationRefDigest": operation_ref_digest,
-        }
+        diagnostic = dict(self._host_operation_diagnostic or {})
+        if request is not None and request.action != "code":
+            diagnostic.pop("codeModeHostStatus", None)
+            diagnostic.pop("codeModeFailureClass", None)
+        diagnostic.update(
+            {
+                "callbackPhase": phase,
+                "operationRefDigest": operation_ref_digest,
+            }
+        )
+        self._host_operation_diagnostic = diagnostic
+
+    def _set_code_mode_diagnostic(
+        self,
+        request: HostCallRequest,
+        *,
+        status: str,
+        error_code: str | None = None,
+    ) -> None:
+        """Attach finite Code Mode result facts to the existing host diagnostic."""
+
+        if request.action != "code":
+            return
+        bounded_status = (
+            status if status in _CODE_MODE_HOST_STATUSES else "unavailable"
+        )
+        if error_code == "CODE_MODE_FAILED":
+            failure_class = "code_mode"
+        elif error_code == "CALLBACK_FAILED":
+            failure_class = "callback"
+        elif error_code in _CODE_MODE_CONTRACT_ERRORS or bounded_status == "invalid":
+            failure_class = "contract"
+        elif bounded_status == "unavailable":
+            failure_class = "transport"
+        else:
+            failure_class = "unknown"
+        diagnostic = dict(self._host_operation_diagnostic or {})
+        diagnostic["codeModeHostStatus"] = bounded_status
+        diagnostic["codeModeFailureClass"] = failure_class
+        self._host_operation_diagnostic = diagnostic
 
     def _schema_is_disclosed(self, operation_ref: str) -> bool:
         return operation_ref in self.eager_operation_refs or operation_ref in self.described_operation_refs
@@ -932,12 +1020,25 @@ class PlaneHostBinding:
             try:
                 result = self.port.invoke(request)
             except PlaneHostError as exc:
+                self._set_code_mode_diagnostic(
+                    request, status="unavailable", error_code="HOST_UNAVAILABLE"
+                )
                 self._fail(str(exc) or "Plane host callback failed")
                 raise
             except Exception as exc:
+                self._set_code_mode_diagnostic(
+                    request, status="unavailable", error_code="HOST_UNAVAILABLE"
+                )
                 self._fail("Plane host callback failed")
                 raise PlaneHostUnavailable("Plane host callback failed") from exc
+            finally:
+                if action == "code":
+                    self._code_mode_phase_hint = None
+                    self._code_mode_phase_claimed = False
             self._set_callback_phase("host_return", request)
+            self._set_code_mode_diagnostic(
+                request, status=result.status, error_code=result.error_code
+            )
             self.records.append(HostCallRecord(request, result))
             try:
                 self._record_catalog_description(request, result)
@@ -976,6 +1077,8 @@ class PlaneHostBinding:
                     combined_output = dict(result.output) if isinstance(result.output, Mapping) else {}
                     combined_output["preparedReadResult"] = prepared_read.to_dict()
                     result = replace(result, output=combined_output)
+                    if prepared_read.status in {"ok", "replayed"} and self.code_mode_phase == "post_search":
+                        self._code_mode_phase_hint = "post_search"
             if (
                 operation_ref == "operation:work_item.read"
                 and isinstance(input.get("preparedCallRef"), str)

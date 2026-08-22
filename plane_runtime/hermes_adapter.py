@@ -464,8 +464,6 @@ def _code_mode_is_available(snapshot: G1RunSnapshot) -> bool:
 
     policy = snapshot.raw["runtimePolicy"]
     return all(policy.get(key, 0) > 0 for key in _CODE_MODE_RUNTIME_POLICY_FIELDS)
-
-
 def _strict_json_object(raw: bytes, expected: set[str], name: str) -> dict[str, Any]:
     """Parse one canonical object and reject duplicate/unknown/trailing data."""
     if raw != raw.strip() or len(raw) > _MAX_CREDENTIAL_VALUE_BYTES:
@@ -615,7 +613,7 @@ class HermesKernelResult:
     usage: Mapping[str, int] | None = None
     model_calls: int | None = None
     failure_cause: str | None = None
-    host_operation_diagnostic: Mapping[str, str] | None = None
+    host_operation_diagnostic: Mapping[str, Any] | None = None
 
 
 def _host_operation_failure_message(
@@ -1085,6 +1083,7 @@ class HermesKernelAdapter:
                     str(operation["operationRef"])
                     for operation in snapshot.eager_operations
                 ),
+                code_mode_phase=str(snapshot.raw.get("runtimePolicy", {}).get("codeModePhase", "none")),
             )
             if self._host_port is not None
             else None
@@ -1097,6 +1096,16 @@ class HermesKernelAdapter:
                     agent,
                     "_plane_runtime_prepared_read_pending_check",
                     host_binding.prepared_read_handoff_pending,
+                )
+                setattr(
+                    agent,
+                    "_plane_runtime_code_mode_phase_hint",
+                    host_binding.code_mode_phase_hint,
+                )
+                setattr(
+                    agent,
+                    "_plane_runtime_consume_code_mode_phase",
+                    host_binding.consume_code_mode_phase,
                 )
             # Plane's provider allowance is a hard invocation boundary. The
             # interactive Hermes summary fallback would spend an additional
