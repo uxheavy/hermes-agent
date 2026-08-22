@@ -1232,11 +1232,22 @@ class PlaneHostBinding:
             self._fail("standard route has no remaining operation")
             raise PlaneHostUnavailable("standard route has no remaining operation")
         expected_ref, _optional, _status, _error_code = self._standard_route_steps[self._standard_route_index]
-        expected_read = expected_ref == "operation:work_item.read"
+        expected_action = (
+            "publish"
+            if expected_ref == PLANE_OUTCOME_PUBLISH_OPERATION
+            else "read"
+            if expected_ref
+            in {
+                PLANE_CATALOG_SEARCH_OPERATION,
+                PLANE_CATALOG_DESCRIBE_OPERATION,
+                "operation:search_workspace",
+                "operation:work_item.read",
+            }
+            else "mutate"
+        )
         if (
             request.operation_ref != expected_ref
-            or ((expected_ref == PLANE_OUTCOME_PUBLISH_OPERATION) != (request.action == "publish"))
-            or (expected_read and request.action != "read")
+            or request.action != expected_action
         ):
             return HostCallResult(
                 request_ref=request.request_ref,
@@ -1246,7 +1257,10 @@ class PlaneHostBinding:
                 replayed=False,
                 output=None,
                 error_code="STANDARD_ROUTE_MISMATCH",
-                error_message="requested operation is not the next standard-route step",
+                error_message=(
+                    f"standard route requires action={expected_action} "
+                    f"operationRef={expected_ref}"
+                ),
             )
         return None
 

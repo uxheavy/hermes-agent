@@ -607,9 +607,13 @@ def test_standard_route_mismatch_is_recoverable_and_does_not_advance_or_dispatch
 
     assert result.status == "invalid"
     assert result.error_code == "STANDARD_ROUTE_MISMATCH"
+    assert result.error_message == (
+        "standard route requires action=read operationRef=operation:work_item.read"
+    )
     assert binding.fatal_error is None
     assert binding._standard_route_index == 0
     assert binding.standard_route_required_tool() == "plane_operation"
+    assert calls == []
 
     publication = binding.publish(
         kind="conversation",
@@ -618,7 +622,11 @@ def test_standard_route_mismatch_is_recoverable_and_does_not_advance_or_dispatch
         content="blocked",
     )
     assert publication.error_code == "STANDARD_ROUTE_MISMATCH"
+    assert publication.error_message == (
+        "standard route requires action=read operationRef=operation:work_item.read"
+    )
     assert binding.fatal_error is None
+    assert calls == []
 
     read = binding.call(
         action="read",
@@ -636,6 +644,10 @@ def test_standard_route_mismatch_is_recoverable_and_does_not_advance_or_dispatch
         content="early",
     )
     assert early_publication.error_code == "STANDARD_ROUTE_MISMATCH"
+    assert early_publication.error_message == (
+        "standard route requires action=mutate "
+        "operationRef=operation:agent.outcome.evaluate"
+    )
 
     denial = binding.call(
         action="mutate",
