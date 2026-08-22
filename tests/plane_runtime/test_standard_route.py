@@ -255,6 +255,57 @@ def test_standard_route_replays_only_a_completed_workspace_search():
     ]
 
 
+def test_standard_route_can_narrow_result_too_large_search():
+    route = {
+        "schemaVersion": "plane.standard-route/v1",
+        "steps": [{"operationRef": "operation:search_workspace"}],
+    }
+    requests = []
+
+    def respond(request):
+        requests.append(request)
+        if request["input"].get("query") == "too broad":
+            return _result(
+                request,
+                status="invalid",
+                errorCode="RESULT_TOO_LARGE",
+                errorMessage="narrow the search",
+            )
+        return _result(request, output={"result": {"results": []}})
+
+    binding = PlaneHostBinding(
+        port=CallablePlaneHostPort(respond),
+        run_id="run:result-too-large",
+        invocation_id="invocation:result-too-large",
+        correlation_id="correlation:result-too-large",
+        cancellation=lambda: False,
+        standard_route=True,
+        standard_route_contract=route,
+        eager_operation_refs=frozenset({"operation:search_workspace"}),
+    )
+
+    broad = binding.call(
+        action="read",
+        operation_ref="operation:search_workspace",
+        input={"query": "too broad"},
+        source="model",
+    )
+    narrowed = binding.call(
+        action="read",
+        operation_ref="operation:search_workspace",
+        input={"query": "assigned"},
+        source="model",
+    )
+
+    assert broad.error_code == "RESULT_TOO_LARGE"
+    assert narrowed.status == "ok"
+    assert binding.fatal_error is None
+    assert [request["input"]["query"] for request in requests] == [
+        "too broad",
+        "assigned",
+    ]
+
+
 def test_standard_route_does_not_auto_read_ambiguous_refs():
     route = {
         "schemaVersion": "plane.standard-route/v1",

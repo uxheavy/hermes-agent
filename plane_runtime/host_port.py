@@ -423,7 +423,16 @@ def _bound_host_result(request: HostCallRequest, raw: Any) -> HostCallResult:
     return result
 
 
-def _host_result_disposition(result: HostCallResult) -> HostResultDisposition:
+def _host_result_disposition(
+    result: HostCallResult, *, action: str | None = None
+) -> HostResultDisposition:
+    # Only non-mutating calls may recover from a bounded result by narrowing input.
+    if (
+        action in {"discover", "read"}
+        and result.status == "invalid"
+        and result.error_code == "RESULT_TOO_LARGE"
+    ):
+        return "continue_with_tool_result"
     return _HOST_RESULT_DISPOSITIONS.get(
         (result.status, result.error_code), "poison_invocation"
     )
@@ -1925,7 +1934,7 @@ class PlaneHostBinding:
                         if not self._code_mode_continuation_used:
                             self._code_mode_phase_hint = "post_search"
             if (
-                _host_result_disposition(result) == "poison_invocation"
+                _host_result_disposition(result, action=action) == "poison_invocation"
                 and not _recoverable_outcome_publication_rejection(request, result)
             ):
                 self._fail(result.error_message or "Plane host rejected the callback")
@@ -2013,7 +2022,7 @@ class PlaneHostBinding:
             ):
                 return result
             if (
-                _host_result_disposition(result) == "continue_with_tool_result"
+                _host_result_disposition(result, action="publish") == "continue_with_tool_result"
                 and result.status in {"invalid", "conflict"}
             ):
                 return result

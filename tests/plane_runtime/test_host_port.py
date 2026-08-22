@@ -2527,6 +2527,67 @@ print("text_response")
                 self.assertEqual(result.status, status)
                 self.assertIsNotNone(binding.fatal_error)
 
+    def test_result_too_large_is_recoverable_only_for_non_mutating_calls(self) -> None:
+        def too_large(request: dict) -> dict:
+            return _result(
+                request,
+                status="invalid",
+                errorCode="RESULT_TOO_LARGE",
+                errorMessage="narrow the request",
+            )
+
+        for action in ("discover", "read"):
+            with self.subTest(action=action):
+                binding = PlaneHostBinding(
+                    port=CallablePlaneHostPort(too_large),
+                    run_id="run:result-too-large",
+                    invocation_id=f"invocation:{action}",
+                    correlation_id=f"correlation:{action}",
+                    cancellation=lambda: False,
+                )
+                result = binding.call(
+                    action=action,
+                    operation_ref="operation:search_workspace",
+                    input={},
+                    source="model",
+                )
+                self.assertEqual(result.error_code, "RESULT_TOO_LARGE")
+                self.assertIsNone(binding.fatal_error)
+
+        mutation = PlaneHostBinding(
+            port=CallablePlaneHostPort(too_large),
+            run_id="run:result-too-large",
+            invocation_id="invocation:mutate",
+            correlation_id="correlation:mutate",
+            cancellation=lambda: False,
+        )
+        result = mutation.call(
+            action="mutate",
+            operation_ref="operation:work-item-update@1",
+            input={"workItemRef": "work-item:test", "title": "updated"},
+            source="model",
+        )
+        self.assertEqual(result.error_code, "RESULT_TOO_LARGE")
+        self.assertIsNotNone(mutation.fatal_error)
+
+        transport = PlaneHostBinding(
+            port=CallablePlaneHostPort(
+                lambda _request: (_ for _ in ()).throw(RuntimeError("transport failed"))
+            ),
+            run_id="run:result-too-large",
+            invocation_id="invocation:transport",
+            correlation_id="correlation:transport",
+            cancellation=lambda: False,
+        )
+        with self.assertRaises(PlaneHostUnavailable):
+            transport.call(
+                action="read",
+                operation_ref="operation:search_workspace",
+                input={},
+                source="model",
+            )
+        self.assertIsNotNone(transport.fatal_error)
+
     def test_changed_replay_binding_and_noncanonical_response_fail_closed(self) -> None:
         def changed_response(request: dict) -> dict:
             response = _result(request)
