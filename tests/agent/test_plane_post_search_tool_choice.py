@@ -336,9 +336,9 @@ def test_standard_route_rearms_evaluate_submit_publish_and_records_named_choices
         }
 
     assert [row["toolChoice"] for row in agent._plane_runtime_diagnostics["requests"]] == [
-        "required",
-        "required",
-        "required",
+        "plane_operation",
+        "plane_operation",
+        "plane_publish",
     ]
 
 

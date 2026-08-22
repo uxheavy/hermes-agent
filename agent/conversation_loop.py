@@ -114,10 +114,7 @@ _API_CALL_MODULES = frozenset({
 
 _PLANE_FIRST_REQUIRED_TOOL_MAX_RECALLS = 2
 _PLANE_RUNTIME_DIAGNOSTIC_TOOL_NAMES = frozenset(
-    {"plane_execute_typescript", "plane_publish"}
-)
-_PLANE_RUNTIME_REQUIRED_TOOL_NAMES = frozenset(
-    {"plane_operation", "plane_execute_typescript", "plane_publish"}
+    {"plane_execute_typescript", "plane_operation", "plane_publish"}
 )
 
 
@@ -180,14 +177,20 @@ def _record_plane_runtime_request(agent: Any, api_kwargs: Any) -> None:
     if len(requests) >= 32 or not isinstance(api_kwargs, dict):
         return
     choice = api_kwargs.get("tool_choice")
-    if isinstance(choice, dict):
-        named = choice.get("name")
-        if not isinstance(named, str):
+    if not (isinstance(choice, str) and choice in {"required", "auto"}):
+        if isinstance(choice, dict) and choice.get("type") == "function":
             function = choice.get("function")
-            named = function.get("name") if isinstance(function, dict) else None
-        choice = "required" if named in _PLANE_RUNTIME_REQUIRED_TOOL_NAMES else "absent"
-    elif choice not in {"required", "auto"}:
-        choice = "absent"
+            name = choice.get("name")
+            if not isinstance(name, str) and isinstance(function, dict):
+                name = function.get("name")
+            choice = (
+                name
+                if isinstance(name, str)
+                and name in _PLANE_RUNTIME_DIAGNOSTIC_TOOL_NAMES
+                else "absent"
+            )
+        else:
+            choice = "absent"
     tools = api_kwargs.get("tools")
     requests.append(
         {
