@@ -1282,7 +1282,7 @@ class HermesKernelAdapter:
                 setattr(
                     agent,
                     "_plane_runtime_code_mode_phase_consume",
-                    host_binding.take_code_mode_phase_hint,
+                    host_binding.consume_code_mode_phase,
                 )
                 setattr(
                     agent,

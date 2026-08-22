@@ -99,7 +99,7 @@ def test_post_search_phase_selects_named_code_mode_tool():
         provider="openai-codex",
         model="gpt-5.6-codex",
         request_overrides={},
-        _plane_runtime_code_mode_phase_consume=lambda: (
+        _plane_runtime_code_mode_phase_consume=lambda **_kwargs: (
             consumed.append(True) or "post_search"
         ),
     )
@@ -119,7 +119,9 @@ def test_post_search_phase_consumer_is_one_shot():
         provider="openai-codex",
         model="gpt-5.6-codex",
         request_overrides={},
-        _plane_runtime_code_mode_phase_consume=lambda: phase.pop(0),
+        _plane_runtime_code_mode_phase_consume=lambda **_kwargs: (
+            phase.pop(0) if phase else None
+        ),
     )
 
     first = _request(agent, [_EXECUTE_TOOL, _PUBLISH_TOOL])
@@ -153,7 +155,7 @@ def test_post_search_phase_consumer_must_return_trusted_phase():
         model="gpt-5.6-codex",
         request_overrides={},
         _plane_runtime_code_mode_phase_hint=lambda: "post_search",
-        _plane_runtime_code_mode_phase_consume=lambda: consumed.append(True),
+        _plane_runtime_code_mode_phase_consume=lambda **_kwargs: consumed.append(True),
     )
 
     with pytest.raises(PlaneCodeModeContinuationError) as error:
@@ -170,7 +172,7 @@ def test_post_search_phase_is_not_consumed_without_execute_tool():
         model="gpt-5.6-codex",
         request_overrides={},
         _plane_runtime_code_mode_phase_hint=lambda: "post_search",
-        _plane_runtime_code_mode_phase_consume=lambda: phase.pop(0),
+        _plane_runtime_code_mode_phase_consume=lambda **_kwargs: phase.pop(0),
     )
 
     with pytest.raises(PlaneCodeModeContinuationError) as error:
@@ -185,7 +187,7 @@ def test_post_search_phase_consumer_failure_fails_closed_without_provider_reques
         provider="openai-codex",
         model="gpt-5.6-codex",
         request_overrides={},
-        _plane_runtime_code_mode_phase_consume=lambda: (_ for _ in ()).throw(
+        _plane_runtime_code_mode_phase_consume=lambda **_kwargs: (_ for _ in ()).throw(
             RuntimeError("broken phase state")
         ),
     )

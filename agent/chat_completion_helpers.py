@@ -160,7 +160,7 @@ def _plane_codex_request_overrides(agent, tools):
     if phase_hint == "post_search" and not execute_available:
         raise PlaneCodeModeContinuationError("execute_tool_unavailable")
 
-    # The host binding's take method is the atomic phase read-and-consume
+    # The host binding's consume method is the atomic claim-and-read
     # boundary. A trusted phase must never silently fall back to auto: that
     # would spend another provider turn without performing the commissioned
     # Code Mode action.
@@ -170,10 +170,12 @@ def _plane_codex_request_overrides(agent, tools):
             raise PlaneCodeModeContinuationError("phase_consumer_unavailable")
         return overrides
     try:
-        phase = consume_phase()
+        phase = consume_phase(tool_available=execute_available)
     except Exception as exc:
         raise PlaneCodeModeContinuationError("phase_consume_failed") from exc
     if phase is None:
+        if phase_hint == "post_search":
+            raise PlaneCodeModeContinuationError("phase_consumer_invalid")
         return overrides
     if phase != "post_search":
         raise PlaneCodeModeContinuationError("phase_consume_invalid")

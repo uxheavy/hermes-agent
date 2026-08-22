@@ -926,6 +926,7 @@ class PlaneHostBinding:
     _catalog_describe_discovered: bool = field(default=False, init=False, repr=False)
     _code_mode_phase_hint: str | None = field(default=None, init=False, repr=False)
     _code_mode_continuation_used: bool = field(default=False, init=False, repr=False)
+    _code_mode_phase_claimed: bool = field(default=False, init=False, repr=False)
     _outcome_submission_ref: str | None = field(default=None, init=False, repr=False)
     _outcome_publication_metadata: dict[str, Any] | None = field(
         default=None, init=False, repr=False
@@ -1003,6 +1004,28 @@ class PlaneHostBinding:
                 self._code_mode_phase_hint = None
                 self._code_mode_continuation_used = True
             return phase
+
+    def consume_code_mode_phase(self, *, tool_available: bool) -> str | None:
+        """Atomically claim one trusted Code Mode continuation request."""
+
+        with self._lock:
+            if type(tool_available) is not bool:
+                self._fail("Plane Code Mode continuation state is invalid")
+                raise PlaneHostError("Plane Code Mode continuation state is invalid")
+            if self._code_mode_phase_hint is None:
+                if self._code_mode_phase_claimed:
+                    self._fail("Plane Code Mode continuation state is invalid")
+                    raise PlaneHostError("Plane Code Mode continuation state is invalid")
+                return None
+            if self._code_mode_phase_hint != "post_search" or self._code_mode_phase_claimed:
+                self._fail("Plane Code Mode continuation state is invalid")
+                raise PlaneHostError("Plane Code Mode continuation state is invalid")
+            if not tool_available:
+                self._fail("Plane Code Mode continuation tool is unavailable")
+                raise PlaneHostError("Plane Code Mode continuation tool is unavailable")
+            self._code_mode_phase_claimed = True
+            self._code_mode_continuation_used = True
+            return self._code_mode_phase_hint
 
     def outcome_publication_metadata(self) -> dict[str, Any] | None:
         """Return the last validated outcome publication's bounded facts."""
@@ -1310,6 +1333,10 @@ class PlaneHostBinding:
                 )
                 self._fail("Plane host callback failed")
                 raise PlaneHostUnavailable("Plane host callback failed") from exc
+            finally:
+                if action == "code":
+                    self._code_mode_phase_hint = None
+                    self._code_mode_phase_claimed = False
             self._set_callback_phase("host_return", request)
             self._set_code_mode_diagnostic(
                 request, status=result.status, error_code=result.error_code
@@ -1430,6 +1457,7 @@ class PlaneHostBinding:
                         result = replace(result, output=combined_output)
                 with self._lock:
                     self._code_mode_phase_hint = None
+                    self._code_mode_phase_claimed = False
                     should_arm = (
                         operation_ref == PLANE_CODE_MODE_EXECUTE_OPERATION
                         and result.status in {"ok", "replayed"}

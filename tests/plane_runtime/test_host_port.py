@@ -1455,6 +1455,84 @@ print("text_response")
         )
         self.assertIsNone(binding.code_mode_phase_hint())
 
+    def test_code_mode_claim_is_atomic_and_duplicate_or_missing_tool_fails_closed(self) -> None:
+        calls: list[dict] = []
+        binding = PlaneHostBinding(
+            port=CallablePlaneHostPort(
+                lambda request: calls.append(request) or _result(request)
+            ),
+            run_id="run:claim",
+            invocation_id="invocation:claim",
+            correlation_id="correlation:claim",
+            cancellation=lambda: False,
+            code_mode_phase="post_search",
+        )
+        binding._code_mode_phase_hint = "post_search"
+
+        self.assertEqual(binding.consume_code_mode_phase(tool_available=True), "post_search")
+        with self.assertRaises(PlaneHostError):
+            binding.consume_code_mode_phase(tool_available=True)
+        self.assertEqual(calls, [])
+
+        missing_tool = PlaneHostBinding(
+            port=CallablePlaneHostPort(
+                lambda request: calls.append(request) or _result(request)
+            ),
+            run_id="run:missing-tool",
+            invocation_id="invocation:missing-tool",
+            correlation_id="correlation:missing-tool",
+            cancellation=lambda: False,
+            code_mode_phase="post_search",
+        )
+        missing_tool._code_mode_phase_hint = "post_search"
+        with self.assertRaises(PlaneHostError):
+            missing_tool.consume_code_mode_phase(tool_available=False)
+        self.assertEqual(calls, [])
+
+    def test_code_mode_claim_clears_after_callback_success(self) -> None:
+        binding = PlaneHostBinding(
+            port=CallablePlaneHostPort(lambda request: _result(request)),
+            run_id="run:claim-success",
+            invocation_id="invocation:claim-success",
+            correlation_id="correlation:claim-success",
+            cancellation=lambda: False,
+            code_mode_phase="post_search",
+        )
+        binding._code_mode_phase_hint = "post_search"
+        self.assertEqual(binding.consume_code_mode_phase(tool_available=True), "post_search")
+        binding.call(
+            action="code",
+            operation_ref="plane.code-mode.execute@1",
+            input={"source": "return 1"},
+            source="code",
+        )
+        self.assertIsNone(binding.code_mode_phase_hint())
+        self.assertFalse(binding._code_mode_phase_claimed)
+
+    def test_code_mode_claim_clears_after_callback_failure(self) -> None:
+        def fail(_request: dict) -> dict:
+            raise RuntimeError("callback failed")
+
+        binding = PlaneHostBinding(
+            port=CallablePlaneHostPort(fail),
+            run_id="run:claim-failure",
+            invocation_id="invocation:claim-failure",
+            correlation_id="correlation:claim-failure",
+            cancellation=lambda: False,
+            code_mode_phase="post_search",
+        )
+        binding._code_mode_phase_hint = "post_search"
+        self.assertEqual(binding.consume_code_mode_phase(tool_available=True), "post_search")
+        with self.assertRaises(PlaneHostUnavailable):
+            binding.call(
+                action="code",
+                operation_ref="plane.code-mode.execute@1",
+                input={"source": "return 1"},
+                source="code",
+            )
+        self.assertIsNone(binding.code_mode_phase_hint())
+        self.assertFalse(binding._code_mode_phase_claimed)
+
     def test_code_mode_search_result_auto_consumes_one_prepared_read(self) -> None:
         def respond(request: dict) -> dict:
             if request["action"] == "code":
