@@ -80,7 +80,7 @@ def build_model_guidance(snapshot: G1RunSnapshot) -> str:
         ],
     }
     if snapshot.standard_route is not None:
-        assignment["standardRoute"] = snapshot.standard_route
+        assignment["standardRoute"] = _plain(snapshot.standard_route)
     compact_assignment = json.dumps(
         assignment,
         ensure_ascii=False,

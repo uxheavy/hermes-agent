@@ -252,6 +252,23 @@ def test_successful_submit_requires_explicit_publish_tool():
     assert _plane_first_tool_tools(agent, [_EXECUTE_TOOL, _PUBLISH_TOOL]) == [_PUBLISH_TOOL]
 
 
+def test_code_mode_ref_recovery_requires_one_named_execute_continuation():
+    agent = SimpleNamespace(
+        request_overrides={},
+        _plane_runtime_code_mode_continuation_required_check=lambda: True,
+    )
+
+    overrides = _plane_standard_request_overrides(
+        agent, [_EXECUTE_TOOL, _PUBLISH_TOOL]
+    )
+
+    assert overrides["tool_choice"] == {
+        "type": "function",
+        "function": {"name": "plane_execute_typescript"},
+    }
+    assert agent._plane_first_required_tool == "plane_execute_typescript"
+
+
 def test_publish_requirement_is_not_created_for_ordinary_plane_or_non_plane_turns():
     for agent in (
         SimpleNamespace(

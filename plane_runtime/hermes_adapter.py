@@ -1303,6 +1303,7 @@ class HermesKernelAdapter:
                 ),
                 standard_route=snapshot.model_toolset == "standard",
                 standard_route_contract=snapshot.standard_route,
+                code_mode_only=snapshot.model_toolset == "code_mode_only",
                 code_mode_phase=(
                     snapshot.code_mode_phase
                     if snapshot.model_name.lower().startswith("gpt-5.6")
@@ -1375,6 +1376,11 @@ class HermesKernelAdapter:
                     agent,
                     "_plane_runtime_outcome_submission_pending_check",
                     host_binding.outcome_submission_pending,
+                )
+                setattr(
+                    agent,
+                    "_plane_runtime_code_mode_continuation_required_check",
+                    host_binding.code_mode_outcome_continuation_required,
                 )
             # Plane's provider allowance is a hard invocation boundary. The
             # interactive Hermes summary fallback would spend an additional

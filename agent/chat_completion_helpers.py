@@ -108,6 +108,17 @@ def _plane_required_tool(agent):
                 return "plane_publish"
         except Exception:
             pass
+    continuation_check = getattr(
+        agent, "_plane_runtime_code_mode_continuation_required_check", None
+    )
+    if callable(continuation_check):
+        try:
+            if continuation_check():
+                setattr(agent, "_plane_first_required_tool", _PLANE_CODE_MODE_TOOL)
+                setattr(agent, "_plane_first_required_tool_retries", 0)
+                return _PLANE_CODE_MODE_TOOL
+        except Exception:
+            pass
     required_check = getattr(agent, "_plane_runtime_required_tool_check", None)
     if callable(required_check):
         try:
@@ -204,7 +215,11 @@ def _plane_standard_request_overrides(agent, tools):
     configured = getattr(agent, "request_overrides", None)
     overrides = dict(configured) if isinstance(configured, dict) else {}
     required = _plane_required_tool(agent)
-    if required in {_PLANE_PREPARED_READ_TOOL, _PLANE_PUBLISH_TOOL}:
+    if required in {
+        _PLANE_CODE_MODE_TOOL,
+        _PLANE_PREPARED_READ_TOOL,
+        _PLANE_PUBLISH_TOOL,
+    }:
         if _plane_first_tool_available(agent, tools):
             overrides["tool_choice"] = {
                 "type": "function",

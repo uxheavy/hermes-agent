@@ -172,6 +172,33 @@ def _applied_outcome_publication(
 
 
 class HostPortTests(unittest.TestCase):
+    def test_code_mode_second_no_ref_fails_closed_without_publish(self) -> None:
+        binding = PlaneHostBinding(
+            port=CallablePlaneHostPort(lambda request: _result(request)),
+            run_id="run:code-mode-no-ref",
+            invocation_id="invocation:code-mode-no-ref",
+            correlation_id="correlation:code-mode-no-ref",
+            cancellation=lambda: False,
+            code_mode_only=True,
+        )
+
+        for _ in range(2):
+            if binding.code_mode_outcome_continuation_required():
+                self.assertFalse(binding.outcome_submission_pending())
+            try:
+                binding.call(
+                    action="code",
+                    operation_ref="plane.code-mode.execute@1",
+                    input={"source": "export default async () => ({})"},
+                    source="code",
+                )
+            except PlaneHostUnavailable:
+                break
+
+        self.assertIsNotNone(binding.fatal_error)
+        self.assertFalse(binding.code_mode_outcome_continuation_required())
+        self.assertEqual(binding.publication_count, 0)
+
     def test_submit_arms_explicit_publish_and_rejected_publish_stays_recoverable(self) -> None:
         def submitted_port(request: dict) -> dict:
             if request["action"] == "code":
@@ -5343,8 +5370,8 @@ print("text_response")
         )
         self.assertFalse(any(body["kind"] == "transcript_evidence_observed" for body in bodies))
 
-    def test_code_mode_requires_first_tool_after_final_text_and_releases_guard(self) -> None:
-        """A final-text first response is recalled before Code Mode can publish."""
+    def test_code_mode_requires_ref_recovery_then_explicit_publish(self) -> None:
+        """A no-ref Code Mode result gets one execute continuation before publish."""
 
         from tests.plane_runtime.test_g1_runtime_process import (
             G1InvocationEnvelope,
@@ -5427,6 +5454,26 @@ print("text_response")
                     tool_calls = [
                         self.tool_call(
                             {
+                                "name": "plane_execute_typescript",
+                                "arguments": {
+                                    "typescript_source": "export default async ({ host }) => ({ accepted: true });"
+                                },
+                            },
+                            "call-code-mode-recovery",
+                        )
+                    ]
+                    message = SimpleNamespace(
+                        content=None,
+                        tool_calls=tool_calls,
+                        reasoning=None,
+                        reasoning_content=None,
+                        refusal=None,
+                    )
+                    finish_reason = "tool_calls"
+                elif self.calls == 4:
+                    tool_calls = [
+                        self.tool_call(
+                            {
                                 "name": "plane_publish",
                                 "arguments": {
                                     "kind": "conversation",
@@ -5483,15 +5530,34 @@ print("text_response")
 
         def rpc(request: dict) -> dict:
             requests.append(request)
+            if request["action"] == "code":
+                if sum(item["action"] == "code" for item in requests) == 1:
+                    return _result(request, output={"accepted": True})
+                return _result(
+                    request,
+                    output={
+                        "observations": [
+                            {
+                                "source": "code",
+                                "action": "code",
+                                "operationRef": PLANE_OUTCOME_SUBMIT_OPERATION,
+                                "status": "ok",
+                            }
+                        ],
+                        "result": {
+                            "result": {
+                                "outcome": {"outcomeRef": "outcome-submission:test"}
+                            }
+                        },
+                    },
+                )
             if request["action"] == "publish":
-                publication = _applied_outcome_publication(
-                    operation_ref="operation:conversation-publish"
+                return _result(
+                    request,
+                    output={"published": True},
+                    publication=_applied_outcome_publication(),
                 )
-                publication.update(
-                    productKind="conversation", productRef="conversation:test"
-                )
-                return _result(request, output={"published": True}, publication=publication)
-            return _result(request, output={"accepted": True})
+            raise AssertionError(request)
 
         with mock.patch.dict(os.environ, {"HERMES_HOME": _TEST_HERMES_HOME.name}):
             import run_agent
@@ -5511,9 +5577,20 @@ print("text_response")
 
         self.assertEqual(result.kind, "completed", result)
         self.assertEqual(
-            [request["action"] for request in requests], ["code", "publish"]
+            [request["action"] for request in requests], ["code", "code", "publish"]
         )
-        self.assertEqual(completions.tool_choices, [None, None, None, None])
+        execute_choice = {
+            "type": "function",
+            "function": {"name": "plane_execute_typescript"},
+        }
+        publish_choice = {
+            "type": "function",
+            "function": {"name": "plane_publish"},
+        }
+        self.assertEqual(
+            completions.tool_choices,
+            [execute_choice, execute_choice, execute_choice, publish_choice],
+        )
 
     def test_code_mode_fails_closed_when_first_tool_is_not_registered(self) -> None:
         from tests.plane_runtime.test_g1_runtime_process import (

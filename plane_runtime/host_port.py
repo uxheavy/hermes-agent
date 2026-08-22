@@ -1033,6 +1033,7 @@ class PlaneHostBinding:
     eager_operation_refs: frozenset[str] = field(default_factory=frozenset)
     standard_route: bool = False
     standard_route_contract: Mapping[str, Any] | None = None
+    code_mode_only: bool = False
     max_calls: int = MAX_HOST_CALLS
     records: list[HostCallRecord] = field(default_factory=list)
     code_mode_phase: str = "none"
@@ -1058,6 +1059,7 @@ class PlaneHostBinding:
     _code_mode_phase_hint: str | None = field(default=None, init=False, repr=False)
     _code_mode_continuation_used: bool = field(default=False, init=False, repr=False)
     _code_mode_phase_claimed: bool = field(default=False, init=False, repr=False)
+    _code_mode_outcome_continuation_pending: bool = field(default=False, init=False, repr=False)
     _outcome_submission_ref: str | None = field(default=None, init=False, repr=False)
     _outcome_publication_metadata: dict[str, Any] | None = field(
         default=None, init=False, repr=False
@@ -1263,6 +1265,12 @@ class PlaneHostBinding:
 
         with self._lock:
             return self._outcome_submission_ref is not None and self._terminal_action_reason is None
+
+    def code_mode_outcome_continuation_required(self) -> bool:
+        """Return whether the one allowed ref-recovery Code Mode call is armed."""
+
+        with self._lock:
+            return self._code_mode_outcome_continuation_pending
 
     def outcome_submission_ref(self) -> str | None:
         """Return the trusted outcome ref bound by this invocation's submit."""
@@ -1682,6 +1690,17 @@ class PlaneHostBinding:
                 outcome_ref = _outcome_ref_from_code_mode_result(result.output)
                 if outcome_ref is not None:
                     self._bind_outcome_submission_ref(outcome_ref)
+                    self._code_mode_outcome_continuation_pending = False
+                elif self.code_mode_only:
+                    if self._code_mode_outcome_continuation_pending:
+                        self._code_mode_outcome_continuation_pending = False
+                        self._fail(
+                            "Code Mode produced no trusted outcome ref after one continuation"
+                        )
+                        raise PlaneHostUnavailable(
+                            "Code Mode produced no trusted outcome ref after one continuation"
+                        )
+                    self._code_mode_outcome_continuation_pending = True
             prepared_ref: str | None = None
             if (
                 operation_ref == "operation:search_workspace"
