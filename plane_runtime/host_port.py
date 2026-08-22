@@ -1725,7 +1725,7 @@ class PlaneHostBinding:
                 self._catalog_describe_discovered = True
             self._emit_call_observation(request, result)
             try:
-                self._observe_publication(request, result)
+                result = self._observe_publication(request, result)
             except Exception:
                 self._set_callback_phase("adapter_event")
                 raise
@@ -1980,7 +1980,7 @@ class PlaneHostBinding:
 
     def _observe_publication(
         self, request: HostCallRequest, result: HostCallResult
-    ) -> None:
+    ) -> HostCallResult:
         """Observe the versioned publication receipt from every host route."""
 
         if request.action == "publish":
@@ -1997,10 +1997,10 @@ class PlaneHostBinding:
                 resource_ref = request.input.get("resourceRef")
             content = request.input.get("content")
         else:
-            return
+            return result
 
         if result.status not in {"ok", "replayed"}:
-            return
+            return result
         publication = result.publication
         if (
             publication is None
@@ -2022,7 +2022,7 @@ class PlaneHostBinding:
             if request.action == "publish" or result.status == "ok":
                 self._fail("publication has no gateway publication receipt")
                 raise PlaneHostUnavailable("publication has no gateway publication receipt")
-            return
+            return result
 
         try:
             resource_ref = _text(resource_ref, "publication.resourceRef", 256)
@@ -2042,6 +2042,10 @@ class PlaneHostBinding:
         except PlaneHostError as exc:
             self._fail(str(exc) or "publication receipt was invalid")
             raise PlaneHostUnavailable("publication receipt was invalid") from exc
+
+        result = replace(result, publication=publication)
+        if self.records and self.records[-1].request == request:
+            self.records[-1] = HostCallRecord(request, result)
 
         with self._lock:
             if request.operation_ref == PLANE_OUTCOME_PUBLISH_OPERATION and kind == "outcome":
@@ -2090,6 +2094,7 @@ class PlaneHostBinding:
                     raise PlaneHostUnavailable(
                         "Plane publication observation could not be emitted"
                     ) from exc
+        return result
 
     def _emit_call_observation(
         self, request: HostCallRequest, result: HostCallResult

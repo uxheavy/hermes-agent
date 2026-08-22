@@ -6534,7 +6534,7 @@ def run_conversation(
                 # an empty tool_calls array — is handled at the finalization
                 # chokepoint below, after final_msg is built, so it catches
                 # every path that reaches turn finalization, not just this one.)
-                required_first_tool = getattr(agent, "_plane_first_required_tool", None)
+                required_first_tool = _plane_required_tool(agent)
                 if isinstance(required_first_tool, str) and required_first_tool:
                     retries = int(getattr(agent, "_plane_first_required_tool_retries", 0))
                     if retries < _PLANE_FIRST_REQUIRED_TOOL_MAX_RECALLS:

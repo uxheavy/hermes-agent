@@ -6,6 +6,7 @@ from agent.chat_completion_helpers import (
     PlaneCodeModeContinuationError,
     _plane_codex_request_overrides,
     _plane_first_tool_tools,
+    _plane_required_tool,
     _plane_standard_request_overrides,
 )
 from agent.transports import get_transport
@@ -106,6 +107,31 @@ def test_standard_route_required_tool_callback_reuses_first_tool_redirect():
         "function": {"name": "plane_operation"},
     }
     assert agent._plane_first_required_tool == "plane_operation"
+
+
+def test_code_mode_initial_request_requires_existing_execute_tool():
+    agent = SimpleNamespace(
+        request_overrides={},
+        _plane_first_required_tool="plane_execute_typescript",
+    )
+
+    overrides = _plane_standard_request_overrides(
+        agent, [_EXECUTE_TOOL, _PUBLISH_TOOL]
+    )
+
+    assert overrides["tool_choice"] == {
+        "type": "function",
+        "function": {"name": "plane_execute_typescript"},
+    }
+
+
+def test_code_mode_continuation_resolves_existing_execute_latch_before_text_exit():
+    agent = SimpleNamespace(
+        _plane_runtime_code_mode_continuation_required_check=lambda: True,
+    )
+
+    assert _plane_required_tool(agent) == "plane_execute_typescript"
+    assert agent._plane_first_required_tool == "plane_execute_typescript"
 
 
 def test_standard_route_unavailable_tool_clears_required_latch():

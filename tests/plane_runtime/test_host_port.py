@@ -2892,6 +2892,7 @@ print("text_response")
         )
 
         self.assertIs(dedicated, generic)
+        self.assertEqual(generic.publication, bodies[2]["publication"])
         self.assertEqual(len(calls), 2)
         self.assertEqual(binding.terminal_action_reason(), "product_outcome_published")
         self.assertIsNone(binding.fatal_error)
@@ -5407,6 +5408,7 @@ print("text_response")
             def __init__(self) -> None:
                 self.calls = 0
                 self.tool_choices: list[object] = []
+                self.visible_tools: list[object] = []
 
             @staticmethod
             def tool_call(arguments: dict[str, object], call_id: str):
@@ -5421,6 +5423,7 @@ print("text_response")
             def create(self, **kwargs: object):
                 self.calls += 1
                 self.tool_choices.append(kwargs.get("tool_choice"))
+                self.visible_tools.append(kwargs.get("tools"))
                 if self.calls == 1:
                     message = SimpleNamespace(
                         content="ordinary final text before the required action",
@@ -5590,6 +5593,13 @@ print("text_response")
         self.assertEqual(
             completions.tool_choices,
             [execute_choice, execute_choice, execute_choice, publish_choice],
+        )
+        self.assertEqual(
+            [
+                [tool["function"]["name"] for tool in tools]  # type: ignore[index]
+                for tools in completions.visible_tools
+            ],
+            [["plane_execute_typescript"]] * 3 + [["plane_publish"]],
         )
 
     def test_code_mode_fails_closed_when_first_tool_is_not_registered(self) -> None:

@@ -1428,6 +1428,10 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
         )
 
     # ── chat_completions (default) ─────────────────────────────────────
+    # Keep the existing first-tool latch authoritative on OpenAI-compatible
+    # routes too; otherwise a provider that ignores a named choice can spend
+    # another text turn before the commissioned Plane action.
+    tools_for_api = _plane_first_tool_tools(agent, tools_for_api)
     _ct = agent._get_transport()
 
     # Provider detection flags
