@@ -135,6 +135,12 @@ def test_code_mode_continuation_resolves_existing_execute_latch_before_text_exit
     assert agent._plane_first_required_tool == "plane_execute_typescript"
 
 
+def test_conversation_loop_uses_the_shared_plane_required_tool_helper():
+    from agent import conversation_loop
+
+    assert conversation_loop._plane_required_tool is _plane_required_tool
+
+
 def test_standard_route_unavailable_tool_clears_required_latch():
     agent = SimpleNamespace(
         request_overrides={},

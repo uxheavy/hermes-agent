@@ -25,6 +25,7 @@ import ssl
 import time
 from typing import Any, Dict, List, Optional
 
+from agent.chat_completion_helpers import _plane_required_tool
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.conversation_compression import (
     COMPRESSION_RETRY_CONTEXT_REDUCED_STATUS_TEMPLATE,
