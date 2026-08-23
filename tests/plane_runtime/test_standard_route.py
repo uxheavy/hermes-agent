@@ -255,6 +255,39 @@ def test_standard_route_replays_only_a_completed_workspace_search():
     ]
 
 
+def test_standard_route_advances_search_when_no_read_step_follows():
+    route = {
+        "schemaVersion": "plane.standard-route/v1",
+        "steps": [
+            {"operationRef": "operation:search_workspace"},
+            {"operationRef": "operation:agent.outcome.submit"},
+        ],
+    }
+    requests = []
+
+    def respond(request):
+        requests.append(request)
+        return _result(request, output={"result": {"results": []}})
+
+    binding = PlaneHostBinding(
+        port=CallablePlaneHostPort(respond),
+        run_id="run:search-submit",
+        invocation_id="invocation:search-submit",
+        correlation_id="correlation:search-submit",
+        cancellation=lambda: False,
+        standard_route=True,
+        standard_route_contract=route,
+        eager_operation_refs=frozenset(step["operationRef"] for step in route["steps"]),
+    )
+
+    first = binding.call(action="read", operation_ref="operation:search_workspace", input={}, source="model")
+    repeated = binding.call(action="read", operation_ref="operation:search_workspace", input={}, source="model")
+
+    assert first.status == "ok"
+    assert repeated.status == "replayed"
+    assert len(requests) == 1
+
+
 def test_standard_route_can_narrow_result_too_large_search():
     route = {
         "schemaVersion": "plane.standard-route/v1",

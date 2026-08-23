@@ -1273,7 +1273,13 @@ class PlaneHostBinding:
         accepted = result.status in {"ok", "replayed"}
         if expected_status is not None:
             accepted = result.status == expected_status and result.error_code == expected_error
-        if accepted and expected_ref == "operation:search_workspace":
+        next_step_requires_read = (
+            self._standard_route_index + 1 < len(self._standard_route_steps)
+            and self._standard_route_steps[self._standard_route_index + 1][0]
+            == "operation:work_item.read"
+            and not self._standard_route_steps[self._standard_route_index + 1][1]
+        )
+        if accepted and expected_ref == "operation:search_workspace" and next_step_requires_read:
             prepared_refs = _prepared_read_refs_from_search_result(result.output)
             if (
                 len(prepared_refs) != 1
@@ -1540,7 +1546,6 @@ class PlaneHostBinding:
             and request.operation_ref == "operation:search_workspace"
             and self._standard_route_steps
             and self._standard_route_index > 0
-            and self._prepared_read_completion is not None
             and not self._prepared_read_handoff_pending
             and not (
                 self._standard_route_index < len(self._standard_route_steps)
