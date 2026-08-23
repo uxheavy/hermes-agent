@@ -27,6 +27,8 @@ from .hermes_adapter import (
     HermesKernelResult,
     HermesCredentialSource,
     NeverCancelled,
+    _classify_runtime_exception,
+    _runtime_child_diagnostic,
 )
 from .host_port import PlaneHostPort
 
@@ -115,6 +117,7 @@ def _failure_result(
     failure_cause: str | None = None,
     runtime_phase: str | None = None,
     exception_class: str | None = None,
+    child_diagnostic: Mapping[str, str] | None = None,
 ) -> HermesKernelResult:
     return HermesKernelResult(
         kind="failed",
@@ -124,6 +127,7 @@ def _failure_result(
         retryable=retryable,
         runtime_phase=runtime_phase,
         exception_class=exception_class,
+        child_diagnostic=child_diagnostic,
     )
 
 
@@ -259,6 +263,8 @@ def serve_once_g1(
                 if exception_class in RUNTIME_FAILURE_EXCEPTION_CLASSES
                 else "Unknown"
             ),
+            failure_cause=_classify_runtime_exception(exc),
+            child_diagnostic=_runtime_child_diagnostic(exc, "unknown"),
         )
 
     if result.kind == "completed":

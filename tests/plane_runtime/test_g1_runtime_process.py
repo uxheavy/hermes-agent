@@ -329,8 +329,15 @@ class G1RuntimeProcessTests(unittest.TestCase):
                 "code": "runtime_error",
                 "message": "Hermes runtime execution failed",
                 "retryable": True,
+                "cause": "runtime_unknown_failure",
                 "runtimePhase": "unknown",
                 "exceptionClass": "TypeError",
+                "childDiagnostic": {
+                    "exceptionModule": "builtins",
+                    "exceptionClass": "TypeError",
+                    "runtimePhase": "unknown",
+                    "originToken": "unknown",
+                },
             },
         )
         self.assertNotIn("private post-processing failure", output.getvalue())
