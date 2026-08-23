@@ -24,7 +24,9 @@ from .g1_contract import (
     MAX_PROMPT_BYTES,
     MAX_TEXT_BYTES,
     RUNTIME_FAILURE_EXCEPTION_CLASSES,
+    RUNTIME_FAILURE_EXCEPTION_MODULES,
     RUNTIME_FAILURE_PHASES,
+    RUNTIME_FAILURE_ORIGIN_TOKENS,
     RUNTIME_FAILURE_CAUSES,
 )
 from .host_port import (
@@ -243,6 +245,34 @@ def _runtime_exception_class(exception: BaseException) -> str:
 
     name = type(exception).__name__
     return name if name in RUNTIME_FAILURE_EXCEPTION_CLASSES else "Unknown"
+
+
+def _runtime_child_diagnostic(
+    exception: BaseException, runtime_phase: str
+) -> Mapping[str, str]:
+    """Keep only finite child-origin facts from the adapter catch seam."""
+
+    origin_token = {
+        "agent_initialization": "agent_factory",
+        "tool_configuration": "tool_configuration",
+        "conversation": "run_conversation",
+    }.get(runtime_phase, "unknown")
+    return {
+        "exceptionModule": (
+            type(exception).__module__
+            if type(exception).__module__ in RUNTIME_FAILURE_EXCEPTION_MODULES
+            else "Unknown"
+        ),
+        "exceptionClass": _runtime_exception_class(exception),
+        "runtimePhase": (
+            runtime_phase if runtime_phase in RUNTIME_FAILURE_PHASES else "unknown"
+        ),
+        "originToken": (
+            origin_token
+            if origin_token in RUNTIME_FAILURE_ORIGIN_TOKENS
+            else "unknown"
+        ),
+    }
 
 
 _STRUCTURED_FAILURE_EXCEPTION_CLASSES = MappingProxyType(
@@ -792,6 +822,7 @@ class HermesKernelResult:
     host_operation_diagnostic: Mapping[str, Any] | None = None
     runtime_phase: str | None = None
     exception_class: str | None = None
+    child_diagnostic: Mapping[str, str] | None = None
 
 
 def _host_operation_failure_message(
@@ -1553,6 +1584,7 @@ class HermesKernelAdapter:
                     else "unknown"
                 ),
                 exception_class=_runtime_exception_class(exc),
+                child_diagnostic=_runtime_child_diagnostic(exc, runtime_phase),
             )
 
         if cancellation_monitor is not None:

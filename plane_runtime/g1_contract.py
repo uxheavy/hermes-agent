@@ -50,6 +50,10 @@ RUNTIME_FAILURE_EXCEPTION_CLASSES = frozenset(
         "Unknown",
     }
 )
+RUNTIME_FAILURE_EXCEPTION_MODULES = frozenset({"Unknown", "builtins", "httpx", "openai"})
+RUNTIME_FAILURE_ORIGIN_TOKENS = frozenset(
+    {"agent_factory", "tool_configuration", "run_conversation", "unknown"}
+)
 
 # Frozen bytes from the paired Plane G1 runtime contract manifest.
 G1_CONTRACT_DIGESTS = {
@@ -856,6 +860,7 @@ def _validate_failure(value: Any, name: str = "failure") -> dict[str, Any]:
             "codeModeFailureClass",
             "runtimePhase",
             "exceptionClass",
+            "childDiagnostic",
             "socketPhase",
             "socketState",
             "preparedHandoff",
@@ -913,6 +918,26 @@ def _validate_failure(value: Any, name: str = "failure") -> dict[str, Any]:
         or data["exceptionClass"] not in RUNTIME_FAILURE_EXCEPTION_CLASSES
     ):
         raise G1ContractError(f"{name} runtime diagnostic fields are invalid")
+    if "childDiagnostic" in data:
+        child = _object(data["childDiagnostic"], f"{name}.childDiagnostic")
+        _reject_unknown(
+            child,
+            {"exceptionModule", "exceptionClass", "runtimePhase", "originToken"},
+            f"{name}.childDiagnostic",
+        )
+        _required(
+            child,
+            {"exceptionModule", "exceptionClass", "runtimePhase", "originToken"},
+            f"{name}.childDiagnostic",
+        )
+        if (
+            any(not isinstance(child[key], str) for key in child)
+            or child["exceptionModule"] not in RUNTIME_FAILURE_EXCEPTION_MODULES
+            or child["exceptionClass"] not in RUNTIME_FAILURE_EXCEPTION_CLASSES
+            or child["runtimePhase"] not in RUNTIME_FAILURE_PHASES
+            or child["originToken"] not in RUNTIME_FAILURE_ORIGIN_TOKENS
+        ):
+            raise G1ContractError(f"{name}.childDiagnostic is invalid")
     _text(data["message"], f"{name}.message")
     return data
 

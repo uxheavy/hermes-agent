@@ -5,13 +5,15 @@ from __future__ import annotations
 import hashlib
 import json
 from datetime import datetime, timezone
-from typing import Any, Callable, TextIO
+from typing import Any, Callable, Mapping, TextIO
 
 from .g1_contract import (
     G1ContractError,
     G1InvocationEnvelope,
     G1RunSnapshot,
     RUNTIME_FAILURE_EXCEPTION_CLASSES,
+    RUNTIME_FAILURE_EXCEPTION_MODULES,
+    RUNTIME_FAILURE_ORIGIN_TOKENS,
     RUNTIME_FAILURE_PHASES,
     _bounded_host_operation_diagnostic,
     bind_snapshot_and_invocation,
@@ -44,6 +46,29 @@ def _bounded_runtime_failure_diagnostic(
         "runtimePhase": result.runtime_phase,
         "exceptionClass": result.exception_class,
     }
+
+
+def _bounded_child_diagnostic(
+    result: HermesKernelResult,
+) -> dict[str, dict[str, str]] | None:
+    diagnostic = result.child_diagnostic
+    if not isinstance(diagnostic, Mapping) or set(diagnostic) != {
+        "exceptionModule",
+        "exceptionClass",
+        "runtimePhase",
+        "originToken",
+    }:
+        return None
+    values = tuple(diagnostic.values())
+    if (
+        any(not isinstance(value, str) for value in values)
+        or diagnostic["exceptionModule"] not in RUNTIME_FAILURE_EXCEPTION_MODULES
+        or diagnostic["exceptionClass"] not in RUNTIME_FAILURE_EXCEPTION_CLASSES
+        or diagnostic["runtimePhase"] not in RUNTIME_FAILURE_PHASES
+        or diagnostic["originToken"] not in RUNTIME_FAILURE_ORIGIN_TOKENS
+    ):
+        return None
+    return {"childDiagnostic": dict(diagnostic)}
 
 
 def _write_model_usage(diagnostics: TextIO | None, model_calls: int | None) -> None:
@@ -133,6 +158,9 @@ def _terminal_failure(
     runtime_diagnostic = _bounded_runtime_failure_diagnostic(result)
     if runtime_diagnostic is not None:
         failure.update(runtime_diagnostic)
+    child_diagnostic = _bounded_child_diagnostic(result)
+    if child_diagnostic is not None:
+        failure.update(child_diagnostic)
     return build_exit(
         snapshot=snapshot,
         invocation=invocation,

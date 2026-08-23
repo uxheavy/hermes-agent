@@ -897,6 +897,7 @@ class G1RuntimeProcessTests(unittest.TestCase):
         ).dispatch(snapshot, invocation, lambda: False, bodies.append, model_call_allowance=3)
 
         self.assertEqual(result.kind, "completed")
+        self.assertIsNone(result.child_diagnostic)
         self.assertNotIn("top-secret-value", result.output_text)
         self.assertLessEqual(len(result.output_text.encode("utf-8")), 4096)
         self.assertEqual(captured["kwargs"]["enabled_toolsets"], ["safe"])  # type: ignore[index]

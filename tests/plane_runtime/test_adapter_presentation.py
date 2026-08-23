@@ -16,6 +16,7 @@ from plane_runtime.hermes_adapter import (
     _classify_runtime_exception,
 )
 from plane_runtime.host_port import CallablePlaneHostPort, current_plane_host
+from plane_runtime.g1_service import _terminal_failure
 from tests.plane_runtime.test_g1_runtime_process import _digest, make_invocation, make_snapshot
 from tools.registry import registry
 
@@ -273,7 +274,7 @@ class AdapterPresentationTests(unittest.TestCase):
                 self._plane_runtime_diagnostics["responses"].append(
                     {"sequence": 1, "responseClass": "text_response", "toolCall": "none"}
                 )
-                raise AssertionError("private conversation detail")
+                raise RuntimeError("private conversation detail")
 
         class Credentials:
             def resolve(self, provider: str) -> dict[str, str]:
@@ -289,7 +290,22 @@ class AdapterPresentationTests(unittest.TestCase):
 
         self.assertEqual(result.failure_cause, "runtime_unknown_failure")
         self.assertEqual(result.runtime_phase, "conversation")
-        self.assertEqual(result.exception_class, "Unknown")
+        self.assertEqual(result.exception_class, "RuntimeError")
+        self.assertEqual(
+            result.child_diagnostic,
+            {
+                "exceptionModule": "builtins",
+                "exceptionClass": "RuntimeError",
+                "runtimePhase": "conversation",
+                "originToken": "run_conversation",
+            },
+        )
+        exit_frame = _terminal_failure(snapshot, invocation, result, 0)
+        self.assertEqual(
+            exit_frame["failure"]["childDiagnostic"],
+            result.child_diagnostic,
+        )
+        self.assertNotIn("private conversation detail", json.dumps(exit_frame))
         diagnostics = [
             body["payload"]
             for body in bodies
