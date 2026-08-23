@@ -1360,6 +1360,9 @@ class HermesKernelAdapter:
             provider_outcome_unknown_latch.bind(host_binding.mark_outcome_unknown)
         try:
             agent = self._agent_factory(**agent_kwargs)
+            from agent.chat_completion_helpers import _reset_stale_streak
+
+            _reset_stale_streak(agent)
             runtime_phase = "tool_configuration"
             _restrict_plane_code_mode_tools(agent, snapshot)
             first_required_tool = _plane_first_required_tool(snapshot)

@@ -645,6 +645,48 @@ def test_default_adapter_factory_passes_openai_codex_identity_and_transport() ->
     assert captured["http_client_factory"] is factory
 
 
+def test_plane_dispatch_clears_stale_breaker_before_first_call(monkeypatch) -> None:
+    from agent.chat_completion_helpers import _check_stale_giveup
+
+    monkeypatch.setenv("HERMES_STREAM_STALE_GIVEUP", "5")
+    snapshot, _invocation, _request = _hermes_request()
+    snapshot_model = G1RunSnapshot.from_dict(snapshot)
+    invocation_model = G1InvocationEnvelope.from_dict(make_invocation(snapshot_model.to_dict()))
+    observed: list[int] = []
+
+    class FakeAgent:
+        session_api_calls = 0
+        session_input_tokens = 0
+        session_output_tokens = 0
+        _consecutive_stale_streams = 5
+
+        def run_conversation(self, message: str, *, system_message: str) -> dict[str, str]:
+            del message, system_message
+            _check_stale_giveup(self)
+            observed.append(self._consecutive_stale_streams)
+            return {"final_response": "done"}
+
+    with mock.patch.dict(
+        sys.modules,
+        {"run_agent": types.SimpleNamespace(AIAgent=lambda **_kwargs: FakeAgent())},
+    ):
+        result = HermesKernelAdapter(
+            credential_source=InlineCredentialSource(
+                {"api_key": "plane-provider-relay", "api_mode": "chat_completions"},
+                "xai",
+            )
+        ).dispatch(
+            snapshot_model,
+            invocation_model,
+            lambda: False,
+            lambda _body: None,
+            model_call_allowance=1,
+        )
+
+    assert result.kind == "completed"
+    assert observed == [0]
+
+
 def test_provider_relay_rejects_missing_or_invalid_socket() -> None:
     credentials = _relay_credentials("/tmp/provider-relay.sock")
 
