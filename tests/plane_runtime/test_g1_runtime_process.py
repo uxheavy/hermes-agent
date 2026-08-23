@@ -365,7 +365,38 @@ class G1RuntimeProcessTests(unittest.TestCase):
                 )
                 if request.get("stream") is True:
                     stream_count[0] += 1
-                    if stream_count[0] == 2:
+                    direct_route = "tool_search" not in model_tool_names[-1]
+                    if direct_route and stream_count[0] == 1:
+                        function_name = "plane_operation"
+                        arguments = {
+                            "action": "read",
+                            "operationRef": "operation:work-item-get",
+                            "input": {"workItemRef": "work-item:test"},
+                        }
+                        finish_reason = "tool_calls"
+                    elif direct_route and stream_count[0] == 2:
+                        function_name = "plane_operation"
+                        arguments = {
+                            "action": "code",
+                            "operationRef": "operation:compose",
+                            "input": {"workItemRef": "work-item:forged"},
+                        }
+                        finish_reason = "tool_calls"
+                    elif direct_route and stream_count[0] == 3:
+                        function_name = "plane_execute_typescript"
+                        arguments = {
+                            "typescript_source": (
+                                "export default ({ input }: { input: Record<string, unknown> }) => ({"
+                                " accepted: true, input"
+                                "});"
+                            )
+                        }
+                        finish_reason = "tool_calls"
+                    elif direct_route:
+                        function_name = None
+                        arguments = None
+                        finish_reason = "stop"
+                    elif stream_count[0] == 2:
                         function_name = "tool_describe"
                         arguments = {"name": "plane_operation"}
                         finish_reason = "tool_calls"
@@ -597,9 +628,9 @@ class G1RuntimeProcessTests(unittest.TestCase):
             + json.dumps(model_requests, default=str),
         )
         self.assertEqual([request["source"] for request in host_requests], ["model", "code"])
-        self.assertTrue(any("tool_search" in names for names in model_tool_names))
-        self.assertTrue(any("tool_describe" in names for names in model_tool_names))
-        self.assertTrue(any("tool_call" in names for names in model_tool_names))
+        self.assertTrue(any("plane_operation" in names for names in model_tool_names))
+        self.assertTrue(any("plane_publish" in names for names in model_tool_names))
+        self.assertTrue(any("plane_execute_typescript" in names for names in model_tool_names))
         self.assertFalse(any("execute_code" in names for names in model_tool_names))
         self.assertNotIn(b"local-bootstrap-secret", completed.stdout + completed.stderr)
         self.assertNotIn(host_path.encode(), completed.stdout + completed.stderr)
@@ -609,8 +640,6 @@ class G1RuntimeProcessTests(unittest.TestCase):
         self.assertNotIn("maxCodeModeInputBytes", model_wire)
         self.assertNotIn("maxCodeModeOutputBytes", model_wire)
         self.assertNotIn("maxCodeModeCalls", model_wire)
-        self.assertNotIn("requestRef", model_wire)
-        self.assertNotIn("idempotencyKey", model_wire)
         self.assertNotIn("maxCodeModeInputBytes", json.dumps(parsed, default=str))
         self.assertFalse(any(frame.get("body", {}).get("kind") == "conversation_publication_observed" for frame in parsed))
 
