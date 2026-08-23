@@ -1776,6 +1776,39 @@ class G1RuntimeProcessTests(unittest.TestCase):
         self.assertEqual(budget_result.failure_code, "budget_exhausted")
         self.assertIsNone(budget_result.failure_cause)
 
+    def test_generic_runtime_error_classification_uses_only_traceback_module(self) -> None:
+        from plane_runtime.hermes_adapter import _classify_runtime_exception
+
+        def raised_from(module: str) -> RuntimeError:
+            namespace = {"__name__": module}
+            exec(
+                "def outer():\n"
+                "    def inner():\n"
+                "        raise RuntimeError()\n"
+                "    inner()\n",
+                namespace,
+            )
+            try:
+                namespace["outer"]()
+            except RuntimeError as exception:
+                return exception
+            raise AssertionError("expected RuntimeError")
+
+        cases = (
+            ("agent.relay_runtime", "relay_session_failure"),
+            ("agent.relay_llm", "relay_session_failure"),
+            ("agent.relay_tools", "relay_session_failure"),
+            ("agent.agent_init", "provider_client_failure"),
+            ("agent.codex_runtime", "provider_client_failure"),
+            ("agent.codex_responses_adapter", "provider_client_failure"),
+            ("agent.account_usage", "provider_client_failure"),
+            ("run_agent", "provider_client_failure"),
+            ("plane_runtime.host_port", "host_operation_failure"),
+            ("untrusted.module", "runtime_unknown_failure"),
+        )
+        for module, cause in cases:
+            self.assertEqual(_classify_runtime_exception(raised_from(module)), cause)
+
     def test_code_mode_failure_diagnostic_round_trips_through_runtime_exit(self) -> None:
         snapshot_raw = make_snapshot()
         snapshot_raw["contentDigest"] = _digest(

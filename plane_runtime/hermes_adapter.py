@@ -207,6 +207,24 @@ def _classify_runtime_exception(exception: BaseException) -> str:
         and str(exception) == "Failed to recreate closed OpenAI client"
     ):
         return "provider_client_failure"
+    if isinstance(exception, RuntimeError):
+        module = None
+        traceback = exception.__traceback__
+        while traceback is not None:
+            module = traceback.tb_frame.f_globals.get("__name__")
+            traceback = traceback.tb_next
+        if module in {"agent.relay_runtime", "agent.relay_llm", "agent.relay_tools"}:
+            return "relay_session_failure"
+        if module in {
+            "agent.agent_init",
+            "agent.codex_runtime",
+            "agent.codex_responses_adapter",
+            "agent.account_usage",
+            "run_agent",
+        }:
+            return "provider_client_failure"
+        if module == "plane_runtime.host_port":
+            return "host_operation_failure"
     if isinstance(exception, (ModuleNotFoundError, ImportError)):
         return "dependency_failure"
     if isinstance(exception, PermissionError):
