@@ -4,16 +4,99 @@ from __future__ import annotations
 
 import copy
 import json
+import os
+import tempfile
 import unittest
+from unittest import mock
 
 from plane_runtime.g1_contract import G1ContractError, G1InvocationEnvelope, G1RunSnapshot
-from plane_runtime.hermes_adapter import HermesKernelAdapter, ProviderOutcomeUnknownError
+from plane_runtime.hermes_adapter import (
+    HermesKernelAdapter,
+    ProviderOutcomeUnknownError,
+    _classify_runtime_exception,
+)
 from plane_runtime.host_port import CallablePlaneHostPort, current_plane_host
 from tests.plane_runtime.test_g1_runtime_process import _digest, make_invocation, make_snapshot
 from tools.registry import registry
 
 
 class AdapterPresentationTests(unittest.TestCase):
+    def test_real_agent_closed_client_recreation_is_bounded_provider_client_failure(self) -> None:
+        raw = copy.deepcopy(make_snapshot())
+        raw["runtimePolicy"] = dict(raw["runtimePolicy"])  # type: ignore[arg-type]
+        raw["runtimePolicy"]["adapter"] = "hermes"  # type: ignore[index]
+        raw["runtimePolicy"]["model"] = {"provider": "xai", "model": "test-model"}  # type: ignore[index]
+        raw["contentDigest"] = _digest(
+            "snapshot", {key: value for key, value in raw.items() if key != "contentDigest"}
+        )
+        snapshot = G1RunSnapshot.from_dict(raw)
+        invocation = G1InvocationEnvelope.from_dict(make_invocation(snapshot.to_dict()))
+
+        class OpenAI:
+            def __init__(self, **kwargs: object) -> None:
+                del kwargs
+
+            def is_closed(self) -> bool:
+                return True
+
+        class Factory:
+            calls = 0
+
+            def __call__(self) -> object:
+                self.calls += 1
+                if self.calls == 2:
+                    raise RuntimeError("relay factory failure")
+                return object()
+
+        factory = Factory()
+
+        def agent_factory(**kwargs: object) -> object:
+            from run_agent import AIAgent
+
+            agent = AIAgent(**kwargs)
+            agent._api_max_retries = 1
+            return agent
+
+        with tempfile.TemporaryDirectory() as hermes_home:
+            import run_agent
+
+            with mock.patch.dict(os.environ, {"HERMES_HOME": hermes_home}), mock.patch.object(
+                run_agent, "OpenAI", OpenAI
+            ), mock.patch.object(run_agent, "get_tool_definitions", return_value=[]), mock.patch.object(
+                run_agent, "check_toolset_requirements", return_value={}
+            ):
+                # The initial client is intentionally closed. The first turn
+                # must attempt exactly one invocation-scoped recreation before
+                # any provider request; the factory then fails at that seam.
+                result = HermesKernelAdapter(
+                    agent_factory=agent_factory,
+                    credential_source=type(
+                        "Credentials",
+                        (),
+                        {"resolve": lambda _self, _provider: {
+                            "api_key": "provider-free-test-secret",
+                            "base_url": "http://provider.invalid/v1",
+                            "api_mode": "chat_completions",
+                        }},
+                    )(),
+                    http_client_factory=factory,
+                ).dispatch(
+                    snapshot,
+                    invocation,
+                    lambda: False,
+                    lambda _body: None,
+                    model_call_allowance=1,
+                )
+
+        self.assertEqual(factory.calls, 2)
+        self.assertEqual(result.kind, "failed")
+        self.assertEqual(
+            _classify_runtime_exception(RuntimeError("Failed to recreate closed OpenAI client")),
+            "provider_client_failure",
+        )
+        self.assertEqual(result.runtime_phase, "conversation")
+        self.assertEqual(result.model_calls, 0)
+
     def test_standard_plane_snapshot_emits_request_response_and_host_callback_shape(self) -> None:
         raw = copy.deepcopy(make_snapshot())
         raw["runtimePolicy"]["adapter"] = "hermes"  # type: ignore[index]

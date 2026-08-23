@@ -182,6 +182,15 @@ def _provider_result_failure_cause(
 def _classify_runtime_exception(exception: BaseException) -> str:
     """Return finite non-content runtime evidence for an adapter exception."""
 
+    # ``_ensure_primary_openai_client`` deliberately wraps a failed rebuild so
+    # callers cannot receive a stale/closed SDK client.  Keep that bounded
+    # RuntimeError distinguishable from an unrelated runtime bug without
+    # copying its message into the runtime receipt.
+    if (
+        isinstance(exception, RuntimeError)
+        and str(exception) == "Failed to recreate closed OpenAI client"
+    ):
+        return "provider_client_failure"
     if isinstance(exception, (ModuleNotFoundError, ImportError)):
         return "dependency_failure"
     if isinstance(exception, PermissionError):
