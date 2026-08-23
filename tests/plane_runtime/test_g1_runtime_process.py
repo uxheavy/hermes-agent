@@ -1285,6 +1285,10 @@ class G1RuntimeProcessTests(unittest.TestCase):
             def run_conversation(self, message: str, *, system_message: str) -> dict[str, str]:
                 captured["message"] = message
                 captured["system_message"] = system_message
+                callback = captured["kwargs"]["stream_delta_callback"]  # type: ignore[index]
+                if not callable(callback):
+                    raise AssertionError("Hermes delta callback was not installed")
+                callback("api_key=top-secret-value")
                 return {"final_response": "api_key=top-secret-value" + "x" * 10000}
 
         def factory(**kwargs: object) -> FakeAgent:

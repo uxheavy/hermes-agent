@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import re
 import socket
 import threading
 import time

@@ -4463,6 +4463,7 @@ print("text_response")
         class Completions:
             def __init__(self) -> None:
                 self.calls = 0
+                self.tool_choices: list[object] = []
 
             def create(self, **_kwargs: object):
                 self.calls += 1
