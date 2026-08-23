@@ -2852,6 +2852,29 @@ class TestRunConversation:
             },
         }
 
+    def test_plane_pre_provider_exception_escapes_without_retry(self, agent):
+        from agent.iteration_budget import IterationBudget
+
+        self._setup_agent(agent)
+        agent.max_iterations = 16
+        agent.iteration_budget = IterationBudget(16)
+        agent._plane_runtime_terminal_budget_failure = True
+        with (
+            patch.object(
+                agent,
+                "_sanitize_tool_call_arguments",
+                side_effect=RuntimeError("bounded pre-provider failure"),
+            ) as sanitize_tool_call_arguments,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            with pytest.raises(RuntimeError, match="bounded pre-provider failure"):
+                agent.run_conversation("keep working")
+
+        assert sanitize_tool_call_arguments.call_count == 1
+        agent.client.chat.completions.create.assert_not_called()
+
     def test_terminal_action_check_none_continues_to_the_next_provider_call(self, agent):
         self._setup_agent(agent)
         tc = _mock_tool_call(name="web_search", arguments="{}", call_id="continue")

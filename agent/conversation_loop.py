@@ -7234,6 +7234,12 @@ def run_conversation(
                     pass
                 break
 
+            if (
+                getattr(agent, "_plane_runtime_terminal_budget_failure", False)
+                and getattr(agent, "_turn_received_provider_response", False) is not True
+            ):
+                raise
+
             # Phase-aware error classification. The huge outer try/except spans
             # both the actual API request and all local post-processing of the
             # returned assistant message. Deterministic local bugs (e.g.
