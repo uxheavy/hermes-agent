@@ -38,15 +38,15 @@ class G1ContractTests(unittest.TestCase):
         )
         self.assertEqual(
             G1_CONTRACT_DIGESTS["runtimeEvent"],
-            "d0fb1c67a7424f5359f9c09ff7206ef7d3d0d6e90e62b724c4a5e4e4bc13412d",
+            "4f6a684e7155f9d65832f8428aed058a1ba22146770ef131935d8aab82b50c20",
         )
         self.assertEqual(
             G1_CONTRACT_DIGESTS["runtimeExit"],
-            "f596e131d3d1bf94c52352fa2156d6dedf4c793f1b31d3fbd6b7a478f4401df9",
+            "0d237c20540874df8ff9ac0b4e081079660f4143a7018a21daf33797150a7454",
         )
         self.assertEqual(
             G1_MANIFEST_DIGEST,
-            "4faf04dae2df9fa3954f7af3bfa8895eed021d558b3c0e88e42511265202eb6e",
+            "01d80754288d172afd6e93246dff3ee11b8e304c22853b75ff3d3368fd40a488",
         )
 
     def test_eager_presentation_fields_are_strict(self) -> None:

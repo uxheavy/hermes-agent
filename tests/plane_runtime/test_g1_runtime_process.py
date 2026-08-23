@@ -1921,6 +1921,10 @@ class G1RuntimeProcessTests(unittest.TestCase):
                 expected_exception_class = "Unknown"
             self.assertEqual(result.runtime_phase, "agent_initialization")
             self.assertEqual(result.exception_class, expected_exception_class)
+            if cause == "runtime_unknown_failure":
+                self.assertEqual(result.runtime_origin["module"], __name__)
+                self.assertEqual(result.runtime_origin["function"], "failing_factory")
+                self.assertIsInstance(result.runtime_origin["line"], int)
             serialized = json.dumps(result.__dict__)
             for secret in ("secret", "path", "prompt", "token"):
                 self.assertNotIn(secret, serialized)
@@ -1929,7 +1933,26 @@ class G1RuntimeProcessTests(unittest.TestCase):
             self.assertEqual(exit_frame["failure"]["cause"], cause)
             self.assertEqual(exit_frame["failure"]["runtimePhase"], "agent_initialization")
             self.assertEqual(exit_frame["failure"]["exceptionClass"], expected_exception_class)
+            if cause == "runtime_unknown_failure":
+                self.assertEqual(exit_frame["failure"]["runtimeOrigin"]["module"], __name__)
+                self.assertEqual(exit_frame["failure"]["runtimeOrigin"]["function"], "failing_factory")
             self.assertNotIn("secret", json.dumps(exit_frame))
+
+        with self.assertRaises(G1ContractError):
+            build_exit(
+                snapshot=snapshot,
+                invocation=invocation,
+                final_sequence=0,
+                kind="failed",
+                failure={
+                    "code": "runtime_error",
+                    "message": "bounded",
+                    "retryable": True,
+                    "runtimePhase": "agent_initialization",
+                    "exceptionClass": "RuntimeError",
+                    "runtimeOrigin": {"module": "/private/secret", "function": "failing_factory"},
+                },
+            )
 
     def test_approved_checkpoint_is_loaded_once_and_prefilled_before_hermes(self) -> None:
         snapshot = G1RunSnapshot.from_dict(make_snapshot())

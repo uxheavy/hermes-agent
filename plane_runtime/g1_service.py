@@ -13,6 +13,7 @@ from .g1_contract import (
     G1RunSnapshot,
     RUNTIME_FAILURE_EXCEPTION_CLASSES,
     RUNTIME_FAILURE_PHASES,
+    _bounded_runtime_origin,
     _bounded_host_operation_diagnostic,
     bind_snapshot_and_invocation,
     build_event,
@@ -32,18 +33,22 @@ from .host_port import PlaneHostPort
 _MODEL_USAGE_PROTOCOL = "plane.agent-runtime/internal-usage/v1"
 def _bounded_runtime_failure_diagnostic(
     result: HermesKernelResult,
-) -> dict[str, str] | None:
-    """Project only the adapter phase and allowlisted exception class."""
+) -> dict[str, object] | None:
+    """Project only bounded adapter runtime diagnostics."""
 
     if (
         result.runtime_phase not in RUNTIME_FAILURE_PHASES
         or result.exception_class not in RUNTIME_FAILURE_EXCEPTION_CLASSES
     ):
         return None
-    return {
+    diagnostic: dict[str, object] = {
         "runtimePhase": result.runtime_phase,
         "exceptionClass": result.exception_class,
     }
+    origin = _bounded_runtime_origin(result.runtime_origin)
+    if origin is not None:
+        diagnostic["runtimeOrigin"] = origin
+    return diagnostic
 
 
 def _write_model_usage(diagnostics: TextIO | None, model_calls: int | None) -> None:

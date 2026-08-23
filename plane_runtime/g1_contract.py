@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any, Mapping, Sequence
@@ -50,16 +51,19 @@ RUNTIME_FAILURE_EXCEPTION_CLASSES = frozenset(
         "Unknown",
     }
 )
+_RUNTIME_ORIGIN_MODULE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*$")
+_RUNTIME_ORIGIN_FUNCTION = re.compile(r"^(?:[A-Za-z_][A-Za-z0-9_]*|<[A-Za-z_][A-Za-z0-9_]*>)$")
+_RUNTIME_ORIGIN_MAX_BYTES = 128
 
 # Frozen bytes from the paired Plane G1 runtime contract manifest.
 G1_CONTRACT_DIGESTS = {
     "runSnapshot": "ca2944e248210658a6c0514c29e23d9dc002d2f9d397e6b5c7aef50d36202dc1",
     "invocationEnvelope": "b7a15d74406f1624cdb7cd95b42edfd1ffee596abe57e4f00ed60e2e23ded995",
-    "runtimeEvent": "d0fb1c67a7424f5359f9c09ff7206ef7d3d0d6e90e62b724c4a5e4e4bc13412d",
-    "runtimeExit": "f596e131d3d1bf94c52352fa2156d6dedf4c793f1b31d3fbd6b7a478f4401df9",
+    "runtimeEvent": "e137287a23fdb5ac4c9cadbd57ef98052aab9cf2010e61036b1d1067a8646385",
+    "runtimeExit": "753bd25137b5b5c4255ef97e0ad74575a62e45a5653af78a5420e8d4f5fdea57",
     "runtimeDurableState": "444c944ec8a5054f33c8662470529a1f4565d42ff06138438beceeef7967a0da",
 }
-G1_MANIFEST_DIGEST = "4faf04dae2df9fa3954f7af3bfa8895eed021d558b3c0e88e42511265202eb6e"
+G1_MANIFEST_DIGEST = "1f8185fc013f7c612dd31664cebdb698f36832fccbdb996e31c280a7088e0751"
 
 _ROLES = {"worker", "delegator", "gardener", "chief_of_staff", "hr", "evaluator", "custom"}
 _TRIGGERS = {"initial", "human_input", "recoverable_restart", "continuation"}
@@ -858,6 +862,7 @@ def _validate_failure(value: Any, name: str = "failure") -> dict[str, Any]:
             "codeModeFailureClass",
             "runtimePhase",
             "exceptionClass",
+            "runtimeOrigin",
             "socketPhase",
             "socketState",
             "preparedHandoff",
@@ -921,8 +926,34 @@ def _validate_failure(value: Any, name: str = "failure") -> dict[str, Any]:
         or data["exceptionClass"] not in RUNTIME_FAILURE_EXCEPTION_CLASSES
     ):
         raise G1ContractError(f"{name} runtime diagnostic fields are invalid")
+    if "runtimeOrigin" in data:
+        if present_runtime_diagnostic_fields != runtime_diagnostic_fields or _bounded_runtime_origin(data["runtimeOrigin"]) is None:
+            raise G1ContractError(f"{name}.runtimeOrigin is invalid")
     _text(data["message"], f"{name}.message")
     return data
+
+
+def _bounded_runtime_origin(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, Mapping) or set(value) not in ({"module", "function"}, {"module", "function", "line"}):
+        return None
+    module = value.get("module")
+    function = value.get("function")
+    if (
+        not isinstance(module, str)
+        or not 0 < len(module.encode("utf-8")) <= _RUNTIME_ORIGIN_MAX_BYTES
+        or _RUNTIME_ORIGIN_MODULE_RE.fullmatch(module) is None
+        or not isinstance(function, str)
+        or not 0 < len(function.encode("utf-8")) <= _RUNTIME_ORIGIN_MAX_BYTES
+        or _RUNTIME_ORIGIN_FUNCTION.fullmatch(function) is None
+    ):
+        return None
+    origin = {"module": module, "function": function}
+    if "line" in value:
+        line = value["line"]
+        if isinstance(line, bool) or not isinstance(line, int) or not 1 <= line <= MAX_INTEGER:
+            return None
+        origin["line"] = line
+    return origin
 
 
 def _validate_event(

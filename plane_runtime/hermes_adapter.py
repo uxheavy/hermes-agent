@@ -5,7 +5,6 @@ from __future__ import annotations
 import contextlib
 import io
 import json
-import re
 import socket
 import threading
 import time
@@ -26,6 +25,7 @@ from .g1_contract import (
     RUNTIME_FAILURE_EXCEPTION_CLASSES,
     RUNTIME_FAILURE_PHASES,
     RUNTIME_FAILURE_CAUSES,
+    _bounded_runtime_origin,
 )
 from .host_port import (
     HOST_CALLBACK_PHASES,
@@ -248,6 +248,21 @@ def _runtime_exception_class(exception: BaseException) -> str:
 
     name = type(exception).__name__
     return name if name in RUNTIME_FAILURE_EXCEPTION_CLASSES else "Unknown"
+
+
+def _runtime_exception_origin(exception: BaseException) -> dict[str, object] | None:
+    """Return the deepest traceback frame that can cross the runtime seam safely."""
+
+    origin: dict[str, object] | None = None
+    traceback = exception.__traceback__
+    while traceback is not None:
+        module = traceback.tb_frame.f_globals.get("__name__")
+        function = traceback.tb_frame.f_code.co_name
+        candidate = _bounded_runtime_origin({"module": module, "function": function, "line": traceback.tb_lineno})
+        if candidate is not None:
+            origin = candidate
+        traceback = traceback.tb_next
+    return origin
 
 
 _STRUCTURED_FAILURE_EXCEPTION_CLASSES = MappingProxyType(
@@ -797,6 +812,7 @@ class HermesKernelResult:
     host_operation_diagnostic: Mapping[str, Any] | None = None
     runtime_phase: str | None = None
     exception_class: str | None = None
+    runtime_origin: Mapping[str, object] | None = None
 
 
 def _host_operation_failure_message(
@@ -1558,6 +1574,7 @@ class HermesKernelAdapter:
                     else "unknown"
                 ),
                 exception_class=_runtime_exception_class(exc),
+                runtime_origin=_runtime_exception_origin(exc),
             )
 
         if cancellation_monitor is not None:
