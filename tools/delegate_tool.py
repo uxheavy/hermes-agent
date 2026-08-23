@@ -1504,10 +1504,6 @@ def _build_child_agent(
     child_http_client_factory = getattr(parent_agent, "__dict__", {}).get(
         "_http_client_factory"
     )
-    if child_http_client_factory is None:
-        from agent.auxiliary_client import _runtime_main_value
-
-        child_http_client_factory = _runtime_main_value("http_client_factory")
     if callable(child_http_client_factory):
         child_optional_kwargs["http_client_factory"] = child_http_client_factory
 

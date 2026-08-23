@@ -578,13 +578,6 @@ def _outcome_ref_from_code_mode_result(output: Any) -> str | None:
     return _outcome_ref_from_operation_result(output.get("result"))
 
 
-def _prepared_read_ref_from_search_result(output: Any) -> str | None:
-    """Return a single prepared read ref for compatibility with callers."""
-
-    refs = _prepared_read_refs_from_search_result(output)
-    return refs[0] if len(refs) == 1 else None
-
-
 def _prepared_read_refs_from_code_mode_result(output: Any) -> tuple[str, ...]:
     """Return prepared reads left unconsumed by one trusted Code Mode result.
 

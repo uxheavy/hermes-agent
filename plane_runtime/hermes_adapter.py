@@ -112,13 +112,8 @@ _PROVIDER_RESULT_FAILURE_CAUSES = MappingProxyType(
 )
 _PROVIDER_RESULT_FAILURE_REASON_ALIASES = MappingProxyType(
     {
-        "auth": FailoverReason.auth,
-        "auth_permanent": FailoverReason.auth_permanent,
-        "billing": FailoverReason.billing,
         "rate_limited": FailoverReason.rate_limit,
         "rate_limit_exceeded": FailoverReason.rate_limit,
-        "timeout": FailoverReason.timeout,
-        "server_error": FailoverReason.server_error,
         "request_error": FailoverReason.format_error,
     }
 )

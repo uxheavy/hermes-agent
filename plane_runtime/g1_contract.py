@@ -59,8 +59,6 @@ G1_CONTRACT_DIGESTS = {
     "runtimeExit": "f596e131d3d1bf94c52352fa2156d6dedf4c793f1b31d3fbd6b7a478f4401df9",
     "runtimeDurableState": "444c944ec8a5054f33c8662470529a1f4565d42ff06138438beceeef7967a0da",
 }
-G1_MANIFEST_DIGEST = "4faf04dae2df9fa3954f7af3bfa8895eed021d558b3c0e88e42511265202eb6e"
-
 _ROLES = {"worker", "delegator", "gardener", "chief_of_staff", "hr", "evaluator", "custom"}
 _TRIGGERS = {"initial", "human_input", "recoverable_restart", "continuation"}
 _EVENT_KINDS = {
@@ -876,12 +874,7 @@ def _validate_failure(value: Any, name: str = "failure") -> dict[str, Any]:
     if present_diagnostic_fields and present_diagnostic_fields != diagnostic_fields:
         raise G1ContractError(f"{name} host diagnostic fields must be provided together")
     if present_diagnostic_fields:
-        if data["callbackPhase"] not in {
-            "before_host_call",
-            "host_return",
-            "model_observation_emit",
-            "adapter_event",
-        }:
+        if data["callbackPhase"] not in _HOST_CALLBACK_PHASES:
             raise G1ContractError(f"{name}.callbackPhase is invalid")
         operation_ref_digest = data["operationRefDigest"]
         if (
@@ -895,11 +888,10 @@ def _validate_failure(value: Any, name: str = "failure") -> dict[str, Any]:
     if present_code_mode_fields and present_code_mode_fields != code_mode_fields:
         raise G1ContractError(f"{name} Code Mode diagnostic fields must be provided together")
     if present_code_mode_fields:
-        if data["codeModeHostStatus"] not in {
-            "ok", "replayed", "denied", "conflict", "unavailable", "invalid"
-        } or data["codeModeFailureClass"] not in {
-            "code_mode", "callback", "transport", "contract", "unknown"
-        }:
+        if (
+            data["codeModeHostStatus"] not in _CODE_MODE_HOST_STATUSES
+            or data["codeModeFailureClass"] not in _CODE_MODE_FAILURE_CLASSES
+        ):
             raise G1ContractError(f"{name} Code Mode diagnostic fields are invalid")
     socket_fields = {"socketPhase", "socketState"}
     present_socket_fields = socket_fields.intersection(data)
@@ -1197,7 +1189,6 @@ def build_exit(
 
 __all__ = [
     "G1_CONTRACT_DIGESTS",
-    "G1_MANIFEST_DIGEST",
     "G1ContractError",
     "G1InvocationEnvelope",
     "G1RunSnapshot",

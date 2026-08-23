@@ -513,8 +513,7 @@ class AIAgent:
                 DeprecationWarning,
                 stacklevel=2,
             )
-        from agent.agent_init import _validate_http_client_factory, init_agent
-        _validate_http_client_factory(http_client_factory)
+        from agent.agent_init import init_agent
         init_agent(
             self,
             base_url=base_url,

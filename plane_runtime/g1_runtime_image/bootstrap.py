@@ -23,25 +23,6 @@ from ..hermes_adapter import validate_absolute_unix_socket_path
 
 _MODEL_USAGE_PROTOCOL = "plane.agent-runtime/internal-usage/v1"
 _MAX_DIAGNOSTIC_BYTES = 16 * 1024
-_MAX_UNIX_SOCKET_PATH_BYTES = 103
-
-def _plane_host_socket(value: object) -> str | None:
-    if value is None:
-        return None
-    if (
-        not isinstance(value, str)
-        or not value.startswith("/")
-        or any(ord(char) < 0x20 or ord(char) == 0x7F for char in value)
-        or len(value.encode("utf-8")) > _MAX_UNIX_SOCKET_PATH_BYTES
-    ):
-        raise ValueError("Plane host socket configuration is invalid")
-    return value
-
-
-def _provider_relay_socket(value: object) -> str | None:
-    return validate_absolute_unix_socket_path(value)
-
-
 def _read_child_diagnostics(stream: Any, result: bytearray, overflow: list[bool]) -> None:
     try:
         while True:
@@ -79,8 +60,8 @@ def _run(
     plane_host_socket: str | None = None,
     provider_relay_socket: str | None = None,
 ) -> int:
-    plane_host_socket = _plane_host_socket(plane_host_socket)
-    provider_relay_socket = _provider_relay_socket(provider_relay_socket)
+    plane_host_socket = validate_absolute_unix_socket_path(plane_host_socket)
+    provider_relay_socket = validate_absolute_unix_socket_path(provider_relay_socket)
     child: subprocess.Popen[bytes] | None = None
     diagnostics = bytearray()
     overflow = [False]
@@ -163,8 +144,8 @@ def main(argv: list[str] | None = None) -> int:
         frames = read_g1_bootstrap_frames(sys.stdin)
         return _run(
             frames,
-            _plane_host_socket(args.plane_host_socket),
-            _provider_relay_socket(args.provider_relay_socket),
+            validate_absolute_unix_socket_path(args.plane_host_socket),
+            validate_absolute_unix_socket_path(args.provider_relay_socket),
         )
     except Exception:
         if frames is not None:

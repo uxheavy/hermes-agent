@@ -1606,40 +1606,6 @@ class TestFallbackModelInheritance(unittest.TestCase):
         _, kwargs = MockAgent.call_args
         self.assertIs(kwargs["http_client_factory"], factory)
 
-    def test_child_inherits_http_client_factory_from_runtime_context(self):
-        """The existing context-local runtime carries the private dependency."""
-        import agent.auxiliary_client as auxiliary_client
-
-        parent = _make_mock_parent(depth=0)
-        factory = lambda: object()
-        token = auxiliary_client.set_runtime_main(
-            parent.provider,
-            parent.model,
-            base_url=parent.base_url,
-            api_key=parent.api_key,
-            api_mode=parent.api_mode,
-            http_client_factory=factory,
-        )
-        try:
-            with patch("run_agent.AIAgent") as MockAgent:
-                MockAgent.return_value = MagicMock()
-                _build_child_agent(
-                    task_index=0,
-                    goal="test context HTTP factory inheritance",
-                    context=None,
-                    toolsets=None,
-                    model=None,
-                    max_iterations=10,
-                    parent_agent=parent,
-                    task_count=1,
-                )
-
-            _, kwargs = MockAgent.call_args
-            self.assertIs(kwargs["http_client_factory"], factory)
-        finally:
-            auxiliary_client.reset_runtime_main(token)
-            auxiliary_client.clear_runtime_main()
-
     def test_child_inherits_fallback_chain(self):
         """_build_child_agent passes parent._fallback_chain as fallback_model."""
         parent = _make_mock_parent(depth=0)

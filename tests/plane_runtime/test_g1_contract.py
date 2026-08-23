@@ -10,7 +10,6 @@ from plane_runtime.g1_contract import (
     G1ContractError,
     G1RunSnapshot,
     G1_CONTRACT_DIGESTS,
-    G1_MANIFEST_DIGEST,
 )
 from tests.plane_runtime.test_g1_runtime_process import _digest, make_snapshot
 
@@ -43,10 +42,6 @@ class G1ContractTests(unittest.TestCase):
         self.assertEqual(
             G1_CONTRACT_DIGESTS["runtimeExit"],
             "f596e131d3d1bf94c52352fa2156d6dedf4c793f1b31d3fbd6b7a478f4401df9",
-        )
-        self.assertEqual(
-            G1_MANIFEST_DIGEST,
-            "4faf04dae2df9fa3954f7af3bfa8895eed021d558b3c0e88e42511265202eb6e",
         )
 
     def test_eager_presentation_fields_are_strict(self) -> None:

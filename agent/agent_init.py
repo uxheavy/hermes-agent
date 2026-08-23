@@ -69,14 +69,6 @@ def _ra():
     return run_agent
 
 
-def _validate_http_client_factory(
-    http_client_factory: Optional[Callable[[], Any]],
-) -> None:
-    """Reject invalid trusted HTTP-client construction hooks early."""
-    if http_client_factory is not None and not callable(http_client_factory):
-        raise TypeError("http_client_factory must be callable or None")
-
-
 def _moa_reference_output_allowed(agent: Any) -> bool:
     """Keep MoA display events off only the machine-readable ``-Q`` surface."""
     return not (
@@ -579,7 +571,8 @@ def init_agent(
             OpenAI-compatible clients. It must return a fresh HTTP client per call;
             the SDK client owns and closes the returned client.
     """
-    _validate_http_client_factory(http_client_factory)
+    if http_client_factory is not None and not callable(http_client_factory):
+        raise TypeError("http_client_factory must be callable or None")
     _install_safe_stdio()
 
     agent.model = model

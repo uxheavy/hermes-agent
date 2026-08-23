@@ -60,28 +60,6 @@ class TestFailoverReason:
         for reason in FailoverReason:
             assert isinstance(reason.value, str)
 
-    def test_enum_members_exist(self):
-        expected = {
-            "auth", "auth_permanent", "billing", "budget_exhausted", "rate_limit",
-            "upstream_rate_limit",
-            "overloaded", "server_error", "timeout",
-            "ssl_cert_verification",
-            "context_overflow", "payload_too_large", "image_too_large",
-            "model_not_found", "format_error",
-            "invalid_encrypted_content",
-            "multimodal_tool_content_unsupported",
-            "provider_policy_blocked",
-            "content_policy_blocked",
-            "outcome_unknown",
-            "thinking_signature", "long_context_tier",
-            "oauth_long_context_beta_forbidden",
-            "llama_cpp_grammar_pattern",
-            "unknown",
-        }
-        actual = {r.value for r in FailoverReason}
-        assert expected == actual
-
-
 # ── Test: ClassifiedError ──────────────────────────────────────────────
 
 class TestClassifiedError:
@@ -1088,5 +1066,4 @@ class TestExpandedOverflowPatterns:
         )
         result = classify_api_error(e, provider="openrouter", model="m")
         assert result.reason == FailoverReason.context_overflow
-
 

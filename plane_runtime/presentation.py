@@ -47,9 +47,7 @@ _PREPARED_READ_INPUT_SCHEMA = {
 def _plain(value: Any) -> Any:
     if isinstance(value, Mapping):
         return {str(key): _plain(item) for key, item in value.items()}
-    if isinstance(value, tuple):
-        return [_plain(item) for item in value]
-    if isinstance(value, list):
+    if isinstance(value, (tuple, list)):
         return [_plain(item) for item in value]
     return value
 

@@ -25,7 +25,7 @@ import ssl
 import time
 from typing import Any, Dict, List, Optional
 
-from agent.chat_completion_helpers import _plane_required_tool
+from agent.chat_completion_helpers import _plane_required_tool, _plane_tool_name
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.conversation_compression import (
     COMPRESSION_RETRY_CONTEXT_REDUCED_STATUS_TEMPLATE,
@@ -127,10 +127,7 @@ def _plane_runtime_toolset_class(tools: Any) -> str:
         for tool in tools:
             if not isinstance(tool, dict):
                 continue
-            function = tool.get("function")
-            name = tool.get("name")
-            if not isinstance(name, str) and isinstance(function, dict):
-                name = function.get("name")
+            name = _plane_tool_name(tool)
             if name in _PLANE_RUNTIME_DIAGNOSTIC_TOOL_NAMES:
                 names.add(name)
             elif isinstance(name, str):
@@ -180,10 +177,7 @@ def _record_plane_runtime_request(agent: Any, api_kwargs: Any) -> None:
     choice = api_kwargs.get("tool_choice")
     if not (isinstance(choice, str) and choice in {"required", "auto"}):
         if isinstance(choice, dict) and choice.get("type") == "function":
-            function = choice.get("function")
-            name = choice.get("name")
-            if not isinstance(name, str) and isinstance(function, dict):
-                name = function.get("name")
+            name = _plane_tool_name(choice)
             choice = (
                 name
                 if isinstance(name, str)

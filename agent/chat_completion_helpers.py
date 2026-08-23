@@ -63,7 +63,6 @@ _FALLBACK_EXHAUSTED_COOLDOWN_S = 5.0
 # the existing Codex Responses path requires a tool for only the first
 # productive request. Code Mode exposes exactly one model tool; once the
 # adapter consumes the hint, normal ``auto`` resumes.
-_PLANE_FIRST_REQUIRED_TOOL = "plane_execute_typescript"
 _PLANE_CODE_MODE_TOOL = "plane_execute_typescript"
 _PLANE_PREPARED_READ_TOOL = "plane_operation"
 _PLANE_PUBLISH_TOOL = "plane_publish"

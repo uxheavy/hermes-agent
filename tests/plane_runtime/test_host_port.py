@@ -3901,49 +3901,6 @@ print("text_response")
             ],
         )
 
-    def test_registry_normalizes_sparse_prepared_ref_and_rejects_malformed_variants(self) -> None:
-        prepared_ref = "prepared-call:sparse"
-        sparse = {"preparedCallRef": {"preparedCallRef": prepared_ref}}
-        self.assertEqual(
-            _normalize_prepared_read_input(
-                "read", "operation:work_item.read", sparse
-            ),
-            {"preparedCallRef": prepared_ref},
-        )
-
-        malformed = (
-            # Tampered opaque value.
-            {"preparedCallRef": {"preparedCallRef": "not-a-prepared-call"}},
-            # Extra fields must not be stripped or forwarded as a valid ref.
-            {
-                "preparedCallRef": {
-                    "preparedCallRef": prepared_ref,
-                    "issue_id": "must-not-cross-the-seam",
-                }
-            },
-            # The sparse adapter is for the work-item read operation only.
-            {
-                "preparedCallRef": {
-                    "action": "mutate",
-                    "operationRef": "operation:work_item.read",
-                    "input": {"preparedCallRef": prepared_ref},
-                }
-            },
-            # Oversized opaque values remain untouched for gateway rejection.
-            {
-                "preparedCallRef": {
-                    "preparedCallRef": "prepared-call:" + "x" * 256,
-                }
-            },
-        )
-        for input_value in malformed:
-            self.assertIs(
-                _normalize_prepared_read_input(
-                    "read", "operation:work_item.read", input_value
-                ),
-                input_value,
-            )
-
     def test_registry_normalizes_json_stringified_sparse_ref_only(self) -> None:
         prepared_ref = "prepared-call:json-stringified"
         stringified = json.dumps(

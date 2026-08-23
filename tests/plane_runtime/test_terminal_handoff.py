@@ -303,7 +303,7 @@ def test_real_hermes_long_route_preserves_applied_publication_after_observation_
 def test_post_terminal_code_mode_host_exception_preserves_applied_publication() -> None:
     """A late Code Mode host exception cannot overturn the applied terminal."""
 
-    from plane_runtime import current_plane_host
+    from plane_runtime.host_port import current_plane_host
     from plane_runtime.hermes_adapter import HermesKernelAdapter
     from plane_runtime.host_port import PlaneHostError
     from tests.plane_runtime.test_g1_runtime_process import (
@@ -425,7 +425,7 @@ def test_post_terminal_code_mode_host_exception_preserves_applied_publication() 
 def test_diagnostics_projection_failure_cannot_relabel_applied_publication() -> None:
     """Diagnostics are observation-only and must not turn a completed product into a runtime failure."""
 
-    from plane_runtime import current_plane_host
+    from plane_runtime.host_port import current_plane_host
     from plane_runtime.hermes_adapter import HermesKernelAdapter
     from tests.plane_runtime.test_g1_runtime_process import (
         G1InvocationEnvelope,
@@ -513,7 +513,7 @@ def test_diagnostics_projection_failure_cannot_relabel_applied_publication() -> 
 def test_pre_terminal_code_mode_host_exception_remains_failed() -> None:
     """The terminal-preserving exception branch must not swallow pre-terminal errors."""
 
-    from plane_runtime import current_plane_host
+    from plane_runtime.host_port import current_plane_host
     from plane_runtime.hermes_adapter import HermesKernelAdapter
     from plane_runtime.host_port import PlaneHostError
     from tests.plane_runtime.test_g1_runtime_process import (

@@ -7,8 +7,8 @@ separately deployed Plane Agent runtime service.
 
 ## Local Responsibility
 
-Keep Plane-specific translation local to this package. The eventual logical
-interface is `plane_runtime.execute`: it accepts versioned Plane
+Keep Plane-specific translation local to this package. The adapter execution
+seam is `plane_runtime.adapter.execute`: it accepts versioned Plane
 `RunSnapshot` and `InvocationEnvelope` inputs through the runtime service and
 adapts them to Hermes kernel execution.
 
@@ -40,12 +40,9 @@ adapts them to Hermes kernel execution.
 | Handling observations | Validate defensively here, then send them across the service seam; never treat them as authoritative product writes. |
 | Handling restart or waiting | Rebuild invocation-scoped infrastructure from Plane-owned snapshot, events, permitted checkpoints, and remaining budget. |
 
-## Current Gotchas
+## Package Boundary
 
-- This is a marker-only scaffold. Do not add placeholder classes, `execute`
-  stubs, dependencies, configuration, or runtime registration before the
-  versioned contract is ready.
-- The logical `plane_runtime.execute` interface is internal to the separate
+- The `plane_runtime.adapter.execute` interface is internal to the separate
   runtime service, not a Python import for Plane API modules.
 
 ## Local Verification
