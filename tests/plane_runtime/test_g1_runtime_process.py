@@ -1849,6 +1849,11 @@ class G1RuntimeProcessTests(unittest.TestCase):
             (MemoryError("secret allocation"), "resource_failure"),
             (TimeoutError("secret timeout"), "timeout_failure"),
             (APIConnectionError("provider secret"), "provider_client_failure"),
+            (RuntimeError("Failed to initialize OpenAI client: secret/path"), "provider_client_failure"),
+            (RuntimeError("provider relay registry contains an invalid path: secret"), "static_configuration_failure"),
+            (RuntimeError("Hermes Relay runtime is unavailable: secret"), "dependency_failure"),
+            (RuntimeError("Hermes Relay session is unavailable: secret"), "dependency_failure"),
+            (RuntimeError("Hermes Relay conversation lease is released"), "relay_session_failure"),
             (RuntimeError("secret/path prompt token"), "runtime_unknown_failure"),
         )
         for exception, cause in cases:

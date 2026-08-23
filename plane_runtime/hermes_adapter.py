@@ -182,6 +182,22 @@ def _provider_result_failure_cause(
 def _classify_runtime_exception(exception: BaseException) -> str:
     """Return finite non-content runtime evidence for an adapter exception."""
 
+    # These are bounded messages emitted by known pre-provider seams.  Match
+    # only their stable prefixes; never copy the exception text into runtime
+    # evidence because the suffix may contain credentials or paths.
+    runtime_error_causes = (
+        ("Failed to initialize OpenAI client:", "provider_client_failure"),
+        ("provider relay registry contains an invalid path", "static_configuration_failure"),
+        ("Hermes Relay runtime is unavailable", "dependency_failure"),
+        ("Hermes Relay session is unavailable", "dependency_failure"),
+        ("Hermes Relay conversation lease is released", "relay_session_failure"),
+    )
+    if isinstance(exception, RuntimeError):
+        message = str(exception)
+        for prefix, cause in runtime_error_causes:
+            if message.startswith(prefix):
+                return cause
+
     # ``_ensure_primary_openai_client`` deliberately wraps a failed rebuild so
     # callers cannot receive a stale/closed SDK client.  Keep that bounded
     # RuntimeError distinguishable from an unrelated runtime bug without
