@@ -58,10 +58,7 @@ def test_code_mode_first_request_filters_to_execute_then_restores_publish():
     )
 
     first = _request(agent, [_PLANE_TOOL, _PUBLISH_TOOL])
-    assert first["tool_choice"] == {
-        "type": "function",
-        "name": "plane_execute_typescript",
-    }
+    assert first["tool_choice"] == "required"
     assert [tool["name"] for tool in first["tools"]] == ["plane_execute_typescript"]
 
     # The conversation loop clears the finite hint after the first matching

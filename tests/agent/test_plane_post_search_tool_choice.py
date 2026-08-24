@@ -41,6 +41,7 @@ _PLANE_OPERATION_TOOL = {
 
 
 def _request(agent, tools):
+    tools = _plane_first_tool_tools(agent, tools)
     return get_transport("codex_responses").build_kwargs(
         model=agent.model,
         messages=[{"role": "user", "content": "continue"}],
@@ -151,7 +152,7 @@ def test_standard_route_unavailable_tool_clears_required_latch():
     assert agent._plane_first_required_tool is None
 
 
-def test_post_search_phase_selects_named_code_mode_tool():
+def test_post_search_phase_requires_code_mode_tool():
     consumed = []
     agent = SimpleNamespace(
         provider="openai-codex",
@@ -164,10 +165,7 @@ def test_post_search_phase_selects_named_code_mode_tool():
 
     request = _request(agent, [_EXECUTE_TOOL, _PUBLISH_TOOL])
 
-    assert request["tool_choice"] == {
-        "type": "function",
-        "name": "plane_execute_typescript",
-    }
+    assert request["tool_choice"] == "required"
     assert consumed == [True]
 
 
@@ -185,10 +183,7 @@ def test_post_search_phase_consumer_is_one_shot():
     first = _request(agent, [_EXECUTE_TOOL, _PUBLISH_TOOL])
     second = _request(agent, [_EXECUTE_TOOL, _PUBLISH_TOOL])
 
-    assert first["tool_choice"] == {
-        "type": "function",
-        "name": "plane_execute_typescript",
-    }
+    assert first["tool_choice"] == "required"
     assert second["tool_choice"] == "auto"
 
 
@@ -283,15 +278,12 @@ def test_successful_submit_requires_explicit_publish_tool():
 
     request = _request(agent, [_EXECUTE_TOOL, _PUBLISH_TOOL])
 
-    assert request["tool_choice"] == {
-        "type": "function",
-        "name": "plane_publish",
-    }
+    assert request["tool_choice"] == "required"
     assert agent._plane_first_required_tool == "plane_publish"
     assert _plane_first_tool_tools(agent, [_EXECUTE_TOOL, _PUBLISH_TOOL]) == [_PUBLISH_TOOL]
 
 
-def test_code_mode_ref_recovery_requires_one_named_execute_continuation():
+def test_code_mode_ref_recovery_requires_one_execute_continuation():
     agent = SimpleNamespace(
         request_overrides={},
         _plane_runtime_code_mode_continuation_required_check=lambda: True,
@@ -308,7 +300,7 @@ def test_code_mode_ref_recovery_requires_one_named_execute_continuation():
     assert agent._plane_first_required_tool == "plane_execute_typescript"
 
 
-def test_codex_responses_requires_named_standard_plane_operation_tool():
+def test_codex_responses_requires_single_filtered_standard_plane_operation_tool():
     agent = SimpleNamespace(
         model="gpt-5.6",
         request_overrides={},
@@ -317,13 +309,10 @@ def test_codex_responses_requires_named_standard_plane_operation_tool():
 
     request = _request(agent, [_PLANE_OPERATION_TOOL, _PUBLISH_TOOL])
 
-    assert request["tool_choice"] == {
-        "type": "function",
-        "name": "plane_operation",
-    }
+    assert request["tool_choice"] == "required"
 
 
-def test_standard_route_rearms_evaluate_submit_publish_and_records_named_choices():
+def test_standard_route_rearms_evaluate_submit_publish_and_records_required_choices():
     required_tools = iter(("plane_operation", "plane_operation", "plane_publish"))
     agent = SimpleNamespace(
         model="gpt-5.6",
@@ -332,19 +321,16 @@ def test_standard_route_rearms_evaluate_submit_publish_and_records_named_choices
         _plane_runtime_diagnostics={"requests": []},
     )
 
-    for expected in ("plane_operation", "plane_operation", "plane_publish"):
+    for _ in range(3):
         agent._plane_first_required_tool = None
         request = _request(agent, [_PLANE_OPERATION_TOOL, _PUBLISH_TOOL])
         _record_plane_runtime_request(agent, request)
-        assert request["tool_choice"] == {
-            "type": "function",
-            "name": expected,
-        }
+        assert request["tool_choice"] == "required"
 
     assert [row["toolChoice"] for row in agent._plane_runtime_diagnostics["requests"]] == [
-        "plane_operation",
-        "plane_operation",
-        "plane_publish",
+        "required",
+        "required",
+        "required",
     ]
 
 

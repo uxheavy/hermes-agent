@@ -150,8 +150,8 @@ def _plane_codex_request_overrides(agent, tools):
     """Return request overrides with Plane's bounded tool choices.
 
     V69's finite first-tool requirement takes precedence. After the trusted
-    host consumes a prepared read, V70 selects the named Code Mode function
-    for the next Codex Responses request.
+    host consumes a prepared read, V70 requires the finite Code Mode tool on
+    the next Codex Responses request.
     """
     configured = getattr(agent, "request_overrides", None)
     overrides = dict(configured) if isinstance(configured, dict) else {}
@@ -162,7 +162,11 @@ def _plane_codex_request_overrides(agent, tools):
             _PLANE_PREPARED_READ_TOOL,
             _PLANE_PUBLISH_TOOL,
         } and _plane_first_tool_available(agent, tools):
-            overrides["tool_choice"] = {"type": "function", "name": required}
+            # The finite Plane path has already reduced the visible toolset
+            # to one tool. Responses `required` is the compatible choice for
+            # this path, including publication; named function choice makes
+            # the Codex backend reject the request before the tool runs.
+            overrides["tool_choice"] = "required"
         return overrides
 
     if getattr(agent, "provider", None) != "openai-codex":
