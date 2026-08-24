@@ -508,7 +508,7 @@ class HostPortTests(unittest.TestCase):
         self.assertEqual(schema["required"], ["content"])
         self.assertFalse(schema["additionalProperties"])
 
-    def test_outcome_publish_tool_rejects_early_and_tampered_refs_without_host_call(self) -> None:
+    def test_outcome_publish_tool_recovers_early_and_rejects_tampered_refs(self) -> None:
         calls: list[dict] = []
 
         def rpc(request: dict) -> dict:
@@ -522,7 +522,13 @@ class HostPortTests(unittest.TestCase):
                         }
                     },
                 )
-            return _result(request, publication=_applied_outcome_publication())
+            return _result(
+                request,
+                publication={
+                    **_applied_outcome_publication(),
+                    "productRef": request["input"]["resourceRef"],
+                },
+            )
 
         install_plane_tools()
         early = PlaneHostBinding(
@@ -537,8 +543,31 @@ class HostPortTests(unittest.TestCase):
                 "plane_publish",
                 {"content": "too early"},
             )
-        self.assertEqual(json.loads(early_payload)["status"], "error")
+        early_result = json.loads(early_payload)
+        self.assertEqual(early_result["status"], "error")
+        self.assertEqual(early_result["error"]["code"], "OUTCOME_SUBMISSION_REQUIRED")
+        self.assertIsNone(early.fatal_error)
         self.assertEqual(calls, [])
+
+        with bind_plane_host(early):
+            registry.dispatch(
+                "plane_operation",
+                {
+                    "action": "mutate",
+                    "operationRef": PLANE_OUTCOME_SUBMIT_OPERATION,
+                    "input": {"summary": "submitted"},
+                },
+            )
+            corrected_payload = registry.dispatch(
+                "plane_publish",
+                {"content": "corrected publication"},
+            )
+        self.assertEqual(json.loads(corrected_payload)["status"], "ok")
+        self.assertIsNone(early.fatal_error)
+        self.assertEqual(
+            [call["operationRef"] for call in calls],
+            [PLANE_OUTCOME_SUBMIT_OPERATION, PLANE_OUTCOME_PUBLISH_OPERATION],
+        )
 
         trusted = PlaneHostBinding(
             port=CallablePlaneHostPort(rpc),
@@ -592,7 +621,7 @@ class HostPortTests(unittest.TestCase):
         self.assertEqual(json.loads(ambiguous_payload)["status"], "error")
         self.assertEqual(
             [call["action"] for call in calls],
-            ["mutate", "mutate"],
+            ["mutate", "publish", "mutate", "mutate"],
         )
 
     def test_replayed_submit_binds_ref_and_replayed_publish_does_not_terminalize(self) -> None:

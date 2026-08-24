@@ -2487,6 +2487,11 @@ def _handle_plane_publish(args: Mapping[str, Any], **_: Any) -> str:
         content = _text(data.get("content"), "plane_publish.content", MAX_HOST_CONTENT_BYTES)
         binding = _binding_or_error()
         if kind == "outcome" and "operationRef" not in data and "resourceRef" not in data:
+            if binding.outcome_submission_ref() is None:
+                return _error_payload(
+                    "explicit outcome publication requires a successful outcome submit",
+                    code="OUTCOME_SUBMISSION_REQUIRED",
+                )
             result = binding.publish_outcome(content=content)
         else:
             operation_ref = _text(
