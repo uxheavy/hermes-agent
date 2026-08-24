@@ -65,6 +65,7 @@ class FailoverReason(enum.Enum):
 
     # Provider-specific
     outcome_unknown = "outcome_unknown"  # Upstream may have accepted the request; never replay
+    provider_relay_denied = "provider_relay_denied"  # Plane denied this invocation before upstream
     thinking_signature = "thinking_signature"  # Anthropic thinking block sig invalid
     long_context_tier = "long_context_tier"    # Anthropic "extra usage" tier gate
     oauth_long_context_beta_forbidden = "oauth_long_context_beta_forbidden"  # Anthropic OAuth subscription rejects 1M context beta — disable beta and retry
@@ -691,6 +692,19 @@ def classify_api_error(
         }
         defaults.update(overrides)
         return ClassifiedError(**defaults)
+
+    # A Plane-owned relay may deny this invocation before the provider sees it.
+    # This must win over generic HTTP 403/auth handling and never rotate or
+    # fall back credentials for a local runtime boundary failure.
+    if _is_provider_relay_denied_error(error):
+        reason_subreason = getattr(error, "reason_subreason", "")
+        return _result(
+            FailoverReason.provider_relay_denied,
+            retryable=False,
+            should_rotate_credential=False,
+            should_fallback=False,
+            error_context={"reason_subreason": reason_subreason},
+        )
 
     # A narrow provider adapter may mark an error when the upstream request
     # could have been accepted. This generic signal prevents credential
@@ -1685,6 +1699,26 @@ def _is_terminal_provider_error(error: Exception) -> bool:
             getattr(current, "terminal_failure", False) is True
             and getattr(current, "retryable", None) is False
             and getattr(current, "upstream_initiated", False) is True
+        ):
+            return True
+        cause = getattr(current, "__cause__", None) or getattr(current, "__context__", None)
+        if cause is None or cause is current:
+            break
+        current = cause
+    return False
+
+
+def _is_provider_relay_denied_error(error: Exception) -> bool:
+    """Find a typed Plane-local relay denial through SDK wrapping."""
+
+    current = error
+    for _ in range(5):
+        if (
+            getattr(current, "plane_runtime_failure", False) is True
+            and getattr(current, "code", None) == "provider_relay_denied"
+            and getattr(current, "retryable", None) is False
+            and getattr(current, "upstream_initiated", None) is False
+            and isinstance(getattr(current, "reason_subreason", None), str)
         ):
             return True
         cause = getattr(current, "__cause__", None) or getattr(current, "__context__", None)

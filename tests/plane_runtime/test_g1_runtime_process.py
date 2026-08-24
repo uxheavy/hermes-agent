@@ -1219,6 +1219,7 @@ class G1RuntimeProcessTests(unittest.TestCase):
             ({"code": "insufficient_quota", "message": "provider secret"}, None, "provider_entitlement_failure"),
             ({"message": "unavailable"}, "auth", "provider_auth_failure"),
             ({"message": "unavailable"}, "timeout", "provider_transport_failure"),
+            ({"message": "lease_invalid"}, "provider_relay_denied", "provider_relay_denied"),
             ({"code": "invalid_request_error", "message": "provider secret"}, None, "provider_unknown_failure"),
         )
         for error, failure_reason, expected_cause in cases:

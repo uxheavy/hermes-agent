@@ -13,6 +13,7 @@ import threading
 import types
 from unittest import mock
 
+import httpx
 import pytest
 
 from plane_runtime.g1_bootstrap_contract import G1BootstrapFrames
@@ -23,12 +24,15 @@ from plane_runtime.hermes_adapter import (
     HermesKernelResult,
     InlineCredentialSource,
     PROVIDER_RELAY_BASE_URL,
+    ProviderRelayDeniedError,
     ProviderOutcomeUnknownError,
+    _raise_on_provider_outcome_unknown,
     prepare_provider_relay_credentials,
     provider_relay_base_url,
 )
 from plane_runtime.g1_service import serve_once_g1
 from plane_runtime.service import main as service_main
+from agent.error_classifier import FailoverReason, classify_api_error
 
 from tests.plane_runtime.test_g1_runtime_process import make_invocation, make_snapshot, _digest
 
@@ -204,6 +208,60 @@ def _outcome_unknown_response(*, status_code: int = 502) -> bytes:
         + b"\r\n\r\n"
         + body
     )
+
+
+def _json_error_response(error: str) -> httpx.Response:
+    body = json.dumps({"error": error}, separators=(",", ":")).encode()
+    return httpx.Response(
+        403,
+        headers={
+            "Content-Type": "application/json",
+            "Content-Length": str(len(body)),
+        },
+        content=body,
+        request=httpx.Request("POST", PROVIDER_RELAY_BASE_URL + "/chat/completions"),
+    )
+
+
+def test_provider_relay_lease_invalid_is_typed_and_non_retryable() -> None:
+    response = _json_error_response("lease_invalid")
+
+    with pytest.raises(ProviderRelayDeniedError) as raised:
+        _raise_on_provider_outcome_unknown(response)
+
+    error = raised.value
+    assert error.code == "provider_relay_denied"
+    assert error.reason_subreason == "lease_invalid"
+    assert error.status_code == 403
+    assert error.retryable is False
+    assert error.upstream_initiated is False
+    classified = classify_api_error(error, provider="openai-codex", model="gpt-5.6-luna")
+    assert classified.reason == FailoverReason.provider_relay_denied
+    assert classified.retryable is False
+    assert classified.should_rotate_credential is False
+    assert classified.should_fallback is False
+    assert classified.error_context == {"reason_subreason": "lease_invalid"}
+
+
+def test_provider_relay_upstream_403_remains_provider_auth() -> None:
+    body = json.dumps(
+        {"error": "provider_error", "statusClass": "4xx", "reasonSubreason": "auth"},
+        separators=(",", ":"),
+    ).encode()
+    response = httpx.Response(
+        403,
+        headers={
+            "Content-Type": "application/json",
+            "Content-Length": str(len(body)),
+        },
+        content=body,
+        request=httpx.Request("POST", PROVIDER_RELAY_BASE_URL + "/chat/completions"),
+    )
+
+    _raise_on_provider_outcome_unknown(response)
+    error = httpx.HTTPStatusError("provider forbidden", request=response.request, response=response)
+    classified = classify_api_error(error, provider="openai-codex", model="gpt-5.6-luna")
+    assert classified.reason == FailoverReason.auth
 
 
 class _BinaryStdin:

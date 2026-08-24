@@ -109,6 +109,7 @@ RUNTIME_FAILURE_CAUSES = frozenset(
         "relay_session_failure",
         "runtime_unknown_failure",
         "provider_auth_failure",
+        "provider_relay_denied",
         "provider_entitlement_failure",
         "provider_rate_limit",
         "provider_request_failure",

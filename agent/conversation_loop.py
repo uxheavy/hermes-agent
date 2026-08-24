@@ -5073,6 +5073,7 @@ def run_conversation(
                     )
                 ) and not is_context_length_error
                 is_budget_exhausted = classified.reason == FailoverReason.budget_exhausted
+                is_provider_relay_denied = classified.reason == FailoverReason.provider_relay_denied
                 is_terminal_failure = classified.terminal
 
                 if is_client_error:
@@ -5086,6 +5087,7 @@ def run_conversation(
                         not is_terminal_failure
                         and agent._has_pending_fallback()
                         and not is_budget_exhausted
+                        and not is_provider_relay_denied
                     ):
                         if classified.reason == FailoverReason.content_policy_blocked:
                             agent._buffer_status("⚠️ Provider safety filter blocked this request — trying fallback...")
@@ -5096,6 +5098,7 @@ def run_conversation(
                     if (
                         not is_terminal_failure
                         and not is_budget_exhausted
+                        and not is_provider_relay_denied
                         and agent._try_activate_fallback()
                     ):
                         active_system_prompt = _sync_failover_system_message(

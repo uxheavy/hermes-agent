@@ -56,6 +56,22 @@ _PROVIDER_RELAY_FIELDS = frozenset(
 )
 _PROVIDER_RELAY_DUMMY_API_KEY = "plane-provider-relay"
 _MAX_PROVIDER_ERROR_BODY_BYTES = 4096
+_PROVIDER_RELAY_DENIAL_CODES = frozenset(
+    {
+        "lease_invalid",
+        "cancelled",
+        "budget_exhausted",
+        "concurrency",
+        "denied",
+        "credential_payload",
+        "redirect_denied",
+        "request_oversize",
+        "response_oversize",
+        "response_chunk_oversize",
+        "oversize",
+        "replay",
+    }
+)
 _CODE_MODE_RUNTIME_POLICY_FIELDS = (
     "maxCodeModeInputBytes",
     "maxCodeModeOutputBytes",
@@ -111,6 +127,7 @@ _PROVIDER_RESULT_FAILURE_CAUSES = MappingProxyType(
         FailoverReason.content_policy_blocked: "provider_request_failure",
         FailoverReason.invalid_encrypted_content: "provider_request_failure",
         FailoverReason.multimodal_tool_content_unsupported: "provider_request_failure",
+        FailoverReason.provider_relay_denied: "provider_relay_denied",
     }
 )
 _PROVIDER_RESULT_FAILURE_REASON_ALIASES = MappingProxyType(
@@ -279,6 +296,7 @@ def _runtime_child_diagnostic(
 _STRUCTURED_FAILURE_EXCEPTION_CLASSES = MappingProxyType(
     {
         "outcome_unknown": "RuntimeError",
+        "provider_relay_denied": "RuntimeError",
         "budget_exhausted": "RuntimeError",
         "required_tool_not_used": "RuntimeError",
         "plane_code_mode_continuation_failed": "RuntimeError",
@@ -319,6 +337,28 @@ class ProviderOutcomeUnknownError(RuntimeError):
     def __init__(self, *, status_code: int) -> None:
         self.status_code = status_code
         super().__init__("provider outcome is unknown; reconcile before retrying")
+
+
+class ProviderRelayDeniedError(RuntimeError):
+    """A Plane relay denied this invocation before an upstream request."""
+
+    code = "provider_relay_denied"
+    retryable = False
+    upstream_initiated = False
+    plane_runtime_failure = True
+
+    def __init__(self, *, status_code: int, reason_subreason: str) -> None:
+        if reason_subreason not in _PROVIDER_RELAY_DENIAL_CODES:
+            reason_subreason = "denied"
+        self.status_code = status_code
+        self.reason_subreason = reason_subreason
+        self.body = {
+            "error": {
+                "code": self.code,
+                "reasonSubreason": reason_subreason,
+            }
+        }
+        super().__init__(f"Plane provider relay denied: {reason_subreason}")
 
 
 class _ProviderOutcomeUnknownLatch:
@@ -434,6 +474,16 @@ def _raise_on_provider_outcome_unknown(
         if outcome_unknown_latch is not None:
             outcome_unknown_latch.mark()
         raise ProviderOutcomeUnknownError(status_code=int(response.status_code))
+    if (
+        int(response.status_code) == 403
+        and isinstance(payload, dict)
+        and set(payload) == {"error"}
+        and payload.get("error") in _PROVIDER_RELAY_DENIAL_CODES
+    ):
+        raise ProviderRelayDeniedError(
+            status_code=int(response.status_code),
+            reason_subreason=str(payload["error"]),
+        )
 
 
 def validate_absolute_unix_socket_path(value: object) -> str | None:
@@ -1541,6 +1591,22 @@ class HermesKernelAdapter:
                     model_calls=self._observed_model_calls(agent, None),
                 )
             if (
+                getattr(exc, "plane_runtime_failure", False) is True
+                and getattr(exc, "code", None) == "provider_relay_denied"
+                and getattr(exc, "retryable", None) is False
+                and getattr(exc, "upstream_initiated", None) is False
+            ):
+                return HermesKernelResult(
+                    kind="failed",
+                    failure_code="runtime_error",
+                    failure_message="Hermes invocation failed",
+                    failure_cause="provider_relay_denied",
+                    retryable=False,
+                    model_calls=self._observed_model_calls(agent, None),
+                    runtime_phase="conversation",
+                    exception_class="RuntimeError",
+                )
+            if (
                 host_binding is not None
                 and host_binding.fatal_error is not None
                 and not host_binding.fatal_error_after_terminal
@@ -1739,6 +1805,20 @@ class HermesKernelAdapter:
                         result.get("failure_reason")
                     ),
                 )
+            if result.get("failure_reason") == "provider_relay_denied":
+                return HermesKernelResult(
+                    kind="failed",
+                    failure_code="runtime_error",
+                    failure_message="Hermes invocation failed",
+                    failure_cause="provider_relay_denied",
+                    retryable=False,
+                    usage=usage,
+                    model_calls=model_calls,
+                    runtime_phase="conversation",
+                    exception_class=_structured_failure_exception_class(
+                        result.get("failure_reason")
+                    ),
+                )
             persistence_cause = _session_persistence_failure_cause(
                 result.get("failure_reason")
             )
@@ -1915,6 +1995,7 @@ __all__ = [
     "HermesKernelAdapter",
     "HermesKernelResult",
     "NeverCancelled",
+    "ProviderRelayDeniedError",
     "PROVIDER_RELAY_BASE_URL",
     "RUNTIME_FAILURE_CAUSES",
     "bound_runtime_text",
