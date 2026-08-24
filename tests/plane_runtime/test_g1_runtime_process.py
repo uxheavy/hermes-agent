@@ -1115,6 +1115,7 @@ class G1RuntimeProcessTests(unittest.TestCase):
 
         for failure_reason, expected_exception_class in (
             ("required_tool_not_used", "RuntimeError"),
+            ("unknown", "Unknown"),
             ("unclassified_failure_reason", "Unknown"),
         ):
             class FailedAgent:

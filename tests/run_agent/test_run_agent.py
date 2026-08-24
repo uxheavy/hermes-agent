@@ -2726,6 +2726,33 @@ class TestRunConversation:
         assert mock_handle_function_call.call_args.kwargs["tool_call_id"] == "c1"
         assert mock_handle_function_call.call_args.kwargs["session_id"] == agent.session_id
 
+    def test_response_parsing_failure_retains_bounded_reason(self, agent):
+        """A completed provider call with a local parse error must not lose its reason."""
+        self._setup_agent(agent)
+
+        class MalformedResponse:
+            model = "test/model"
+            usage = None
+
+            @property
+            def choices(self):
+                raise ValueError("provider secret parser detail")
+
+        agent.client.chat.completions.create.return_value = MalformedResponse()
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("parse the response")
+
+        assert result["failed"] is True
+        assert result["completed"] is False
+        assert result["failure_reason"] == "unknown"
+        assert "provider secret" not in result["failure_reason"]
+        assert result["api_calls"] == 1
+        assert agent.client.chat.completions.create.call_count == 1
+
     def test_code_mode_rejects_direct_plane_operation_model_call(self, agent):
         self._setup_agent(agent)
         agent.valid_tool_names = {"plane_execute_typescript", "plane_publish"}

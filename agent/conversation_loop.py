@@ -5275,9 +5275,8 @@ def run_conversation(
                         "completed": False,
                         "failed": True,
                         "error": _nonretryable_summary,
+                        "failure_reason": classified.reason.value,
                     }
-                    if is_budget_exhausted or is_terminal_failure:
-                        result["failure_reason"] = classified.reason.value
                     return result
 
                 if retry_count >= max_retries:
