@@ -4,8 +4,7 @@
 
 Candidate B is based on Hermes `1619b409b06ebfab18e9b964ef3e351f82778dcf`
 with the wrapped-cause fix from `59acc45225091c984336341bbc5876cd4ec7eec0`.
-The implementation uses one bounded cause extractor for the classifier and
-retains the existing boolean predicate as a compatibility wrapper.
+The implementation uses one bounded cause extractor for the classifier.
 
 The Candidate A graft pattern was the right structural starting point:
 return the matched inner typed exception so classification cannot read an

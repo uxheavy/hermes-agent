@@ -1757,12 +1757,6 @@ def _find_provider_relay_denied_error(error: Exception) -> Exception | None:
     return None
 
 
-def _is_provider_relay_denied_error(error: Exception) -> bool:
-    """Preserve the boolean relay-denial predicate for existing callers."""
-
-    return _find_provider_relay_denied_error(error) is not None
-
-
 def _extract_error_body(error: Exception) -> dict:
     """Extract the structured error body from an SDK exception or its cause chain."""
     current = error
