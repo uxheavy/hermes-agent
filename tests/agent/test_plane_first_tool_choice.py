@@ -1,5 +1,6 @@
 """Provider-free contract for Plane Code Mode's first tool request."""
 
+import json
 from types import SimpleNamespace
 
 from agent.chat_completion_helpers import (
@@ -166,3 +167,77 @@ def test_code_mode_diagnostic_records_serialized_choice_and_response_class_only(
             }
         ],
     }
+
+
+def test_publish_argument_shape_diagnostic_is_finite_and_non_sensitive():
+    secret = "SECRET_PUBLICATION_CONTENT"
+    cases = [
+        (f'{{"kind":"outcome","content":"{secret}"', "malformed_json"),
+        (json.dumps([secret, "operation:secret"]), "non_object"),
+        (json.dumps({"kind": "outcome", "content": secret}), "minimal_outcome"),
+        (
+            json.dumps(
+                {
+                    "kind": "outcome",
+                    "operationRef": "operation:secret",
+                    "resourceRef": "outcome:secret",
+                    "content": secret,
+                }
+            ),
+            "exact_redundant_outcome",
+        ),
+        (
+            json.dumps(
+                {
+                    "kind": "outcome",
+                    "operationRef": "operation:secret",
+                    "content": secret,
+                }
+            ),
+            "partial_or_unknown_outcome",
+        ),
+        (
+            json.dumps(
+                {
+                    "kind": "conversation",
+                    "resourceRef": "conversation:secret",
+                    "content": secret,
+                }
+            ),
+            "conversation",
+        ),
+        (json.dumps({"content": secret}), "missing_required"),
+    ]
+
+    for arguments, expected in cases:
+        agent = SimpleNamespace(_plane_runtime_diagnostics={"responses": []})
+        _record_plane_runtime_response(
+            agent,
+            SimpleNamespace(tool_calls=[_tool_call(name="plane_publish", arguments=arguments)]),
+        )
+
+        response = agent._plane_runtime_diagnostics["responses"][0]
+        assert response == {
+            "sequence": 1,
+            "responseClass": "tool_call",
+            "toolCall": "publish",
+            "publishArgumentShape": expected,
+        }
+        assert secret not in json.dumps(agent._plane_runtime_diagnostics)
+
+    missing_arguments = SimpleNamespace(
+        function=SimpleNamespace(name="plane_publish"),
+    )
+    agent = SimpleNamespace(_plane_runtime_diagnostics={"responses": []})
+    _record_plane_runtime_response(agent, SimpleNamespace(tool_calls=[missing_arguments]))
+    assert agent._plane_runtime_diagnostics["responses"][0]["publishArgumentShape"] == (
+        "missing_required"
+    )
+
+    non_publish = SimpleNamespace(_plane_runtime_diagnostics={"responses": []})
+    _record_plane_runtime_response(
+        non_publish,
+        SimpleNamespace(tool_calls=[_tool_call(arguments=json.dumps({"content": secret}))]),
+    )
+    assert "publishArgumentShape" not in non_publish._plane_runtime_diagnostics["responses"][0]
+    assert secret not in json.dumps(non_publish._plane_runtime_diagnostics)

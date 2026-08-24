@@ -23,6 +23,7 @@ import random
 import re
 import ssl
 import time
+from collections.abc import Mapping
 from typing import Any, Dict, List, Optional
 
 from agent.chat_completion_helpers import _plane_required_tool, _plane_tool_name
@@ -165,6 +166,42 @@ def _plane_runtime_tool_call_class(tool_calls: Any) -> str:
     return "multiple"
 
 
+def _plane_publish_argument_shape(tool_calls: Any) -> str:
+    """Classify publish arguments without retaining any model-supplied data."""
+
+    publish_call = None
+    for call in tool_calls or []:
+        function = getattr(call, "function", None)
+        if getattr(function, "name", None) == "plane_publish":
+            publish_call = function
+            break
+    if publish_call is None or not hasattr(publish_call, "arguments"):
+        return "missing_required"
+
+    arguments = publish_call.arguments
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments)
+        except (TypeError, json.JSONDecodeError):
+            return "malformed_json"
+    if not isinstance(arguments, Mapping):
+        return "non_object"
+
+    keys = set(arguments)
+    kind = arguments.get("kind")
+    if kind == "conversation":
+        return "conversation"
+    if kind == "outcome":
+        if keys == {"kind", "content"}:
+            return "minimal_outcome"
+        if keys == {"kind", "operationRef", "resourceRef", "content"}:
+            return "exact_redundant_outcome"
+        return "partial_or_unknown_outcome"
+    if kind is None or "content" not in keys:
+        return "missing_required"
+    return "partial_or_unknown_outcome"
+
+
 def _record_plane_runtime_request(agent: Any, api_kwargs: Any) -> None:
     """Retain only bounded request-choice metadata for Code Mode diagnosis."""
 
@@ -208,13 +245,15 @@ def _record_plane_runtime_response(agent: Any, assistant_message: Any) -> None:
     if len(responses) >= 32:
         return
     tool_calls = getattr(assistant_message, "tool_calls", None) or []
-    responses.append(
-        {
-            "sequence": len(responses) + 1,
-            "responseClass": "tool_call" if tool_calls else "text_response",
-            "toolCall": _plane_runtime_tool_call_class(tool_calls),
-        }
-    )
+    tool_call = _plane_runtime_tool_call_class(tool_calls)
+    response = {
+        "sequence": len(responses) + 1,
+        "responseClass": "tool_call" if tool_calls else "text_response",
+        "toolCall": tool_call,
+    }
+    if tool_call == "publish":
+        response["publishArgumentShape"] = _plane_publish_argument_shape(tool_calls)
+    responses.append(response)
 
 
 def _consume_plane_first_required_tool(
