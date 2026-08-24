@@ -722,8 +722,9 @@ def classify_api_error(
     # A Plane-owned relay may deny this invocation before the provider sees it.
     # This must win over generic HTTP 403/auth handling and never rotate or
     # fall back credentials for a local runtime boundary failure.
-    if _is_provider_relay_denied_error(error):
-        reason_subreason = getattr(error, "reason_subreason", "")
+    provider_relay_denial = _find_provider_relay_denied_error(error)
+    if provider_relay_denial is not None:
+        reason_subreason = getattr(provider_relay_denial, "reason_subreason", "")
         return _result(
             FailoverReason.provider_relay_denied,
             retryable=False,
@@ -1734,24 +1735,33 @@ def _is_terminal_provider_error(error: Exception) -> bool:
     return False
 
 
-def _is_provider_relay_denied_error(error: Exception) -> bool:
-    """Find a typed Plane-local relay denial through SDK wrapping."""
+def _find_provider_relay_denied_error(error: Exception) -> Exception | None:
+    """Return the matched typed Plane-local relay denial through SDK wrapping."""
 
     current = error
     for _ in range(5):
+        reason_subreason = _bounded_provider_relay_denial_subreason(
+            getattr(current, "reason_subreason", None)
+        )
         if (
             getattr(current, "plane_runtime_failure", False) is True
             and getattr(current, "code", None) == "provider_relay_denied"
             and getattr(current, "retryable", None) is False
             and getattr(current, "upstream_initiated", None) is False
-            and isinstance(getattr(current, "reason_subreason", None), str)
+            and reason_subreason is not None
         ):
-            return True
+            return current
         cause = getattr(current, "__cause__", None) or getattr(current, "__context__", None)
         if cause is None or cause is current:
             break
         current = cause
-    return False
+    return None
+
+
+def _is_provider_relay_denied_error(error: Exception) -> bool:
+    """Preserve the boolean relay-denial predicate for existing callers."""
+
+    return _find_provider_relay_denied_error(error) is not None
 
 
 def _extract_error_body(error: Exception) -> dict:

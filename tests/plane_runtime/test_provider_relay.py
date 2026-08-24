@@ -246,6 +246,30 @@ def test_provider_relay_lease_invalid_is_typed_and_non_retryable() -> None:
     assert classified.error_context == {"reason_subreason": "lease_invalid"}
 
 
+def test_wrapped_provider_relay_denial_uses_inner_finite_subreason() -> None:
+    request = httpx.Request("POST", PROVIDER_RELAY_BASE_URL + "/chat/completions")
+
+    def wrapped(inner: Exception) -> httpx.HTTPStatusError:
+        outer = httpx.HTTPStatusError(
+            "SDK wrapper", request=request, response=httpx.Response(403, request=request)
+        )
+        outer.reason_subreason = "provider_secret"  # type: ignore[attr-defined]
+        outer.__cause__ = inner
+        return outer
+
+    inner = ProviderRelayDeniedError(status_code=403, reason_subreason="lease_invalid")
+    classified = classify_api_error(wrapped(inner), provider="openai-codex", model="gpt-5.6-luna")
+    assert classified.reason == FailoverReason.provider_relay_denied
+    assert classified.error_context == {"reason_subreason": "lease_invalid"}
+    assert classified.retryable is False
+    assert classified.should_rotate_credential is False
+    assert classified.should_fallback is False
+
+    for reason_subreason in ("provider_secret", [], None):
+        inner.reason_subreason = reason_subreason  # type: ignore[assignment]
+        assert classify_api_error(wrapped(inner)).reason != FailoverReason.provider_relay_denied
+
+
 def test_provider_relay_upstream_403_remains_provider_auth() -> None:
     body = json.dumps(
         {"error": "provider_error", "statusClass": "4xx", "reasonSubreason": "auth"},
