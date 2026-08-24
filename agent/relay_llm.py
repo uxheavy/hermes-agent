@@ -72,20 +72,24 @@ def execute(
         return raw_response["json"]
 
     try:
-        managed = _run_awaitable(
-            runtime.run_in_session_async(
-                session,
-                runtime.relay.llm.execute,
-                name,
-                relay_request,
-                invoke,
-                handle=parent,
-                metadata=_jsonable(metadata or {}),
-                model_name=model_name,
-                codec=_codec(runtime.relay, metadata),
-                response_codec=_codec(runtime.relay, metadata),
+        session.llm_lock.acquire()
+        try:
+            managed = _run_awaitable(
+                runtime.run_in_session_async(
+                    session,
+                    runtime.relay.llm.execute,
+                    name,
+                    relay_request,
+                    invoke,
+                    handle=parent,
+                    metadata=_jsonable(metadata or {}),
+                    model_name=model_name,
+                    codec=_codec(runtime.relay, metadata),
+                    response_codec=_codec(runtime.relay, metadata),
+                )
             )
-        )
+        finally:
+            session.llm_lock.release()
     except BaseException as exc:
         if (
             callback_error is not None
@@ -343,6 +347,7 @@ class ManagedLlmStream(Iterator[Any]):
         self._provider_completed = False
         self._raw_chunks: list[tuple[Any, Any]] = []
         self.output_modified = False
+        self._llm_lock: Any = None
         callback_context = contextvars.copy_context()
 
         def run_callback(callback: Callable[..., Any], *args: Any) -> Any:
@@ -454,6 +459,8 @@ class ManagedLlmStream(Iterator[Any]):
         loop = asyncio.new_event_loop()
         self._loop = loop
         self._relay_observes_chunks = True
+        self._llm_lock = session.llm_lock
+        self._llm_lock.acquire()
         try:
             self._stream = loop.run_until_complete(
                 runtime.run_in_session_async(
@@ -492,6 +499,7 @@ class ManagedLlmStream(Iterator[Any]):
                 self._logical = None
             loop.close()
             self._loop = None
+            self._release_llm_lock()
             raise
 
     def __iter__(self) -> "ManagedLlmStream":
@@ -592,6 +600,7 @@ class ManagedLlmStream(Iterator[Any]):
                         exc_info=True,
                     )
             loop.close()
+            self._release_llm_lock()
         if not self._defer_logical_completion:
             _complete_logical(self._logical, outcome="success")
             self._logical = None
@@ -625,6 +634,7 @@ class ManagedLlmStream(Iterator[Any]):
             if not self._defer_logical_completion:
                 _complete_logical(self._logical, outcome=logical_outcome)
                 self._logical = None
+            self._release_llm_lock()
             return
         close = getattr(self._stream, "aclose", None)
         if callable(close):
@@ -641,6 +651,14 @@ class ManagedLlmStream(Iterator[Any]):
             _complete_logical(self._logical, outcome=logical_outcome)
             self._logical = None
         loop.close()
+        self._release_llm_lock()
+
+    def _release_llm_lock(self) -> None:
+        llm_lock = self._llm_lock
+        if llm_lock is None:
+            return
+        self._llm_lock = None
+        llm_lock.release()
 
     def __del__(self) -> None:
         self._close(logical_outcome="cancelled")

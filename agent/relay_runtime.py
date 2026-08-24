@@ -33,6 +33,7 @@ class RelaySession:
     session_id: str
     parent_session_id: str = ""
     lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
+    llm_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     closing: bool = False
     handle: Any = None
     context: contextvars.Context | None = None
