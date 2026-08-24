@@ -2560,6 +2560,68 @@ print("text_response")
                 self.assertNotIn("opaque-module", encoded)
                 self.assertNotIn("bounded host failure", encoded)
 
+    def test_code_mode_error_class_from_result_output_is_bounded(self) -> None:
+        callbacks: list[Mapping[str, object]] = []
+        binding = PlaneHostBinding(
+            port=CallablePlaneHostPort(
+                lambda request: _result(
+                    request,
+                    status="invalid",
+                    output={
+                        "codeModeErrorClass": "module_parse_or_load",
+                        "rawSource": "must-not-leak",
+                    },
+                    errorCode="CODE_MODE_FAILED",
+                    errorMessage="must-not-leak",
+                )
+            ),
+            run_id="run:diagnostic",
+            invocation_id="invocation:diagnostic",
+            correlation_id="correlation:diagnostic",
+            cancellation=lambda: False,
+            diagnostic_callback=callbacks.append,
+        )
+        binding.call(
+            action="code",
+            operation_ref="plane.code-mode.execute@1",
+            input={"source": "opaque-module"},
+            source="code",
+        )
+
+        diagnostic = binding.host_operation_diagnostic
+        self.assertIsNotNone(diagnostic)
+        assert diagnostic is not None
+        self.assertEqual(diagnostic["codeModeFailureClass"], "code_mode")
+        self.assertEqual(diagnostic["codeModeErrorClass"], "module_parse_or_load")
+        self.assertEqual(callbacks[-1], diagnostic)
+        encoded = json.dumps(diagnostic, sort_keys=True)
+        self.assertNotIn("must-not-leak", encoded)
+
+        invalid = PlaneHostBinding(
+            port=CallablePlaneHostPort(
+                lambda request: _result(
+                    request,
+                    status="invalid",
+                    output={"codeModeErrorClass": "raw-message"},
+                    errorCode="CODE_MODE_FAILED",
+                    errorMessage="must-not-leak",
+                )
+            ),
+            run_id="run:diagnostic-invalid",
+            invocation_id="invocation:diagnostic-invalid",
+            correlation_id="correlation:diagnostic-invalid",
+            cancellation=lambda: False,
+        )
+        invalid.call(
+            action="code",
+            operation_ref="plane.code-mode.execute@1",
+            input={"source": "opaque-module"},
+            source="code",
+        )
+        invalid_diagnostic = invalid.host_operation_diagnostic
+        assert invalid_diagnostic is not None
+        self.assertNotIn("codeModeErrorClass", invalid_diagnostic)
+
     def test_plane_conflict_is_model_observable_but_idempotency_conflict_stays_fatal(self) -> None:
         conflict = PlaneHostBinding(
             port=CallablePlaneHostPort(

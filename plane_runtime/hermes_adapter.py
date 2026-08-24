@@ -18,6 +18,7 @@ import httpx
 from agent.error_classifier import FailoverReason, classify_api_error
 
 from .g1_contract import (
+    CODE_MODE_ERROR_CLASSES,
     G1ContractError,
     G1InvocationEnvelope,
     G1RunSnapshot,
@@ -1023,13 +1024,17 @@ def _record_plane_runtime_host_callback(agent: Any, diagnostic: Any) -> None:
     callbacks = diagnostics.setdefault("hostCallbacks", [])
     if not isinstance(callbacks, list) or len(callbacks) >= 64:
         return
-    callbacks.append(
-        {
-            "sequence": len(callbacks) + 1,
-            "phase": phase,
-            "operationRefDigest": digest,
-        }
-    )
+    callback = {
+        "sequence": len(callbacks) + 1,
+        "phase": phase,
+        "operationRefDigest": digest,
+    }
+    error_class = diagnostic.get("codeModeErrorClass")
+    if error_class is not None:
+        if not isinstance(error_class, str) or error_class not in CODE_MODE_ERROR_CLASSES:
+            return
+        callback["codeModeErrorClass"] = error_class
+    callbacks.append(callback)
 
 
 class NeverCancelled:

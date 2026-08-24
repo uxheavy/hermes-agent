@@ -28,7 +28,12 @@ from dataclasses import dataclass, field, replace
 from types import MappingProxyType
 from typing import Any, Callable, Iterator, Literal, Mapping, Protocol
 
-from .g1_contract import CODE_MODE_PHASES, G1ContractError, validate_eager_input_schema
+from .g1_contract import (
+    CODE_MODE_ERROR_CLASSES,
+    CODE_MODE_PHASES,
+    G1ContractError,
+    validate_eager_input_schema,
+)
 
 
 HOST_PROTOCOL = "plane.agent-runtime/v1"
@@ -1404,6 +1409,7 @@ class PlaneHostBinding:
         *,
         status: str,
         error_code: str | None = None,
+        output: Any = None,
     ) -> None:
         """Attach only finite Code Mode result facts to the host diagnostic."""
 
@@ -1423,6 +1429,11 @@ class PlaneHostBinding:
         diagnostic = dict(self._host_operation_diagnostic or {})
         diagnostic["codeModeHostStatus"] = bounded_status
         diagnostic["codeModeFailureClass"] = failure_class
+        diagnostic.pop("codeModeErrorClass", None)
+        if error_code == "CODE_MODE_FAILED" and isinstance(output, Mapping):
+            error_class = output.get("codeModeErrorClass")
+            if isinstance(error_class, str) and error_class in CODE_MODE_ERROR_CLASSES:
+                diagnostic["codeModeErrorClass"] = error_class
         self._host_operation_diagnostic = diagnostic
         if self.diagnostic_callback is not None:
             try:
@@ -1773,7 +1784,10 @@ class PlaneHostBinding:
                     self._code_mode_phase_claimed = False
             self._set_callback_phase("host_return", request)
             self._set_code_mode_diagnostic(
-                request, status=result.status, error_code=result.error_code
+                request,
+                status=result.status,
+                error_code=result.error_code,
+                output=result.output,
             )
             if (
                 result.status in {"ok", "replayed"}

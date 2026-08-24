@@ -127,6 +127,15 @@ _CODE_MODE_HOST_STATUSES = frozenset(
 _CODE_MODE_FAILURE_CLASSES = frozenset(
     {"code_mode", "callback", "transport", "contract", "unknown"}
 )
+CODE_MODE_ERROR_CLASSES = frozenset(
+    {
+        "module_parse_or_load",
+        "default_export_missing",
+        "callback_or_protocol",
+        "execution_runtime",
+        "child_exit_no_result",
+    }
+)
 _PREPARED_HANDOFF_STAGES = frozenset(
     {"register", "runtime_auto_read", "hermes_model_read", "host_normalize", "registry_resolve", "registry_consume"}
 )
@@ -196,6 +205,7 @@ def _bounded_host_operation_diagnostic(value: Mapping[str, Any] | None) -> dict[
         "operationRefDigest",
         "codeModeHostStatus",
         "codeModeFailureClass",
+        "codeModeErrorClass",
         "socketPhase",
         "socketState",
         "preparedHandoff",
@@ -226,6 +236,13 @@ def _bounded_host_operation_diagnostic(value: Mapping[str, Any] | None) -> dict[
         ):
             return None
         result.update({field: value[field] for field in code_mode_fields})
+    if "codeModeErrorClass" in value:
+        if (
+            not isinstance(value["codeModeErrorClass"], str)
+            or value["codeModeErrorClass"] not in CODE_MODE_ERROR_CLASSES
+        ):
+            return None
+        result["codeModeErrorClass"] = value["codeModeErrorClass"]
     socket_fields = {"socketPhase", "socketState"}
     present = socket_fields.intersection(value)
     if present and present != socket_fields:
@@ -858,6 +875,7 @@ def _validate_failure(value: Any, name: str = "failure") -> dict[str, Any]:
             "operationRefDigest",
             "codeModeHostStatus",
             "codeModeFailureClass",
+            "codeModeErrorClass",
             "runtimePhase",
             "exceptionClass",
             "childDiagnostic",
@@ -898,6 +916,11 @@ def _validate_failure(value: Any, name: str = "failure") -> dict[str, Any]:
             or data["codeModeFailureClass"] not in _CODE_MODE_FAILURE_CLASSES
         ):
             raise G1ContractError(f"{name} Code Mode diagnostic fields are invalid")
+    if "codeModeErrorClass" in data and (
+        not isinstance(data["codeModeErrorClass"], str)
+        or data["codeModeErrorClass"] not in CODE_MODE_ERROR_CLASSES
+    ):
+        raise G1ContractError(f"{name}.codeModeErrorClass is invalid")
     socket_fields = {"socketPhase", "socketState"}
     present_socket_fields = socket_fields.intersection(data)
     if present_socket_fields and present_socket_fields != socket_fields:
