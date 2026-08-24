@@ -217,8 +217,16 @@ def _record_plane_runtime_response(agent: Any, assistant_message: Any) -> None:
     )
 
 
-def _consume_plane_first_required_tool(agent: Any, tool_calls: Any) -> None:
-    """Release the finite Code Mode first-tool guard after its valid call."""
+def _consume_plane_first_required_tool(
+    agent: Any,
+    tool_calls: Any,
+    *,
+    dispatch_accepted: bool = False,
+) -> None:
+    """Release the finite first-tool guard after accepted dispatch."""
+
+    if not dispatch_accepted:
+        return
 
     required = getattr(agent, "_plane_first_required_tool", None)
     if not isinstance(required, str) or not required:
@@ -6121,8 +6129,6 @@ def run_conversation(
                 # Reset retry counter on successful JSON validation
                 agent._invalid_json_retries = 0
 
-                _consume_plane_first_required_tool(agent, assistant_message.tool_calls)
-
                 # ── Post-call guardrails ──────────────────────────
                 assistant_message.tool_calls = agent._cap_delegate_task_calls(
                     assistant_message.tool_calls
@@ -6305,7 +6311,18 @@ def run_conversation(
                     except Exception:
                         pass
 
+                # Consume the finite first-tool latch only after the call has
+                # crossed the executor boundary.  Name/JSON validation and
+                # the mixed-batch filter above can reject a model-shaped call
+                # without dispatching it; those calls must leave the latch
+                # armed so the next provider response is still required to
+                # use the commissioned tool.
                 agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
+                _consume_plane_first_required_tool(
+                    agent,
+                    assistant_message.tool_calls,
+                    dispatch_accepted=True,
+                )
 
                 if getattr(agent, "_incremental_persistence_failed", False):
                     # A tool result could not be made canonical. Do not send

@@ -7,6 +7,7 @@ from agent.chat_completion_helpers import (
     _plane_first_tool_tools,
 )
 from agent.conversation_loop import (
+    _consume_plane_first_required_tool,
     _record_plane_runtime_request,
     _record_plane_runtime_response,
 )
@@ -51,6 +52,34 @@ def _request(agent, tools):
     )
 
 
+def _tool_call(name="plane_execute_typescript", arguments="{}"):
+    return SimpleNamespace(
+        function=SimpleNamespace(name=name, arguments=arguments),
+    )
+
+
+def test_rejected_execute_shape_does_not_consume_first_tool_latch():
+    agent = SimpleNamespace(_plane_first_required_tool="plane_execute_typescript")
+
+    _consume_plane_first_required_tool(
+        agent,
+        [_tool_call(arguments="{broken")],
+    )
+
+    assert agent._plane_first_required_tool == "plane_execute_typescript"
+
+
+def test_accepted_execute_dispatch_consumes_latch_once():
+    agent = SimpleNamespace(_plane_first_required_tool="plane_execute_typescript")
+    call = [_tool_call()]
+
+    _consume_plane_first_required_tool(agent, call, dispatch_accepted=True)
+    assert agent._plane_first_required_tool is None
+
+    _consume_plane_first_required_tool(agent, call, dispatch_accepted=True)
+    assert agent._plane_first_required_tool is None
+
+
 def test_code_mode_first_request_filters_to_execute_then_restores_publish():
     agent = SimpleNamespace(
         request_overrides={},
@@ -61,9 +90,13 @@ def test_code_mode_first_request_filters_to_execute_then_restores_publish():
     assert first["tool_choice"] == "required"
     assert [tool["name"] for tool in first["tools"]] == ["plane_execute_typescript"]
 
-    # The conversation loop clears the finite hint after the first matching
-    # tool invocation. The same transport path then uses its normal auto mode.
-    agent._plane_first_required_tool = None
+    # The conversation loop clears the finite hint only after accepted
+    # dispatch. The same transport path then uses its normal auto mode.
+    _consume_plane_first_required_tool(
+        agent,
+        [_tool_call()],
+        dispatch_accepted=True,
+    )
     second = _request(agent, [_PLANE_TOOL, _PUBLISH_TOOL])
     assert second["tool_choice"] == "auto"
     assert [tool["name"] for tool in second["tools"]] == [
