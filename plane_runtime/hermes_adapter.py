@@ -467,13 +467,16 @@ def _raise_on_provider_outcome_unknown(
     if (
         int(response.status_code) == 403
         and isinstance(payload, dict)
-        and set(payload) == {"error"}
+        and set(payload).issubset({"error", "reasonSubreason"})
         and isinstance(payload.get("error"), str)
         and payload.get("error") in _PROVIDER_RELAY_DENIAL_CODES
     ):
+        reason_subreason = payload.get("reasonSubreason")
+        if not isinstance(reason_subreason, str) or reason_subreason not in _PROVIDER_RELAY_DENIAL_CODES:
+            reason_subreason = str(payload["error"])
         raise ProviderRelayDeniedError(
             status_code=int(response.status_code),
-            reason_subreason=str(payload["error"]),
+            reason_subreason=reason_subreason,
         )
 
 

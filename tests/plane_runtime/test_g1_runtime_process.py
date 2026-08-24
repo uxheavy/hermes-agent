@@ -1337,6 +1337,13 @@ class G1RuntimeProcessTests(unittest.TestCase):
         self.assertEqual(result.provider_relay_denial_subreason, "lease_invalid")
         self.assertEqual(exit_frame["failure"]["providerRelayDenialSubreason"], "lease_invalid")
 
+        result, exit_frame = dispatch_result("credential_lease_expired")
+        self.assertEqual(result.provider_relay_denial_subreason, "credential_lease_expired")
+        self.assertEqual(
+            exit_frame["failure"]["providerRelayDenialSubreason"],
+            "credential_lease_expired",
+        )
+
         for subreason in ("provider_secret", [], None):
             result, exit_frame = dispatch_result(subreason)
             self.assertIsNone(result.provider_relay_denial_subreason)

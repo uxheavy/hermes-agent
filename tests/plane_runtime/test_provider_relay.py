@@ -246,6 +246,29 @@ def test_provider_relay_lease_invalid_is_typed_and_non_retryable() -> None:
     assert classified.error_context == {"reason_subreason": "lease_invalid"}
 
 
+def test_provider_relay_lease_detail_is_typed_and_fail_closed() -> None:
+    response = _json_error_response(
+        "lease_invalid",
+        extra={"reasonSubreason": "credential_lease_expired"},
+    )
+
+    with pytest.raises(ProviderRelayDeniedError) as raised:
+        _raise_on_provider_outcome_unknown(response)
+
+    error = raised.value
+    assert error.reason_subreason == "credential_lease_expired"
+    classified = classify_api_error(error, provider="openai-codex", model="gpt-5.6-luna")
+    assert classified.reason == FailoverReason.provider_relay_denied
+    assert classified.error_context == {"reason_subreason": "credential_lease_expired"}
+
+    for invalid in ("provider_secret", [], {"token": "secret"}):
+        with pytest.raises(ProviderRelayDeniedError) as malformed:
+            _raise_on_provider_outcome_unknown(
+                _json_error_response("lease_invalid", extra={"reasonSubreason": invalid})
+            )
+        assert malformed.value.reason_subreason == "lease_invalid"
+
+
 def test_wrapped_provider_relay_denial_projects_inner_finite_subreason() -> None:
     request = httpx.Request("POST", PROVIDER_RELAY_BASE_URL + "/chat/completions")
 

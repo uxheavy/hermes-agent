@@ -104,6 +104,13 @@ class ClassifiedError:
 _PROVIDER_RELAY_DENIAL_SUBREASONS = frozenset(
     {
         "lease_invalid",
+        "credential_lease_binding",
+        "credential_lease_expired",
+        "credential_lease_metadata_invalid",
+        "credential_lease_revoked",
+        "credential_lease_rotated",
+        "credential_state_invalid",
+        "credential_state_unavailable",
         "cancelled",
         "budget_exhausted",
         "concurrency",
