@@ -376,8 +376,61 @@ class HostPortTests(unittest.TestCase):
         )
         outcome_schema = publish_definition["function"]["parameters"]["oneOf"][0]
         self.assertEqual(outcome_schema["required"], ["kind", "content"])
-        self.assertNotIn("operationRef", outcome_schema["properties"])
-        self.assertNotIn("resourceRef", outcome_schema["properties"])
+        self.assertIn("operationRef", outcome_schema["properties"])
+        self.assertIn("resourceRef", outcome_schema["properties"])
+
+    def test_outcome_publish_tool_uses_bound_ref_with_redundant_operation_hint(self) -> None:
+        calls: list[dict] = []
+
+        def rpc(request: dict) -> dict:
+            calls.append(request)
+            if request["operationRef"] == PLANE_OUTCOME_SUBMIT_OPERATION:
+                return _result(
+                    request,
+                    output={
+                        "result": {
+                            "outcome": {"outcomeRef": "outcome-submission:trusted"}
+                        }
+                    },
+                )
+            return _result(
+                request,
+                publication={
+                    **_applied_outcome_publication(),
+                    "productRef": request["input"]["resourceRef"],
+                },
+            )
+
+        binding = PlaneHostBinding(
+            port=CallablePlaneHostPort(rpc),
+            run_id="run:publish-redundant-hint",
+            invocation_id="invocation:publish-redundant-hint",
+            correlation_id="correlation:publish-redundant-hint",
+            cancellation=lambda: False,
+        )
+        install_plane_tools()
+        with bind_plane_host(binding):
+            registry.dispatch(
+                "plane_operation",
+                {
+                    "action": "mutate",
+                    "operationRef": PLANE_OUTCOME_SUBMIT_OPERATION,
+                    "input": {"summary": "submitted"},
+                },
+            )
+            published = registry.dispatch(
+                "plane_publish",
+                {
+                    "kind": "outcome",
+                    "operationRef": PLANE_OUTCOME_PUBLISH_OPERATION,
+                    "content": "explicit publication",
+                },
+            )
+
+        self.assertEqual(json.loads(published)["status"], "ok")
+        self.assertEqual(
+            calls[1]["input"]["resourceRef"], "outcome-submission:trusted"
+        )
 
     def test_outcome_publish_tool_rejects_early_and_tampered_refs_without_host_call(self) -> None:
         calls: list[dict] = []

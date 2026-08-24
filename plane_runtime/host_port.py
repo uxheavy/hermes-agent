@@ -2464,7 +2464,26 @@ def _handle_plane_publish(args: Mapping[str, Any], **_: Any) -> str:
         kind = _text(data.get("kind"), "plane_publish.kind", 32)
         content = _text(data.get("content"), "plane_publish.content", MAX_HOST_CONTENT_BYTES)
         binding = _binding_or_error()
-        if kind == "outcome" and "operationRef" not in data and "resourceRef" not in data:
+        if kind == "outcome":
+            # Models sometimes repeat the generic operation/resource fields.
+            # Validate those hints, but always publish through the ref bound by
+            # the successful submit; they are never authority-bearing.
+            if "operationRef" in data:
+                operation_ref = _text(
+                    data["operationRef"],
+                    "plane_publish.operationRef",
+                    MAX_HOST_OPERATION_REF_BYTES,
+                )
+                if operation_ref != PLANE_OUTCOME_PUBLISH_OPERATION:
+                    raise PlaneHostError(
+                        "outcome publication operationRef is not the trusted publish operation"
+                    )
+            if "resourceRef" in data:
+                resource_ref = _text(data["resourceRef"], "plane_publish.resourceRef", 256)
+                if resource_ref != binding.outcome_submission_ref():
+                    raise PlaneHostError(
+                        "outcome publication resourceRef is not bound to this invocation"
+                    )
             result = binding.publish_outcome(content=content)
         else:
             operation_ref = _text(
@@ -2586,6 +2605,8 @@ def install_plane_tools() -> None:
                             "additionalProperties": False,
                             "properties": {
                                 "kind": {"type": "string", "enum": ["outcome"]},
+                                "operationRef": {"type": "string"},
+                                "resourceRef": {"type": "string"},
                                 "content": {"type": "string"},
                             },
                             "required": ["kind", "content"],
