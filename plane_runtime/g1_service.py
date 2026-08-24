@@ -167,7 +167,15 @@ def _terminal_failure(
         "retryable": bool(result.retryable),
     }
     if result.failure_cause is not None:
-        failure["cause"] = result.failure_cause
+        # ``required_tool_not_used`` is an Hermes-internal finite reason. The
+        # paired Plane RuntimeExit contract predates that reason, so keep the
+        # wire receipt valid and bounded without widening the cross-repo
+        # contract from the Hermes side.
+        failure["cause"] = (
+            "runtime_unknown_failure"
+            if result.failure_cause == "required_tool_not_used"
+            else result.failure_cause
+        )
     denial_subreason = _bounded_provider_relay_denial_subreason(result)
     if denial_subreason is not None:
         failure.update(denial_subreason)

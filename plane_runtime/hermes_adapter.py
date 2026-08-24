@@ -1867,6 +1867,20 @@ class HermesKernelAdapter:
                         result.get("failure_reason")
                     ),
                 )
+            if result.get("failure_reason") == "required_tool_not_used":
+                return HermesKernelResult(
+                    kind="failed",
+                    failure_code="runtime_error",
+                    failure_message="Hermes invocation failed",
+                    failure_cause="required_tool_not_used",
+                    retryable=False,
+                    usage=usage,
+                    model_calls=model_calls,
+                    runtime_phase="conversation",
+                    exception_class=_structured_failure_exception_class(
+                        result.get("failure_reason")
+                    ),
+                )
             model = snapshot.raw["runtimePolicy"].get("model", {})
             provider_failure_cause = _provider_result_failure_cause(
                 result.get("error"),

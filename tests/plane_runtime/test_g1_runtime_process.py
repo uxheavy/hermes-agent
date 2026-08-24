@@ -1149,6 +1149,52 @@ class G1RuntimeProcessTests(unittest.TestCase):
             self.assertEqual(exit_frame["failure"]["exceptionClass"], expected_exception_class)
             self.assertNotIn("private structured failure detail", json.dumps(exit_frame))
 
+    def test_hermes_adapter_fails_closed_for_required_tool_result(self) -> None:
+        snapshot_raw = make_snapshot()
+        snapshot_raw["runtimePolicy"] = dict(snapshot_raw["runtimePolicy"])  # type: ignore[arg-type]
+        snapshot_raw["runtimePolicy"]["adapter"] = "hermes"  # type: ignore[index]
+        snapshot_raw["contentDigest"] = _digest(
+            "snapshot", {key: value for key, value in snapshot_raw.items() if key != "contentDigest"}
+        )
+        snapshot = G1RunSnapshot.from_dict(snapshot_raw)
+        invocation = G1InvocationEnvelope.from_dict(make_invocation(snapshot.to_dict()))
+
+        class Credentials:
+            def resolve(self, provider: str) -> dict[str, str]:
+                del provider
+                return {"api_key": "trusted-host-secret"}
+
+        class RequiredToolAgent:
+            session_input_tokens = 3
+            session_output_tokens = 2
+            session_api_calls = 3
+
+            def run_conversation(self, message: str, *, system_message: str) -> dict[str, object]:
+                del message, system_message
+                return {
+                    "failed": True,
+                    "failure_reason": "required_tool_not_used",
+                    "final_response": "ordinary model text must not complete the run",
+                    "error": "private provider detail",
+                }
+
+        result = HermesKernelAdapter(
+            agent_factory=lambda **kwargs: RequiredToolAgent(),
+            credential_source=Credentials(),
+        ).dispatch(snapshot, invocation, lambda: False, lambda body: None, model_call_allowance=3)
+
+        self.assertEqual(result.kind, "failed")
+        self.assertEqual(result.failure_cause, "required_tool_not_used")
+        self.assertFalse(result.retryable)
+        self.assertEqual(result.runtime_phase, "conversation")
+        self.assertEqual(result.exception_class, "RuntimeError")
+        self.assertNotIn("ordinary model text", json.dumps(result.__dict__))
+        exit_frame = _terminal_failure(snapshot, invocation, result, 0)
+        self.assertEqual(exit_frame["kind"], "failed")
+        self.assertEqual(exit_frame["failure"]["cause"], "runtime_unknown_failure")
+        self.assertFalse(exit_frame["failure"]["retryable"])
+        self.assertNotIn("private provider detail", json.dumps(exit_frame))
+
     def test_hermes_adapter_projects_session_persistence_failure(self) -> None:
         snapshot = G1RunSnapshot.from_dict(make_snapshot())
         invocation = G1InvocationEnvelope.from_dict(make_invocation(snapshot.to_dict()))
