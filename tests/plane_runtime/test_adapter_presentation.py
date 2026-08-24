@@ -9,10 +9,16 @@ import tempfile
 import unittest
 from unittest import mock
 
-from plane_runtime.g1_contract import G1ContractError, G1InvocationEnvelope, G1RunSnapshot
+from plane_runtime.g1_contract import (
+    G1ContractError,
+    G1InvocationEnvelope,
+    G1RunSnapshot,
+    _bounded_payload,
+)
 from plane_runtime.hermes_adapter import (
     HermesKernelAdapter,
     ProviderOutcomeUnknownError,
+    _emit_plane_runtime_diagnostics,
     _classify_runtime_exception,
 )
 from plane_runtime.host_port import CallablePlaneHostPort, current_plane_host
@@ -21,7 +27,68 @@ from tests.plane_runtime.test_g1_runtime_process import _digest, make_invocation
 from tools.registry import registry
 
 
+def _runtime_diagnostics(bodies: list[dict[str, object]]) -> list[dict[str, object]]:
+    values: list[dict[str, object]] = []
+    for body in bodies:
+        payload = body.get("payload")
+        if not isinstance(payload, dict) or payload.get("kind") != "inline_text":
+            continue
+        if payload.get("contentType") != "text/plain":
+            continue
+        text = payload.get("text")
+        if not isinstance(text, str):
+            continue
+        try:
+            value = json.loads(text)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(value, dict) or value.get("kind") != "runtime_diagnostics":
+            continue
+        canonical = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        if text != canonical:
+            raise AssertionError("runtime diagnostics are not canonical JSON")
+        values.append(value)
+    return values
+
+
 class AdapterPresentationTests(unittest.TestCase):
+    def test_runtime_diagnostics_use_bounded_canonical_inline_text(self) -> None:
+        class Agent:
+            _plane_runtime_diagnostics = {
+                "requests": [
+                    {
+                        "sequence": 1,
+                        "toolChoice": "required",
+                        "visibleToolset": "execute_only",
+                        "visibleToolCount": 1,
+                        "serialized": True,
+                    }
+                ],
+                "responses": [
+                    {"sequence": 1, "responseClass": "tool_call", "toolCall": "execute"}
+                ],
+                "hostCallbacks": [
+                    {"sequence": 1, "phase": "before_host_call", "operationRefDigest": "a" * 64}
+                ],
+            }
+
+        bodies: list[dict[str, object]] = []
+        _emit_plane_runtime_diagnostics(Agent(), bodies.append)
+
+        self.assertEqual(len(bodies), 1)
+        payload = bodies[0]["payload"]
+        self.assertEqual(_bounded_payload(payload), payload)
+        self.assertEqual(payload["kind"], "inline_text")  # type: ignore[index]
+        self.assertEqual(payload["contentType"], "text/plain")  # type: ignore[index]
+        text = payload["text"]  # type: ignore[index]
+        self.assertIsInstance(text, str)
+        parsed = json.loads(text)
+        self.assertEqual(parsed["kind"], "runtime_diagnostics")
+        self.assertEqual(json.dumps(parsed, ensure_ascii=False, sort_keys=True, separators=(",", ":")), text)
+        self.assertNotIn("prompt", text)
+        self.assertNotIn("provider", text)
+        self.assertNotIn("provider-test-secret", text)
+
     def test_real_agent_closed_client_recreation_is_bounded_provider_client_failure(self) -> None:
         raw = copy.deepcopy(make_snapshot())
         raw["runtimePolicy"] = dict(raw["runtimePolicy"])  # type: ignore[arg-type]
@@ -164,13 +231,7 @@ class AdapterPresentationTests(unittest.TestCase):
 
         self.assertEqual(result.kind, "completed")
         self.assertTrue(captured["diagnostics_initialized"])
-        diagnostics = [
-            body["payload"]
-            for body in bodies
-            if body.get("kind") == "progress_observed"
-            and isinstance(body.get("payload"), dict)
-            and body["payload"].get("kind") == "runtime_diagnostics"
-        ]
+        diagnostics = _runtime_diagnostics(bodies)
         self.assertEqual(len(diagnostics), 1)
         self.assertEqual(diagnostics[0]["requests"][0]["visibleToolset"], "other")  # type: ignore[index]
         self.assertEqual(diagnostics[0]["responses"][0]["responseClass"], "tool_call")  # type: ignore[index]
@@ -235,13 +296,7 @@ class AdapterPresentationTests(unittest.TestCase):
 
         self.assertEqual(result.failure_code, "outcome_unknown")
         self.assertFalse(result.retryable)
-        diagnostics = [
-            body["payload"]
-            for body in bodies
-            if body.get("kind") == "progress_observed"
-            and isinstance(body.get("payload"), dict)
-            and body["payload"].get("kind") == "runtime_diagnostics"
-        ]
+        diagnostics = _runtime_diagnostics(bodies)
         self.assertEqual(len(diagnostics), 1)
         self.assertEqual(len(diagnostics[0]["requests"]), 5)  # type: ignore[index]
         self.assertEqual(diagnostics[0]["requests"][0]["toolChoice"], "required")  # type: ignore[index]
@@ -306,13 +361,7 @@ class AdapterPresentationTests(unittest.TestCase):
             result.child_diagnostic,
         )
         self.assertNotIn("private conversation detail", json.dumps(exit_frame))
-        diagnostics = [
-            body["payload"]
-            for body in bodies
-            if body.get("kind") == "progress_observed"
-            and isinstance(body.get("payload"), dict)
-            and body["payload"].get("kind") == "runtime_diagnostics"
-        ]
+        diagnostics = _runtime_diagnostics(bodies)
         self.assertEqual(len(diagnostics), 1)
         self.assertEqual(diagnostics[0]["requests"][0]["visibleToolset"], "other")  # type: ignore[index]
         self.assertEqual(diagnostics[0]["responses"][0]["responseClass"], "text_response")  # type: ignore[index]
