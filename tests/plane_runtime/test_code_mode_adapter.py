@@ -123,6 +123,58 @@ class CodeModeAdapterTests(unittest.TestCase):
         })
         self.assertEqual(json.loads(result)["output"], {"value": "from-plane-isolate"})
 
+    def test_typescript_dispatch_normalizes_bounded_common_source_forms(self) -> None:
+        requests: list[dict] = []
+
+        def rpc(request: dict) -> dict:
+            requests.append(request)
+            return _result(request)
+
+        sources = (
+            "```typescript\nasync function main({ input }) { return input; }\n```",
+            "({ input }) => ({ ok: true, input });",
+        )
+        with bind_plane_host(_binding(rpc)):
+            for source in sources:
+                result = registry.dispatch(PLANE_CODE_MODE_TOOL, {"typescript_source": source})
+                self.assertEqual(json.loads(result)["status"], "ok")
+
+        self.assertEqual(
+            [request["input"]["source"] for request in requests],
+            [
+                "export default async function main({ input }) { return input; }",
+                "export default ({ input }) => ({ ok: true, input });",
+            ],
+        )
+        for request in requests:
+            self.assertEqual(request["input"]["schemaVersion"], PLANE_CODE_MODE_SCHEMA_VERSION)
+            self.assertEqual(request["input"]["entrypoint"], "default")
+            self.assertEqual(request["input"]["input"], {})
+
+    def test_typescript_dispatch_rejects_ambiguous_or_unsupported_wrappers(self) -> None:
+        requests: list[dict] = []
+
+        def rpc(request: dict) -> dict:
+            requests.append(request)
+            return _result(request)
+
+        sources = (
+            "```python\nasync function main() {}\n```",
+            "```typescript\nasync function main() {}\n",
+            "async function main() {" + "x" * (MAX_CODE_MODE_SOURCE_BYTES - 24) + "}",
+        )
+        with bind_plane_host(_binding(rpc)):
+            results = [
+                registry.dispatch(PLANE_CODE_MODE_TOOL, {"typescript_source": source})
+                for source in sources
+            ]
+
+        self.assertEqual(requests, [])
+        for result in results:
+            payload = json.loads(result)
+            self.assertEqual(payload["status"], "error")
+            self.assertIn("plane_execute_typescript", payload["error"]["message"])
+
     def test_python_source_is_opaque_and_never_falls_back_to_python(self) -> None:
         requests: list[dict] = []
 

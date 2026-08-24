@@ -158,6 +158,35 @@ def _text(value: Any, name: str, maximum: int) -> str:
     return value
 
 
+def _normalize_code_mode_source(value: Any) -> str:
+    """Normalize only bounded, unambiguous model wrappers around one entry."""
+
+    source = _text(value, f"{PLANE_CODE_MODE_TOOL}.typescript_source", MAX_CODE_MODE_SOURCE_BYTES)
+    normalized = source.strip()
+    if normalized.startswith("```"):
+        lines = normalized.splitlines()
+        if len(lines) < 3 or lines[-1].strip() != "```":
+            raise PlaneHostError(f"{PLANE_CODE_MODE_TOOL}.typescript_source has an invalid code fence")
+        language = lines[0][3:].strip().lower()
+        if language not in {"", "ts", "typescript"} or any(
+            line.strip() == "```" for line in lines[1:-1]
+        ):
+            raise PlaneHostError(f"{PLANE_CODE_MODE_TOOL}.typescript_source has an unsupported code fence")
+        normalized = "\n".join(lines[1:-1]).strip()
+    if not normalized:
+        raise PlaneHostError(f"{PLANE_CODE_MODE_TOOL}.typescript_source must be non-empty TypeScript")
+    if normalized.startswith("export default"):
+        candidate = normalized
+    elif normalized.startswith(("async function ", "function ")):
+        candidate = f"export default {normalized}"
+    elif normalized.startswith(("async (", "(")) and "=>" in normalized:
+        candidate = f"export default {normalized}"
+    else:
+        candidate = normalized
+    _text(candidate, f"{PLANE_CODE_MODE_TOOL}.typescript_source", MAX_CODE_MODE_SOURCE_BYTES)
+    return candidate
+
+
 def _object(value: Any, name: str) -> dict[str, Any]:
     if not isinstance(value, Mapping) or any(not isinstance(k, str) for k in value):
         raise PlaneHostError(f"{name} must be an object")
@@ -2395,15 +2424,7 @@ def _handle_plane_code_mode(args: Mapping[str, Any], **_: Any) -> str:
     try:
         data = _object(args, PLANE_CODE_MODE_TOOL)
         _reject_unknown(data, {"typescript_source"}, PLANE_CODE_MODE_TOOL)
-        source = _text(
-            data.get("typescript_source"),
-            f"{PLANE_CODE_MODE_TOOL}.typescript_source",
-            MAX_CODE_MODE_SOURCE_BYTES,
-        )
-        if not source.strip():
-            raise PlaneHostError(
-                f"{PLANE_CODE_MODE_TOOL}.typescript_source must be non-empty TypeScript"
-            )
+        source = _normalize_code_mode_source(data.get("typescript_source"))
         capsule = {
             "schemaVersion": PLANE_CODE_MODE_SCHEMA_VERSION,
             "entrypoint": "default",
