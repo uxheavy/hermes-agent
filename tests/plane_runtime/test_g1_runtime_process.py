@@ -1143,6 +1143,39 @@ class G1RuntimeProcessTests(unittest.TestCase):
             self.assertEqual(exit_frame["failure"]["exceptionClass"], expected_exception_class)
             self.assertNotIn("private structured failure detail", json.dumps(exit_frame))
 
+    def test_hermes_adapter_projects_session_persistence_failure(self) -> None:
+        snapshot = G1RunSnapshot.from_dict(make_snapshot())
+        invocation = G1InvocationEnvelope.from_dict(make_invocation(snapshot.to_dict()))
+
+        class Credentials:
+            def resolve(self, provider: str) -> dict[str, str]:
+                del provider
+                return {"api_key": "trusted-host-secret"}
+
+        class FailedAgent:
+            session_input_tokens = 1
+            session_output_tokens = 1
+
+            def run_conversation(self, message: str, *, system_message: str) -> dict[str, object]:
+                del message, system_message
+                return {
+                    "failed": True,
+                    "failure_reason": "session_persistence_failed:locked",
+                    "error": "private persistence detail",
+                }
+
+        result = HermesKernelAdapter(
+            agent_factory=lambda **kwargs: FailedAgent(),
+            credential_source=Credentials(),
+        ).dispatch(snapshot, invocation, lambda: False, lambda body: None, model_call_allowance=1)
+
+        self.assertEqual(result.failure_code, "runtime_error")
+        self.assertEqual(result.failure_cause, "resource_failure")
+        self.assertFalse(result.retryable)
+        self.assertEqual(result.exception_class, "RuntimeError")
+        self.assertEqual(result.failure_message, "Hermes session persistence failed (locked)")
+        self.assertNotIn("private persistence detail", json.dumps(result.__dict__))
+
     def test_hermes_adapter_projects_structured_outcome_unknown_diagnostic(self) -> None:
         snapshot = G1RunSnapshot.from_dict(make_snapshot())
         invocation = G1InvocationEnvelope.from_dict(make_invocation(snapshot.to_dict()))

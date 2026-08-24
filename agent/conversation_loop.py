@@ -1331,6 +1331,7 @@ def run_conversation(
     # A configured SessionDB append failure halts only the affected turn. A
     # cached gateway agent must recover on the next message if storage did.
     agent._incremental_persistence_failed = False
+    agent._last_persistence_error_cause = None
 
     # Main conversation loop counters (pure locals consumed by the loop below).
     api_call_count = 0
@@ -6268,6 +6269,8 @@ def run_conversation(
                     )
                 except Exception as exc:
                     _tool_turn_persisted = False
+                    from run_agent import classify_persistence_error
+                    agent._last_persistence_error_cause = classify_persistence_error(exc)
                     logger.warning(
                         "Incremental tool-call persistence failed before execution "
                         "(session=%s): %s",

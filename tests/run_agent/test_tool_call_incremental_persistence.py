@@ -241,6 +241,7 @@ def test_failed_assistant_persist_blocks_ui_projection_and_tool_side_effects():
     assert result["failed"] is True
     assert result["completed"] is False
     assert result["turn_exit_reason"] == "session_persistence_failed"
+    assert result["failure_reason"] == "session_persistence_failed:unknown"
 
 
 # ---------------------------------------------------------------------------

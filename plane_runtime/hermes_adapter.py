@@ -285,6 +285,20 @@ _STRUCTURED_FAILURE_EXCEPTION_CLASSES = MappingProxyType(
 )
 
 
+_SESSION_PERSISTENCE_CAUSES = frozenset({"locked", "disk", "unknown"})
+
+
+def _session_persistence_failure_cause(failure_reason: object) -> str | None:
+    """Recognize Hermes' bounded session-store failure reason."""
+    if not isinstance(failure_reason, str):
+        return None
+    prefix = "session_persistence_failed:"
+    if not failure_reason.startswith(prefix):
+        return None
+    cause = failure_reason[len(prefix) :]
+    return cause if cause in _SESSION_PERSISTENCE_CAUSES else None
+
+
 def _structured_failure_exception_class(failure_reason: object) -> str:
     """Project only exact, bounded Hermes failure reasons into runtime evidence."""
 
@@ -1706,6 +1720,27 @@ class HermesKernelAdapter:
                     exception_class=_structured_failure_exception_class(
                         result.get("failure_reason")
                     ),
+                )
+            persistence_cause = _session_persistence_failure_cause(
+                result.get("failure_reason")
+            )
+            if persistence_cause is not None:
+                return HermesKernelResult(
+                    kind="failed",
+                    failure_code="runtime_error",
+                    failure_message=(
+                        f"Hermes session persistence failed ({persistence_cause})"
+                    ),
+                    failure_cause=(
+                        "runtime_unknown_failure"
+                        if persistence_cause == "unknown"
+                        else "resource_failure"
+                    ),
+                    retryable=False,
+                    usage=usage,
+                    model_calls=model_calls,
+                    runtime_phase="conversation",
+                    exception_class="RuntimeError",
                 )
             if result.get("failure_reason") == "budget_exhausted":
                 return HermesKernelResult(

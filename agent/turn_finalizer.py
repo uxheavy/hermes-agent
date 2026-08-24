@@ -669,6 +669,12 @@ def finalize_turn(
         ).get("service_tier"),
         "session_id": agent.session_id,
     }
+    if failed and _turn_exit_reason == "session_persistence_failed":
+        cause = getattr(agent, "_last_persistence_error_cause", None)
+        if cause not in {"locked", "disk", "unknown"}:
+            cause = "unknown"
+        result["failure_reason"] = f"session_persistence_failed:{cause}"
+        result["error"] = "session storage could not be written"
     if getattr(agent, "_terminal_hook_installed", False):
         _budget = getattr(agent, "iteration_budget", None)
         _terminal_action = getattr(agent, "_terminal_action_snapshot", None)

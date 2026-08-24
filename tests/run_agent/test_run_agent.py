@@ -53,6 +53,21 @@ def test_is_destructive_command_treats_cp_as_mutating():
     assert run_agent._is_destructive_command("cp .env.local .env") is True
 
 
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        ("database is locked", "locked"),
+        ("SQLITE_BUSY", "locked"),
+        ("database or disk is full", "disk"),
+        ("attempt to write a readonly database", "disk"),
+        ("unexpected write failure", "unknown"),
+        (None, "unknown"),
+    ],
+)
+def test_classify_persistence_error_is_bounded(error, expected):
+    assert run_agent.classify_persistence_error(error) == expected
+
+
 
 
 
@@ -86,6 +101,17 @@ def test_persist_user_message_override_rewrites_text_turns(agent):
     agent._apply_persist_user_message_override(messages)
 
     assert messages == [{"role": "user", "content": "hello"}]
+
+
+def test_flush_session_db_stamps_bounded_persistence_cause(agent):
+    agent._session_db = MagicMock()
+    agent._session_db_created = True
+    agent.session_id = "session-123"
+    agent._last_flushed_db_idx = 0
+    agent._session_db.append_message.side_effect = RuntimeError("database is locked")
+
+    assert agent._flush_messages_to_session_db([{"role": "user", "content": "hello"}], []) is False
+    assert agent._last_persistence_error_cause == "locked"
 
 
 

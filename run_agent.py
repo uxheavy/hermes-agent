@@ -276,6 +276,27 @@ _MAX_TOOL_WORKERS = 8
 _DB_PERSISTED_MARKER = "_db_persisted"
 
 
+def classify_persistence_error(exc_or_str) -> str:
+    """Return a bounded cause for a failed session-store write."""
+    if exc_or_str is None:
+        return "unknown"
+    text = str(exc_or_str).lower()
+    if "locked" in text or "busy" in text:
+        return "locked"
+    if any(
+        marker in text
+        for marker in (
+            "disk",
+            "readonly",
+            "read-only",
+            "no space",
+            "database or disk is full",
+        )
+    ):
+        return "disk"
+    return "unknown"
+
+
 # Guard so the OpenRouter metadata pre-warm thread is only spawned once per
 # process, not once per AIAgent instantiation.  Without this, long-running
 # gateway processes leak one OS thread per incoming message and eventually
@@ -2192,6 +2213,7 @@ class AIAgent:
             # Force a full re-scan on the next flush: an exception mid-loop
             # leaves messages with mixed dispositions.
             self._db_flush_scan_prefix = None
+            self._last_persistence_error_cause = classify_persistence_error(e)
             logger.warning("Session DB append_message failed: %s", e)
             return False
 
