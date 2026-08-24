@@ -1787,6 +1787,20 @@ class HermesKernelAdapter:
                 retryable=False,
                 model_calls=model_calls,
             )
+        if result.get("failure_reason") == "required_tool_not_used":
+            return HermesKernelResult(
+                kind="failed",
+                failure_code="runtime_error",
+                failure_message="Hermes required Code Mode tool was not used",
+                failure_cause="runtime_unknown_failure",
+                retryable=False,
+                usage=usage,
+                model_calls=model_calls,
+                runtime_phase="conversation",
+                exception_class=_structured_failure_exception_class(
+                    result.get("failure_reason")
+                ),
+            )
         if result.get("failed") is True:
             if result.get("failure_reason") == "outcome_unknown":
                 return HermesKernelResult(

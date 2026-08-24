@@ -1149,6 +1149,57 @@ class G1RuntimeProcessTests(unittest.TestCase):
             self.assertEqual(exit_frame["failure"]["exceptionClass"], expected_exception_class)
             self.assertNotIn("private structured failure detail", json.dumps(exit_frame))
 
+    def test_hermes_adapter_fail_closes_code_mode_required_tool_result(self) -> None:
+        snapshot_raw = make_snapshot()
+        snapshot_raw["toolCatalog"] = dict(snapshot_raw["toolCatalog"])  # type: ignore[arg-type]
+        snapshot_raw["toolCatalog"]["modelToolset"] = "code_mode_only"  # type: ignore[index]
+        snapshot_raw["runtimePolicy"] = dict(snapshot_raw["runtimePolicy"])  # type: ignore[arg-type]
+        snapshot_raw["runtimePolicy"]["adapter"] = "hermes"  # type: ignore[index]
+        snapshot_raw["contentDigest"] = _digest(
+            "snapshot", {key: value for key, value in snapshot_raw.items() if key != "contentDigest"}
+        )
+        snapshot = G1RunSnapshot.from_dict(snapshot_raw)
+        invocation = G1InvocationEnvelope.from_dict(make_invocation(snapshot_raw))
+        captured: dict[str, object] = {}
+
+        class FinalizerResultAgent:
+            session_input_tokens = 1
+            session_output_tokens = 1
+
+            def run_conversation(self, message: str, *, system_message: str) -> dict[str, object]:
+                del message, system_message
+                captured["required_tool"] = getattr(self, "_plane_first_required_tool", None)
+                return {
+                    "failed": False,
+                    "failure_reason": "required_tool_not_used",
+                    "final_response": "Required Code Mode tool was not invoked.",
+                }
+
+        class Credentials:
+            def resolve(self, provider: str) -> dict[str, str]:
+                del provider
+                return {"api_key": "trusted-host-secret"}
+
+        result = HermesKernelAdapter(
+            agent_factory=lambda **kwargs: FinalizerResultAgent(),
+            credential_source=Credentials(),
+            host_port=CallablePlaneHostPort(lambda request: {}),
+        ).dispatch(snapshot, invocation, lambda: False, lambda body: None, model_call_allowance=3)
+
+        self.assertEqual(captured["required_tool"], "plane_execute_typescript")
+        self.assertEqual(result.kind, "failed")
+        self.assertEqual(result.failure_code, "runtime_error")
+        self.assertEqual(result.failure_cause, "runtime_unknown_failure")
+        self.assertEqual(result.failure_message, "Hermes required Code Mode tool was not used")
+        self.assertFalse(result.retryable)
+        self.assertEqual(result.runtime_phase, "conversation")
+        self.assertEqual(result.exception_class, "RuntimeError")
+        exit_frame = _terminal_failure(snapshot, invocation, result, 0)
+        self.assertEqual(exit_frame["kind"], "failed")
+        self.assertEqual(exit_frame["failure"]["cause"], "runtime_unknown_failure")
+        self.assertFalse(exit_frame["failure"]["retryable"])
+        self.assertNotIn("missing_outcome", json.dumps(exit_frame))
+
     def test_hermes_adapter_projects_session_persistence_failure(self) -> None:
         snapshot = G1RunSnapshot.from_dict(make_snapshot())
         invocation = G1InvocationEnvelope.from_dict(make_invocation(snapshot.to_dict()))
