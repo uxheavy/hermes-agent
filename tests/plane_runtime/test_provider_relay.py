@@ -210,8 +210,11 @@ def _outcome_unknown_response(*, status_code: int = 502) -> bytes:
     )
 
 
-def _json_error_response(error: str) -> httpx.Response:
-    body = json.dumps({"error": error}, separators=(",", ":")).encode()
+def _json_error_response(error: object, *, extra: dict[str, object] | None = None) -> httpx.Response:
+    payload = {"error": error}
+    if extra:
+        payload.update(extra)
+    body = json.dumps(payload, separators=(",", ":")).encode()
     return httpx.Response(
         403,
         headers={
@@ -262,6 +265,18 @@ def test_provider_relay_upstream_403_remains_provider_auth() -> None:
     error = httpx.HTTPStatusError("provider forbidden", request=response.request, response=response)
     classified = classify_api_error(error, provider="openai-codex", model="gpt-5.6-luna")
     assert classified.reason == FailoverReason.auth
+
+
+@pytest.mark.parametrize(
+    ("error", "extra"),
+    (("unknown_relay_code", None), ("lease_invalid", {"message": "credential secret"}), ([], None)),
+)
+def test_provider_relay_unknown_or_unrelated_denials_fail_closed(
+    error: object, extra: dict[str, object] | None
+) -> None:
+    response = _json_error_response(error, extra=extra)
+
+    _raise_on_provider_outcome_unknown(response)
 
 
 class _BinaryStdin:

@@ -464,6 +464,7 @@ def _raise_on_provider_outcome_unknown(
         int(response.status_code) == 403
         and isinstance(payload, dict)
         and set(payload) == {"error"}
+        and isinstance(payload.get("error"), str)
         and payload.get("error") in _PROVIDER_RELAY_DENIAL_CODES
     ):
         raise ProviderRelayDeniedError(
