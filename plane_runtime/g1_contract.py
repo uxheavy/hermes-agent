@@ -117,6 +117,22 @@ RUNTIME_FAILURE_CAUSES = frozenset(
         "provider_unknown_failure",
     }
 )
+PROVIDER_RELAY_DENIAL_SUBREASONS = frozenset(
+    {
+        "lease_invalid",
+        "cancelled",
+        "budget_exhausted",
+        "concurrency",
+        "denied",
+        "credential_payload",
+        "redirect_denied",
+        "request_oversize",
+        "response_oversize",
+        "response_chunk_oversize",
+        "oversize",
+        "replay",
+    }
+)
 _HOST_CALLBACK_PHASES = frozenset(
     {"before_host_call", "host_return", "model_observation_emit", "adapter_event"}
 )
@@ -872,6 +888,7 @@ def _validate_failure(value: Any, name: str = "failure") -> dict[str, Any]:
             "message",
             "retryable",
             "cause",
+            "providerRelayDenialSubreason",
             "callbackPhase",
             "operationRefDigest",
             "codeModeHostStatus",
@@ -893,6 +910,12 @@ def _validate_failure(value: Any, name: str = "failure") -> dict[str, Any]:
         data["code"] != "runtime_error" or data["cause"] not in RUNTIME_FAILURE_CAUSES
     ):
         raise G1ContractError(f"{name}.cause is invalid")
+    if "providerRelayDenialSubreason" in data and (
+        data.get("cause") != "provider_relay_denied"
+        or not isinstance(data["providerRelayDenialSubreason"], str)
+        or data["providerRelayDenialSubreason"] not in PROVIDER_RELAY_DENIAL_SUBREASONS
+    ):
+        raise G1ContractError(f"{name}.providerRelayDenialSubreason is invalid")
     diagnostic_fields = {"callbackPhase", "operationRefDigest"}
     present_diagnostic_fields = diagnostic_fields.intersection(data)
     if present_diagnostic_fields and present_diagnostic_fields != diagnostic_fields:
@@ -1242,6 +1265,7 @@ __all__ = [
     "G1InvocationEnvelope",
     "G1RunSnapshot",
     "PROTOCOL",
+    "PROVIDER_RELAY_DENIAL_SUBREASONS",
     "RUNTIME_FAILURE_CAUSES",
     "bind_snapshot_and_invocation",
     "build_event",

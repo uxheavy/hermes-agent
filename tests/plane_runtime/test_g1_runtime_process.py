@@ -28,7 +28,12 @@ from plane_runtime.g1_contract import (
 )
 from plane_runtime.g1_bootstrap_contract import G1BootstrapFrames
 from plane_runtime.g1_runtime_image import bootstrap
-from plane_runtime.hermes_adapter import HermesKernelAdapter, HermesKernelResult, InlineCredentialSource
+from plane_runtime.hermes_adapter import (
+    HermesKernelAdapter,
+    HermesKernelResult,
+    InlineCredentialSource,
+    ProviderRelayDeniedError,
+)
 from plane_runtime.host_port import (
     CallablePlaneHostPort,
     PLANE_CODE_MODE_TOOLSET,
@@ -1246,6 +1251,63 @@ class G1RuntimeProcessTests(unittest.TestCase):
             exit_frame = _terminal_failure(snapshot, invocation, result, 0)
             self.assertEqual(exit_frame["failure"]["cause"], expected_cause)
             self.assertNotIn("provider secret", json.dumps(exit_frame))
+
+    def test_provider_relay_denial_subreason_round_trips_and_rejects_unknown_values(self) -> None:
+        snapshot = G1RunSnapshot.from_dict(make_snapshot())
+        invocation = G1InvocationEnvelope.from_dict(make_invocation(snapshot.to_dict()))
+        result = HermesKernelResult(
+            kind="failed",
+            failure_code="runtime_error",
+            failure_message="Hermes invocation failed",
+            failure_cause="provider_relay_denied",
+            provider_relay_denial_subreason="lease_invalid",
+            retryable=False,
+        )
+
+        exit_frame = _terminal_failure(snapshot, invocation, result, 0)
+        self.assertEqual(
+            exit_frame["failure"]["providerRelayDenialSubreason"],
+            "lease_invalid",
+        )
+        with self.assertRaises(G1ContractError):
+            build_exit(
+                snapshot=snapshot,
+                invocation=invocation,
+                final_sequence=0,
+                kind="failed",
+                failure={
+                    "code": "runtime_error",
+                    "message": "Hermes invocation failed",
+                    "retryable": False,
+                    "cause": "provider_relay_denied",
+                    "providerRelayDenialSubreason": "unrelated",
+                },
+            )
+
+    def test_typed_provider_relay_denial_preserves_its_finite_subreason(self) -> None:
+        snapshot = G1RunSnapshot.from_dict(make_snapshot())
+        invocation = G1InvocationEnvelope.from_dict(make_invocation(snapshot.to_dict()))
+
+        class RelayDeniedAgent:
+            session_input_tokens = 0
+            session_output_tokens = 0
+            session_api_calls = 0
+
+            def run_conversation(self, message: str, *, system_message: str) -> None:
+                del message, system_message
+                raise ProviderRelayDeniedError(status_code=403, reason_subreason="lease_invalid")
+
+        result = HermesKernelAdapter(
+            agent_factory=lambda **kwargs: RelayDeniedAgent(),
+            credential_source=InlineCredentialSource({"api_key": "trusted-host-secret"}, "test-provider"),
+        ).dispatch(snapshot, invocation, lambda: False, lambda body: None, model_call_allowance=1)
+
+        self.assertEqual(result.failure_cause, "provider_relay_denied")
+        self.assertEqual(result.provider_relay_denial_subreason, "lease_invalid")
+        self.assertEqual(
+            _terminal_failure(snapshot, invocation, result, 0)["failure"]["providerRelayDenialSubreason"],
+            "lease_invalid",
+        )
 
     def test_zero_model_call_allowance_does_not_construct_hermes(self) -> None:
         snapshot = G1RunSnapshot.from_dict(make_snapshot())

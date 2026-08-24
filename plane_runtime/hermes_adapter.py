@@ -29,6 +29,7 @@ from .g1_contract import (
     RUNTIME_FAILURE_PHASES,
     RUNTIME_FAILURE_ORIGIN_TOKENS,
     RUNTIME_FAILURE_CAUSES,
+    PROVIDER_RELAY_DENIAL_SUBREASONS,
 )
 from .host_port import (
     HOST_CALLBACK_PHASES,
@@ -56,22 +57,7 @@ _PROVIDER_RELAY_FIELDS = frozenset(
 )
 _PROVIDER_RELAY_DUMMY_API_KEY = "plane-provider-relay"
 _MAX_PROVIDER_ERROR_BODY_BYTES = 4096
-_PROVIDER_RELAY_DENIAL_CODES = frozenset(
-    {
-        "lease_invalid",
-        "cancelled",
-        "budget_exhausted",
-        "concurrency",
-        "denied",
-        "credential_payload",
-        "redirect_denied",
-        "request_oversize",
-        "response_oversize",
-        "response_chunk_oversize",
-        "oversize",
-        "replay",
-    }
-)
+_PROVIDER_RELAY_DENIAL_CODES = PROVIDER_RELAY_DENIAL_SUBREASONS
 _CODE_MODE_RUNTIME_POLICY_FIELDS = (
     "maxCodeModeInputBytes",
     "maxCodeModeOutputBytes",
@@ -884,6 +870,7 @@ class HermesKernelResult:
     usage: Mapping[str, int] | None = None
     model_calls: int | None = None
     failure_cause: str | None = None
+    provider_relay_denial_subreason: str | None = None
     host_operation_diagnostic: Mapping[str, Any] | None = None
     runtime_phase: str | None = None
     exception_class: str | None = None
@@ -1601,6 +1588,7 @@ class HermesKernelAdapter:
                     failure_code="runtime_error",
                     failure_message="Hermes invocation failed",
                     failure_cause="provider_relay_denied",
+                    provider_relay_denial_subreason=getattr(exc, "reason_subreason", None),
                     retryable=False,
                     model_calls=self._observed_model_calls(agent, None),
                     runtime_phase="conversation",

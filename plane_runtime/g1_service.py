@@ -11,6 +11,7 @@ from .g1_contract import (
     G1ContractError,
     G1InvocationEnvelope,
     G1RunSnapshot,
+    PROVIDER_RELAY_DENIAL_SUBREASONS,
     RUNTIME_FAILURE_EXCEPTION_CLASSES,
     RUNTIME_FAILURE_EXCEPTION_MODULES,
     RUNTIME_FAILURE_ORIGIN_TOKENS,
@@ -48,6 +49,17 @@ def _bounded_runtime_failure_diagnostic(
         "runtimePhase": result.runtime_phase,
         "exceptionClass": result.exception_class,
     }
+
+
+def _bounded_provider_relay_denial_subreason(
+    result: HermesKernelResult,
+) -> dict[str, str] | None:
+    if result.failure_cause != "provider_relay_denied":
+        return None
+    subreason = result.provider_relay_denial_subreason
+    if not isinstance(subreason, str) or subreason not in PROVIDER_RELAY_DENIAL_SUBREASONS:
+        return None
+    return {"providerRelayDenialSubreason": subreason}
 
 
 def _bounded_child_diagnostic(
@@ -156,6 +168,9 @@ def _terminal_failure(
     }
     if result.failure_cause is not None:
         failure["cause"] = result.failure_cause
+    denial_subreason = _bounded_provider_relay_denial_subreason(result)
+    if denial_subreason is not None:
+        failure.update(denial_subreason)
     diagnostic = _bounded_host_operation_diagnostic(result.host_operation_diagnostic)
     if diagnostic is not None:
         failure.update(diagnostic)
