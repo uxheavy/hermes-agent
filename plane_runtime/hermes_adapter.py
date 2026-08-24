@@ -980,10 +980,23 @@ def _emit_plane_runtime_diagnostics(
     if isinstance(diagnostics.get("hostCallbacks"), list):
         payload["hostCallbacks"] = list(diagnostics["hostCallbacks"])[:64]
     try:
+        encoded = json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    except (TypeError, ValueError):
+        return
+    try:
         emit_body(
             {
                 "kind": "progress_observed",
-                "payload": payload,
+                "payload": {
+                    "kind": "inline_text",
+                    "contentType": "text/plain",
+                    "text": encoded,
+                },
                 "publication": {"action": "observation_only"},
             }
         )
