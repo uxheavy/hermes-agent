@@ -2037,6 +2037,11 @@ class PlaneHostBinding:
                     raise PlaneHostError(
                         "outcome publication resourceRef is not bound to this invocation"
                     )
+                # Redundant model fields are accepted only as a checked
+                # compatibility form. The host-owned values remain the ones
+                # sent across the boundary.
+                operation_ref = PLANE_OUTCOME_PUBLISH_OPERATION
+                resource_ref = expected_ref
         except PlaneHostError as exc:
             self._fail(str(exc) or "publication request was invalid")
             raise
@@ -2589,6 +2594,17 @@ def install_plane_tools() -> None:
                                 "content": {"type": "string"},
                             },
                             "required": ["kind", "content"],
+                        },
+                        {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "properties": {
+                                "kind": {"type": "string", "enum": ["outcome"]},
+                                "operationRef": {"type": "string"},
+                                "resourceRef": {"type": "string"},
+                                "content": {"type": "string"},
+                            },
+                            "required": ["kind", "operationRef", "resourceRef", "content"],
                         },
                         {
                             "type": "object",

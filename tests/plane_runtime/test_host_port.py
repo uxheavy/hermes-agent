@@ -379,6 +379,72 @@ class HostPortTests(unittest.TestCase):
         self.assertNotIn("operationRef", outcome_schema["properties"])
         self.assertNotIn("resourceRef", outcome_schema["properties"])
 
+    def test_outcome_publish_tool_accepts_checked_redundant_refs(self) -> None:
+        calls: list[dict] = []
+
+        def rpc(request: dict) -> dict:
+            calls.append(request)
+            if request["operationRef"] == PLANE_OUTCOME_SUBMIT_OPERATION:
+                return _submitted_result(request, outcome_ref="outcome-submission:trusted")
+            return _result(
+                request,
+                publication={
+                    **_applied_outcome_publication(),
+                    "productRef": request["input"]["resourceRef"],
+                },
+            )
+
+        binding = PlaneHostBinding(
+            port=CallablePlaneHostPort(rpc),
+            run_id="run:redundant-publish",
+            invocation_id="invocation:redundant-publish",
+            correlation_id="correlation:redundant-publish",
+            cancellation=lambda: False,
+        )
+        install_plane_tools()
+        with bind_plane_host(binding):
+            registry.dispatch(
+                "plane_operation",
+                {
+                    "action": "mutate",
+                    "operationRef": PLANE_OUTCOME_SUBMIT_OPERATION,
+                    "input": {"summary": "submitted"},
+                },
+            )
+            published = registry.dispatch(
+                "plane_publish",
+                {
+                    "kind": "outcome",
+                    "operationRef": PLANE_OUTCOME_PUBLISH_OPERATION,
+                    "resourceRef": "outcome-submission:trusted",
+                    "content": "explicit publication",
+                },
+            )
+
+        self.assertEqual(json.loads(published)["status"], "ok")
+        self.assertEqual(
+            calls[-1]["operationRef"],
+            PLANE_OUTCOME_PUBLISH_OPERATION,
+        )
+        self.assertEqual(calls[-1]["input"]["resourceRef"], "outcome-submission:trusted")
+        publish_definition = next(
+            definition
+            for definition in registry.get_definitions({"plane_publish"}, quiet=True)
+            if definition["function"]["name"] == "plane_publish"
+        )
+        redundant_schema = next(
+            schema
+            for schema in publish_definition["function"]["parameters"]["oneOf"]
+            if schema["properties"].get("kind", {}).get("enum") == ["outcome"]
+            and set(schema["required"]) == {
+                "kind",
+                "operationRef",
+                "resourceRef",
+                "content",
+            }
+        )
+        self.assertFalse(redundant_schema["additionalProperties"])
+
     def test_outcome_publish_tool_rejects_early_and_tampered_refs_without_host_call(self) -> None:
         calls: list[dict] = []
 
