@@ -2088,9 +2088,17 @@ class PlaneHostBinding:
 
         outcome_ref = self.outcome_submission_ref()
         if outcome_ref is None:
-            self._fail("explicit outcome publication requires a successful outcome submit")
-            raise PlaneHostError(
-                "explicit outcome publication requires a successful outcome submit"
+            return HostCallResult(
+                request_ref=f"host-request:outcome-submission-required:{self.invocation_id}",
+                correlation_id=self.correlation_id,
+                idempotency_key=(
+                    f"host-idempotency:outcome-submission-required:{self.invocation_id}"
+                ),
+                status="invalid",
+                replayed=False,
+                output=None,
+                error_code="OUTCOME_SUBMISSION_REQUIRED",
+                error_message="explicit outcome publication requires a successful outcome submit",
             )
         return self.publish(
             kind="outcome",

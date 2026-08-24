@@ -522,7 +522,13 @@ class HostPortTests(unittest.TestCase):
                         }
                     },
                 )
-            return _result(request, publication=_applied_outcome_publication())
+            return _result(
+                request,
+                publication={
+                    **_applied_outcome_publication(),
+                    "productRef": request["input"]["resourceRef"],
+                },
+            )
 
         install_plane_tools()
         early = PlaneHostBinding(
@@ -537,8 +543,29 @@ class HostPortTests(unittest.TestCase):
                 "plane_publish",
                 {"content": "too early"},
             )
-        self.assertEqual(json.loads(early_payload)["status"], "error")
+        self.assertEqual(json.loads(early_payload)["status"], "invalid")
+        self.assertEqual(
+            json.loads(early_payload)["errorCode"],
+            "OUTCOME_SUBMISSION_REQUIRED",
+        )
+        self.assertIsNone(early.fatal_error)
         self.assertEqual(calls, [])
+
+        with bind_plane_host(early):
+            registry.dispatch(
+                "plane_operation",
+                {
+                    "action": "mutate",
+                    "operationRef": PLANE_OUTCOME_SUBMIT_OPERATION,
+                    "input": {"summary": "submitted after recoverable publish"},
+                },
+            )
+            recovered_payload = registry.dispatch(
+                "plane_publish",
+                {"content": "published after submit"},
+            )
+        self.assertEqual(json.loads(recovered_payload)["status"], "ok")
+        self.assertIsNone(early.fatal_error)
 
         trusted = PlaneHostBinding(
             port=CallablePlaneHostPort(rpc),
@@ -592,7 +619,7 @@ class HostPortTests(unittest.TestCase):
         self.assertEqual(json.loads(ambiguous_payload)["status"], "error")
         self.assertEqual(
             [call["action"] for call in calls],
-            ["mutate", "mutate"],
+            ["mutate", "publish", "mutate", "mutate"],
         )
 
     def test_replayed_submit_binds_ref_and_replayed_publish_does_not_terminalize(self) -> None:
