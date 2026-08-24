@@ -15,7 +15,11 @@ from types import MappingProxyType
 from typing import Any, Callable, Mapping, MutableMapping, Protocol, Sequence
 
 import httpx
-from agent.error_classifier import FailoverReason, classify_api_error
+from agent.error_classifier import (
+    FailoverReason,
+    _bounded_provider_relay_denial_subreason,
+    classify_api_error,
+)
 
 from .g1_contract import (
     CODE_MODE_ERROR_CLASSES,
@@ -1795,11 +1799,15 @@ class HermesKernelAdapter:
                     ),
                 )
             if result.get("failure_reason") == "provider_relay_denied":
+                denial_subreason = _bounded_provider_relay_denial_subreason(
+                    result.get("provider_relay_denial_subreason")
+                )
                 return HermesKernelResult(
                     kind="failed",
                     failure_code="runtime_error",
                     failure_message="Hermes invocation failed",
                     failure_cause="provider_relay_denied",
+                    provider_relay_denial_subreason=denial_subreason,
                     retryable=False,
                     usage=usage,
                     model_calls=model_calls,

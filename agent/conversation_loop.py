@@ -39,7 +39,11 @@ from agent.conversation_compression import (
 )
 from agent.context_engine import automatic_compaction_status_message
 from agent.display import KawaiiSpinner
-from agent.error_classifier import FailoverReason, classify_api_error
+from agent.error_classifier import (
+    FailoverReason,
+    _bounded_provider_relay_denial_subreason,
+    classify_api_error,
+)
 from agent.turn_context import (
     _compression_warrants_another_preflight_pass,
     build_turn_context,
@@ -5329,6 +5333,12 @@ def run_conversation(
                         "error": _nonretryable_summary,
                         "failure_reason": classified.reason.value,
                     }
+                    if classified.reason == FailoverReason.provider_relay_denied:
+                        denial_subreason = _bounded_provider_relay_denial_subreason(
+                            classified.error_context.get("reason_subreason")
+                        )
+                        if denial_subreason is not None:
+                            result["provider_relay_denial_subreason"] = denial_subreason
                     return result
 
                 if retry_count >= max_retries:

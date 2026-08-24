@@ -101,6 +101,32 @@ class ClassifiedError:
         return self.reason in {FailoverReason.auth, FailoverReason.auth_permanent}
 
 
+_PROVIDER_RELAY_DENIAL_SUBREASONS = frozenset(
+    {
+        "lease_invalid",
+        "cancelled",
+        "budget_exhausted",
+        "concurrency",
+        "denied",
+        "credential_payload",
+        "redirect_denied",
+        "request_oversize",
+        "response_oversize",
+        "response_chunk_oversize",
+        "oversize",
+        "replay",
+    }
+)
+
+
+def _bounded_provider_relay_denial_subreason(value: object) -> str | None:
+    """Project only the finite local relay denial reason."""
+
+    if isinstance(value, str) and value in _PROVIDER_RELAY_DENIAL_SUBREASONS:
+        return value
+    return None
+
+
 
 # ── Provider-specific patterns ──────────────────────────────────────────
 

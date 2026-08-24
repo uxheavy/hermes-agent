@@ -1309,6 +1309,39 @@ class G1RuntimeProcessTests(unittest.TestCase):
             "lease_invalid",
         )
 
+    def test_handled_provider_relay_result_reaches_runtime_exit_without_unbounded_reason(self) -> None:
+        snapshot = G1RunSnapshot.from_dict(make_snapshot())
+        invocation = G1InvocationEnvelope.from_dict(make_invocation(snapshot.to_dict()))
+
+        def dispatch_result(subreason: object) -> tuple[HermesKernelResult, dict[str, object]]:
+            class HandledRelayDeniedAgent:
+                session_input_tokens = 1
+                session_output_tokens = 1
+                session_api_calls = 1
+
+                def run_conversation(self, message: str, *, system_message: str) -> dict[str, object]:
+                    del message, system_message
+                    return {
+                        "failed": True,
+                        "failure_reason": "provider_relay_denied",
+                        "provider_relay_denial_subreason": subreason,
+                    }
+
+            result = HermesKernelAdapter(
+                agent_factory=lambda **kwargs: HandledRelayDeniedAgent(),
+                credential_source=InlineCredentialSource({"api_key": "trusted-host-secret"}, "test-provider"),
+            ).dispatch(snapshot, invocation, lambda: False, lambda body: None, model_call_allowance=1)
+            return result, _terminal_failure(snapshot, invocation, result, 0)
+
+        result, exit_frame = dispatch_result("lease_invalid")
+        self.assertEqual(result.provider_relay_denial_subreason, "lease_invalid")
+        self.assertEqual(exit_frame["failure"]["providerRelayDenialSubreason"], "lease_invalid")
+
+        for subreason in ("provider_secret", [], None):
+            result, exit_frame = dispatch_result(subreason)
+            self.assertIsNone(result.provider_relay_denial_subreason)
+            self.assertNotIn("providerRelayDenialSubreason", exit_frame["failure"])
+
     def test_zero_model_call_allowance_does_not_construct_hermes(self) -> None:
         snapshot = G1RunSnapshot.from_dict(make_snapshot())
         invocation = G1InvocationEnvelope.from_dict(make_invocation(snapshot.to_dict()))
