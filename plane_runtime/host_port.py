@@ -2583,52 +2583,22 @@ def install_plane_tools() -> None:
                 "name": PLANE_PUBLISH_TOOL,
                 "description": (
                     "Explicitly ask the Plane host to publish a conversation or "
-                    "outcome. For an outcome, provide only kind=outcome and content; "
+                    "outcome. For an outcome after submit, provide only content; "
                     "the trusted submit ref and publish operation are bound internally. "
+                    "For a conversation, provide kind=conversation, operationRef, "
+                    "resourceRef, and content. "
                     "Ordinary final text never calls this implicitly."
                 ),
                 "parameters": {
-                    "oneOf": [
-                        {
-                            "type": "object",
-                            "additionalProperties": False,
-                            "properties": {
-                                "kind": {"type": "string", "enum": ["outcome"]},
-                                "content": {"type": "string"},
-                            },
-                            "required": ["kind", "content"],
-                        },
-                        {
-                            "type": "object",
-                            "additionalProperties": False,
-                            "properties": {
-                                "content": {"type": "string"},
-                            },
-                            "required": ["content"],
-                        },
-                        {
-                            "type": "object",
-                            "additionalProperties": False,
-                            "properties": {
-                                "kind": {"type": "string", "enum": ["outcome"]},
-                                "operationRef": {"type": "string"},
-                                "resourceRef": {"type": "string"},
-                                "content": {"type": "string"},
-                            },
-                            "required": ["kind", "operationRef", "resourceRef", "content"],
-                        },
-                        {
-                            "type": "object",
-                            "additionalProperties": False,
-                            "properties": {
-                                "kind": {"type": "string", "enum": ["conversation"]},
-                                "operationRef": {"type": "string"},
-                                "resourceRef": {"type": "string"},
-                                "content": {"type": "string"},
-                            },
-                            "required": ["kind", "operationRef", "resourceRef", "content"],
-                        },
-                    ],
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "kind": {"type": "string", "enum": ["conversation", "outcome"]},
+                        "operationRef": {"type": "string"},
+                        "resourceRef": {"type": "string"},
+                        "content": {"type": "string"},
+                    },
+                    "required": ["content"],
                 },
             },
             _handle_plane_publish,

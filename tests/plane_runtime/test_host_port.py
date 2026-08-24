@@ -40,6 +40,7 @@ from plane_runtime.host_port import (
     _prepared_read_refs_from_code_mode_result,
 )
 from tools.registry import registry
+from tools.schema_sanitizer import sanitize_tool_schemas
 
 _RuntimePlaneHostBinding = PlaneHostBinding
 _TEST_EAGER_OPERATION_REFS = frozenset(
@@ -374,17 +375,32 @@ class HostPortTests(unittest.TestCase):
             for definition in registry.get_definitions({"plane_publish"}, quiet=True)
             if definition["function"]["name"] == "plane_publish"
         )
-        outcome_schema = publish_definition["function"]["parameters"]["oneOf"][0]
-        self.assertEqual(outcome_schema["required"], ["kind", "content"])
-        self.assertNotIn("operationRef", outcome_schema["properties"])
-        self.assertNotIn("resourceRef", outcome_schema["properties"])
-        content_only_schema = next(
-            schema
-            for schema in publish_definition["function"]["parameters"]["oneOf"]
-            if schema["required"] == ["content"]
+        schema = publish_definition["function"]["parameters"]
+        self.assertEqual(schema["required"], ["content"])
+        self.assertEqual(
+            set(schema["properties"]),
+            {"kind", "operationRef", "resourceRef", "content"},
         )
-        self.assertEqual(set(content_only_schema["properties"]), {"content"})
-        self.assertFalse(content_only_schema["additionalProperties"])
+        self.assertFalse(schema["additionalProperties"])
+
+    def test_outcome_publish_schema_survives_provider_sanitization(self) -> None:
+        install_plane_tools()
+        publish_definition = next(
+            definition
+            for definition in registry.get_definitions({"plane_publish"}, quiet=True)
+            if definition["function"]["name"] == "plane_publish"
+        )
+
+        model_schema = sanitize_tool_schemas([publish_definition])[0]["function"][
+            "parameters"
+        ]
+
+        self.assertEqual(model_schema["required"], ["content"])
+        self.assertEqual(
+            set(model_schema["properties"]),
+            {"kind", "operationRef", "resourceRef", "content"},
+        )
+        self.assertNotIn("oneOf", model_schema)
 
     def test_outcome_publish_tool_accepts_content_only_and_binds_submit_ref(self) -> None:
         calls: list[dict] = []
@@ -488,18 +504,9 @@ class HostPortTests(unittest.TestCase):
             for definition in registry.get_definitions({"plane_publish"}, quiet=True)
             if definition["function"]["name"] == "plane_publish"
         )
-        redundant_schema = next(
-            schema
-            for schema in publish_definition["function"]["parameters"]["oneOf"]
-            if schema["properties"].get("kind", {}).get("enum") == ["outcome"]
-            and set(schema["required"]) == {
-                "kind",
-                "operationRef",
-                "resourceRef",
-                "content",
-            }
-        )
-        self.assertFalse(redundant_schema["additionalProperties"])
+        schema = publish_definition["function"]["parameters"]
+        self.assertEqual(schema["required"], ["content"])
+        self.assertFalse(schema["additionalProperties"])
 
     def test_outcome_publish_tool_rejects_early_and_tampered_refs_without_host_call(self) -> None:
         calls: list[dict] = []
