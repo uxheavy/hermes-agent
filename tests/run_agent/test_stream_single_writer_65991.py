@@ -243,6 +243,73 @@ class TestCodexSingleWriter:
         assert produced == ["first", "lookahead"]
         assert stream_closed.is_set()
 
+    def test_codex_sequential_turns_close_response_context_before_next_request(self, monkeypatch):
+        """A Relay wrapper cannot defer the SDK context past the next turn."""
+        from agent.codex_runtime import run_codex_stream
+
+        agent = _make_agent()
+        agent.api_mode = "codex_responses"
+        state = {"active": 0, "max_active": 0, "closed": 0}
+
+        class ResponseContext:
+            def __init__(self):
+                self._events = iter([
+                    SimpleNamespace(type="response.output_text.delta", delta="ok"),
+                    SimpleNamespace(
+                        type="response.completed",
+                        response=SimpleNamespace(
+                            id="response", status="completed", output=[], usage=None,
+                        ),
+                    ),
+                ])
+                self._closed = False
+
+            def __enter__(self):
+                return self
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                return next(self._events)
+
+            def __exit__(self, *_exc):
+                if not self._closed:
+                    self._closed = True
+                    state["active"] -= 1
+                    state["closed"] += 1
+
+        class RelayView:
+            final_response = None
+
+            def __init__(self, resource):
+                self._resource = resource
+
+            def __iter__(self):
+                return iter(self._resource)
+
+            def close(self):
+                # Simulate Relay handing cleanup back to the transport.
+                pass
+
+        def create(**_kwargs):
+            assert state["active"] == 0
+            state["active"] += 1
+            state["max_active"] = max(state["max_active"], state["active"])
+            return ResponseContext()
+
+        def relay_stream(_request, factory, **_kwargs):
+            return RelayView(factory(_request))
+
+        mock_client = MagicMock()
+        mock_client.responses.create.side_effect = create
+        monkeypatch.setattr("agent.relay_llm.stream", relay_stream)
+
+        run_codex_stream(agent, {"model": "gpt-5.3-codex"}, client=mock_client)
+        run_codex_stream(agent, {"model": "gpt-5.3-codex"}, client=mock_client)
+
+        assert state == {"active": 0, "max_active": 1, "closed": 2}
+
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))

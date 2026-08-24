@@ -936,6 +936,26 @@ def _item_field(item: Any, name: str, default: Any = None) -> Any:
     return value if value is not None else default
 
 
+def _close_codex_response_resource(resource: Any) -> None:
+    """Close one SDK response stream or its context-manager owner.
+
+    ``responses.create(stream=True)`` normally returns an OpenAI ``Stream``
+    with ``close()``, while compatible clients may return a context-managed
+    stream with only ``__exit__``.  Keep the transport boundary responsible
+    for both shapes so a Relay wrapper cannot leave the SDK resource live for
+    the next conversation-loop request.
+    """
+    if resource is None:
+        return
+    close = getattr(resource, "close", None)
+    if callable(close):
+        close()
+        return
+    exit_context = getattr(resource, "__exit__", None)
+    if callable(exit_context):
+        exit_context(None, None, None)
+
+
 def _raise_stream_error(event: Any) -> None:
     """Raise a ``_StreamErrorEvent`` from a ``type=error`` SSE frame.
 
@@ -1266,11 +1286,32 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
 
         intercepted_events = []
         writer_token = {"value": None}
+        response_resources: list[Any] = []
+
+        def _close_response_resources() -> bool:
+            cleanup_failed = False
+            while response_resources:
+                resource = response_resources.pop()
+                try:
+                    _close_codex_response_resource(resource)
+                except Exception:
+                    cleanup_failed = True
+                    logger.debug(
+                        "Codex Responses resource cleanup failed",
+                        exc_info=True,
+                    )
+            return cleanup_failed
 
         def _open_codex_stream(next_api_kwargs: dict[str, Any]):
             stream_kwargs = dict(next_api_kwargs)
             stream_kwargs["stream"] = True
-            return active_client.responses.create(**stream_kwargs)
+            resource = active_client.responses.create(**stream_kwargs)
+            response_resources.append(resource)
+            enter_context = getattr(resource, "__enter__", None)
+            if callable(enter_context):
+                entered = enter_context()
+                return resource if entered is None else entered
+            return resource
 
         def _codex_stream_created(_raw_stream: Any) -> None:
             # Claim the delta sink for THIS physical attempt. A newer attempt
@@ -1330,6 +1371,11 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
             _httpx.ConnectError,
             ConnectionError,
         ) as exc:
+            cleanup_failed = _close_response_resources()
+            if cleanup_failed and client is not None:
+                agent._abort_request_openai_client(
+                    active_client, reason="codex_stream_close_failed"
+                )
             if attempt < max_stream_retries:
                 logger.debug(
                     "Codex Responses stream connect failed (attempt %s/%s); "
@@ -1340,6 +1386,13 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                     exc,
                 )
                 continue
+            raise
+        except BaseException:
+            cleanup_failed = _close_response_resources()
+            if cleanup_failed and client is not None:
+                agent._abort_request_openai_client(
+                    active_client, reason="codex_stream_close_failed"
+                )
             raise
 
         def _interrupt_or_superseded() -> bool:
@@ -1396,11 +1449,13 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
 
             return final
         finally:
+            cleanup_failed = False
             close_fn = getattr(event_stream, "close", None)
             if callable(close_fn):
                 try:
                     close_fn()
                 except Exception:
+                    cleanup_failed = True
                     # A failed close can leave this response's connection
                     # checked out of the httpx pool while the caller's finally
                     # reports a reuse-reason close (e.g. interrupt_check broke
@@ -1411,10 +1466,11 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                     # ``client is None`` means the shared primary client,
                     # which is never reuse-cached and must not have its
                     # sockets force-shut here.
-                    if client is not None:
-                        agent._abort_request_openai_client(
-                            active_client, reason="codex_stream_close_failed"
-                        )
+            cleanup_failed = _close_response_resources() or cleanup_failed
+            if cleanup_failed and client is not None:
+                agent._abort_request_openai_client(
+                    active_client, reason="codex_stream_close_failed"
+                )
 
 
 def run_codex_create_stream_fallback(agent, api_kwargs: dict, client: Any = None):
