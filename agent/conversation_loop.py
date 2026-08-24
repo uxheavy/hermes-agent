@@ -188,6 +188,8 @@ def _plane_publish_argument_shape(tool_calls: Any) -> str:
         return "non_object"
 
     keys = set(arguments)
+    if keys == {"content"}:
+        return "content_only_outcome"
     kind = arguments.get("kind")
     if kind == "conversation":
         return "conversation"

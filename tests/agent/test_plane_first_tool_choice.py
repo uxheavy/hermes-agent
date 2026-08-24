@@ -175,6 +175,7 @@ def test_publish_argument_shape_diagnostic_is_finite_and_non_sensitive():
         (f'{{"kind":"outcome","content":"{secret}"', "malformed_json"),
         (json.dumps([secret, "operation:secret"]), "non_object"),
         (json.dumps({"kind": "outcome", "content": secret}), "minimal_outcome"),
+        (json.dumps({"content": secret}), "content_only_outcome"),
         (
             json.dumps(
                 {
@@ -206,7 +207,7 @@ def test_publish_argument_shape_diagnostic_is_finite_and_non_sensitive():
             ),
             "conversation",
         ),
-        (json.dumps({"content": secret}), "missing_required"),
+        (json.dumps({}), "missing_required"),
     ]
 
     for arguments, expected in cases:

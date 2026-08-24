@@ -378,6 +378,62 @@ class HostPortTests(unittest.TestCase):
         self.assertEqual(outcome_schema["required"], ["kind", "content"])
         self.assertNotIn("operationRef", outcome_schema["properties"])
         self.assertNotIn("resourceRef", outcome_schema["properties"])
+        content_only_schema = next(
+            schema
+            for schema in publish_definition["function"]["parameters"]["oneOf"]
+            if schema["required"] == ["content"]
+        )
+        self.assertEqual(set(content_only_schema["properties"]), {"content"})
+        self.assertFalse(content_only_schema["additionalProperties"])
+
+    def test_outcome_publish_tool_accepts_content_only_and_binds_submit_ref(self) -> None:
+        calls: list[dict] = []
+
+        def rpc(request: dict) -> dict:
+            calls.append(request)
+            if request["operationRef"] == PLANE_OUTCOME_SUBMIT_OPERATION:
+                return _submitted_result(request, outcome_ref="outcome-submission:trusted")
+            return _result(
+                request,
+                publication={
+                    **_applied_outcome_publication(),
+                    "productRef": request["input"]["resourceRef"],
+                },
+            )
+
+        binding = PlaneHostBinding(
+            port=CallablePlaneHostPort(rpc),
+            run_id="run:content-only-publish",
+            invocation_id="invocation:content-only-publish",
+            correlation_id="correlation:content-only-publish",
+            cancellation=lambda: False,
+        )
+        install_plane_tools()
+        with bind_plane_host(binding):
+            registry.dispatch(
+                "plane_operation",
+                {
+                    "action": "mutate",
+                    "operationRef": PLANE_OUTCOME_SUBMIT_OPERATION,
+                    "input": {"summary": "submitted"},
+                },
+            )
+            published = registry.dispatch(
+                "plane_publish",
+                {"content": "content-only publication"},
+            )
+
+        self.assertEqual(json.loads(published)["status"], "ok")
+        self.assertEqual(
+            [
+                (call["action"], call["operationRef"], call["input"].get("resourceRef"))
+                for call in calls
+            ],
+            [
+                ("mutate", PLANE_OUTCOME_SUBMIT_OPERATION, None),
+                ("publish", PLANE_OUTCOME_PUBLISH_OPERATION, "outcome-submission:trusted"),
+            ],
+        )
 
     def test_outcome_publish_tool_accepts_checked_redundant_refs(self) -> None:
         calls: list[dict] = []
@@ -472,7 +528,7 @@ class HostPortTests(unittest.TestCase):
         with bind_plane_host(early):
             early_payload = registry.dispatch(
                 "plane_publish",
-                {"kind": "outcome", "content": "too early"},
+                {"content": "too early"},
             )
         self.assertEqual(json.loads(early_payload)["status"], "error")
         self.assertEqual(calls, [])
@@ -503,9 +559,33 @@ class HostPortTests(unittest.TestCase):
                 },
             )
         self.assertEqual(json.loads(tampered_payload)["status"], "error")
+        ambiguous = PlaneHostBinding(
+            port=CallablePlaneHostPort(rpc),
+            run_id="run:ambiguous-publish",
+            invocation_id="invocation:ambiguous-publish",
+            correlation_id="correlation:ambiguous-publish",
+            cancellation=lambda: False,
+        )
+        with bind_plane_host(ambiguous):
+            registry.dispatch(
+                "plane_operation",
+                {
+                    "action": "mutate",
+                    "operationRef": PLANE_OUTCOME_SUBMIT_OPERATION,
+                    "input": {"summary": "submitted"},
+                },
+            )
+            ambiguous_payload = registry.dispatch(
+                "plane_publish",
+                {
+                    "content": "ambiguous",
+                    "operationRef": PLANE_OUTCOME_PUBLISH_OPERATION,
+                },
+            )
+        self.assertEqual(json.loads(ambiguous_payload)["status"], "error")
         self.assertEqual(
             [call["action"] for call in calls],
-            ["mutate"],
+            ["mutate", "mutate"],
         )
 
     def test_replayed_submit_binds_ref_and_replayed_publish_does_not_terminalize(self) -> None:

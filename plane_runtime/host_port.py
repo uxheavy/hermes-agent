@@ -2466,7 +2466,10 @@ def _handle_plane_publish(args: Mapping[str, Any], **_: Any) -> str:
             {"kind", "operationRef", "resourceRef", "content"},
             "plane_publish",
         )
-        kind = _text(data.get("kind"), "plane_publish.kind", 32)
+        if set(data) == {"content"}:
+            kind = "outcome"
+        else:
+            kind = _text(data.get("kind"), "plane_publish.kind", 32)
         content = _text(data.get("content"), "plane_publish.content", MAX_HOST_CONTENT_BYTES)
         binding = _binding_or_error()
         if kind == "outcome" and "operationRef" not in data and "resourceRef" not in data:
@@ -2594,6 +2597,14 @@ def install_plane_tools() -> None:
                                 "content": {"type": "string"},
                             },
                             "required": ["kind", "content"],
+                        },
+                        {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "properties": {
+                                "content": {"type": "string"},
+                            },
+                            "required": ["content"],
                         },
                         {
                             "type": "object",
