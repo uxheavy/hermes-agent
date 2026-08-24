@@ -724,7 +724,9 @@ def classify_api_error(
     # fall back credentials for a local runtime boundary failure.
     provider_relay_denial = _find_provider_relay_denied_error(error)
     if provider_relay_denial is not None:
-        reason_subreason = getattr(provider_relay_denial, "reason_subreason", "")
+        reason_subreason = _bounded_provider_relay_denial_subreason(
+            getattr(provider_relay_denial, "reason_subreason", None)
+        )
         return _result(
             FailoverReason.provider_relay_denied,
             retryable=False,
@@ -1740,15 +1742,12 @@ def _find_provider_relay_denied_error(error: Exception) -> Exception | None:
 
     current = error
     for _ in range(5):
-        reason_subreason = _bounded_provider_relay_denial_subreason(
-            getattr(current, "reason_subreason", None)
-        )
         if (
             getattr(current, "plane_runtime_failure", False) is True
             and getattr(current, "code", None) == "provider_relay_denied"
             and getattr(current, "retryable", None) is False
             and getattr(current, "upstream_initiated", None) is False
-            and reason_subreason is not None
+            and isinstance(getattr(current, "reason_subreason", None), str)
         ):
             return current
         cause = getattr(current, "__cause__", None) or getattr(current, "__context__", None)

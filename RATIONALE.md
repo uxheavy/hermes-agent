@@ -10,15 +10,15 @@ recognized as a local relay denial while its finite subtype was lost.
 ## Chosen change
 
 `_find_provider_relay_denied_error` performs the existing bounded five-level
-cause walk and returns the matching typed exception. It uses the existing
-finite allowlist helper while matching, so unknown, non-string, and unrelated
-values fail closed. Classification and the retained boolean predicate both
-reuse this extractor; classification reads the subtype from the matched
-inner exception.
+cause walk and returns the matching typed exception. It preserves the base
+typed predicate: any string subtype recognizes the local denial, while
+non-string and absent values do not. Classification then applies the existing
+finite allowlist helper to the matched subtype, so unknown strings become
+`None` and are omitted by downstream runtime contracts.
 
-The focused regression also gives the outer wrapper an unrelated subtype to
-prove that only the matched inner finite value is carried forward, then
-covers unknown, non-string, and absent subtypes. No provider call, retry,
+The focused regression gives the outer wrapper an unrelated subtype to prove
+that only the matched inner finite value is carried forward, and covers
+unknown, non-string, and absent subtypes. No provider call, retry,
 fallback, authentication, gateway, or live-runtime behavior was changed.
 
 ## Alternatives rejected

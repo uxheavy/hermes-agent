@@ -246,7 +246,7 @@ def test_provider_relay_lease_invalid_is_typed_and_non_retryable() -> None:
     assert classified.error_context == {"reason_subreason": "lease_invalid"}
 
 
-def test_wrapped_provider_relay_denial_uses_inner_finite_subreason() -> None:
+def test_wrapped_provider_relay_denial_projects_inner_finite_subreason() -> None:
     request = httpx.Request("POST", PROVIDER_RELAY_BASE_URL + "/chat/completions")
 
     def wrapped(inner: Exception) -> httpx.HTTPStatusError:
@@ -265,9 +265,17 @@ def test_wrapped_provider_relay_denial_uses_inner_finite_subreason() -> None:
     assert classified.should_rotate_credential is False
     assert classified.should_fallback is False
 
-    for reason_subreason in ("provider_secret", [], None):
+    inner.reason_subreason = "provider_secret"  # type: ignore[assignment]
+    classified = classify_api_error(wrapped(inner))
+    assert classified.reason == FailoverReason.provider_relay_denied
+    assert classified.error_context == {"reason_subreason": None}
+
+    for reason_subreason in ([], None):
         inner.reason_subreason = reason_subreason  # type: ignore[assignment]
         assert classify_api_error(wrapped(inner)).reason != FailoverReason.provider_relay_denied
+
+    del inner.reason_subreason
+    assert classify_api_error(wrapped(inner)).reason != FailoverReason.provider_relay_denied
 
 
 def test_provider_relay_upstream_403_remains_provider_auth() -> None:
