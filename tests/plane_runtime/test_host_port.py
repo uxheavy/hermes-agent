@@ -2509,46 +2509,54 @@ print("text_response")
         self.assertEqual(unknown_result.status, "unavailable")
         self.assertIsNotNone(unknown.fatal_error)
 
-    def test_code_mode_failure_is_bounded_and_corrected_call_can_continue(self) -> None:
+    def test_code_mode_failure_poison_stops_before_publish_and_preserves_subreason(self) -> None:
         calls = 0
+        callbacks: list[Mapping[str, object]] = []
 
-        def failed_then_ok(request: dict) -> dict:
+        def failed(request: dict) -> dict:
             nonlocal calls
             calls += 1
-            if calls == 1:
-                return _result(
-                    request,
-                    status="invalid",
-                    errorCode="CODE_MODE_FAILED",
-                    errorMessage="Code Mode module failed in the restricted isolate",
-                )
-            return _result(request, output={"operationId": "work_item.rename"})
+            return _result(
+                request,
+                status="invalid",
+                output={"codeModeRuntimeSubreason": "prepared_read_handoff_unavailable"},
+                errorCode="CODE_MODE_FAILED",
+                errorMessage="bounded Code Mode failure",
+            )
 
         binding = PlaneHostBinding(
-            port=CallablePlaneHostPort(failed_then_ok),
+            port=CallablePlaneHostPort(failed),
             run_id="run:test",
             invocation_id="invocation:test",
             correlation_id="correlation:test",
             cancellation=lambda: False,
+            diagnostic_callback=callbacks.append,
         )
-        failed = binding.call(
-            action="code",
-            operation_ref="plane.code-mode.execute@1",
-            input={"source": "malformed-generated-module"},
-            source="code",
+        with self.assertRaises(RuntimeError):
+            binding.call(
+                action="code",
+                operation_ref="plane.code-mode.execute@1",
+                input={"source": "malformed-generated-module"},
+                source="code",
+            )
+        self.assertEqual(calls, 1)
+        diagnostic = binding.host_operation_diagnostic
+        self.assertIsNotNone(diagnostic)
+        assert diagnostic is not None
+        self.assertEqual(
+            diagnostic["codeModeRuntimeSubreason"],
+            "prepared_read_handoff_unavailable",
         )
-        corrected = binding.call(
-            action="code",
-            operation_ref="plane.code-mode.execute@1",
-            input={"source": "corrected-generated-module"},
-            source="code",
-        )
-
-        self.assertEqual(failed.status, "invalid")
-        self.assertEqual(failed.error_code, "CODE_MODE_FAILED")
-        self.assertEqual(corrected.status, "ok")
-        self.assertEqual(corrected.output, {"operationId": "work_item.rename"})
-        self.assertIsNone(binding.fatal_error)
+        self.assertEqual(callbacks[-1], diagnostic)
+        self.assertNotIn("bounded Code Mode failure", json.dumps(diagnostic))
+        with self.assertRaises(PlaneHostUnavailable):
+            binding.publish(
+                kind="conversation",
+                operation_ref="operation:conversation.publish@1",
+                resource_ref="conversation:test",
+                content="model text",
+            )
+        self.assertEqual(calls, 1)
 
     def test_code_mode_diagnostic_classification_is_finite_and_redacted(self) -> None:
         cases = (
@@ -2572,12 +2580,21 @@ print("text_response")
                     correlation_id="correlation:diagnostic",
                     cancellation=lambda: False,
                 )
-                binding.call(
-                    action="code",
-                    operation_ref="plane.code-mode.execute@1",
-                    input={"source": "opaque-module"},
-                    source="code",
-                )
+                if error_code == "CODE_MODE_FAILED":
+                    with self.assertRaises(RuntimeError):
+                        binding.call(
+                            action="code",
+                            operation_ref="plane.code-mode.execute@1",
+                            input={"source": "opaque-module"},
+                            source="code",
+                        )
+                else:
+                    binding.call(
+                        action="code",
+                        operation_ref="plane.code-mode.execute@1",
+                        input={"source": "opaque-module"},
+                        source="code",
+                    )
                 diagnostic = binding.host_operation_diagnostic
                 self.assertIsNotNone(diagnostic)
                 assert diagnostic is not None
@@ -2596,6 +2613,7 @@ print("text_response")
                     status="invalid",
                     output={
                         "codeModeErrorClass": "module_parse_or_load",
+                        "codeModeRuntimeSubreason": "catalog_operation_unavailable",
                         "rawSource": "must-not-leak",
                     },
                     errorCode="CODE_MODE_FAILED",
@@ -2608,18 +2626,20 @@ print("text_response")
             cancellation=lambda: False,
             diagnostic_callback=callbacks.append,
         )
-        binding.call(
-            action="code",
-            operation_ref="plane.code-mode.execute@1",
-            input={"source": "opaque-module"},
-            source="code",
-        )
+        with self.assertRaises(RuntimeError):
+            binding.call(
+                action="code",
+                operation_ref="plane.code-mode.execute@1",
+                input={"source": "opaque-module"},
+                source="code",
+            )
 
         diagnostic = binding.host_operation_diagnostic
         self.assertIsNotNone(diagnostic)
         assert diagnostic is not None
         self.assertEqual(diagnostic["codeModeFailureClass"], "code_mode")
         self.assertEqual(diagnostic["codeModeErrorClass"], "module_parse_or_load")
+        self.assertEqual(diagnostic["codeModeRuntimeSubreason"], "catalog_operation_unavailable")
         self.assertEqual(callbacks[-1], diagnostic)
         encoded = json.dumps(diagnostic, sort_keys=True)
         self.assertNotIn("must-not-leak", encoded)
@@ -2639,15 +2659,45 @@ print("text_response")
             correlation_id="correlation:diagnostic-invalid",
             cancellation=lambda: False,
         )
-        invalid.call(
-            action="code",
-            operation_ref="plane.code-mode.execute@1",
-            input={"source": "opaque-module"},
-            source="code",
-        )
+        with self.assertRaises(RuntimeError):
+            invalid.call(
+                action="code",
+                operation_ref="plane.code-mode.execute@1",
+                input={"source": "opaque-module"},
+                source="code",
+            )
         invalid_diagnostic = invalid.host_operation_diagnostic
         assert invalid_diagnostic is not None
         self.assertNotIn("codeModeErrorClass", invalid_diagnostic)
+
+        invalid_subreason = PlaneHostBinding(
+            port=CallablePlaneHostPort(
+                lambda request: _result(
+                    request,
+                    status="invalid",
+                    output={
+                        "codeModeErrorClass": "execution_runtime",
+                        "codeModeRuntimeSubreason": "raw-message",
+                    },
+                    errorCode="CODE_MODE_FAILED",
+                    errorMessage="must-not-leak",
+                )
+            ),
+            run_id="run:diagnostic-invalid-subreason",
+            invocation_id="invocation:diagnostic-invalid-subreason",
+            correlation_id="correlation:diagnostic-invalid-subreason",
+            cancellation=lambda: False,
+        )
+        with self.assertRaises(RuntimeError):
+            invalid_subreason.call(
+                action="code",
+                operation_ref="plane.code-mode.execute@1",
+                input={"source": "opaque-module"},
+                source="code",
+            )
+        invalid_subreason_diagnostic = invalid_subreason.host_operation_diagnostic
+        assert invalid_subreason_diagnostic is not None
+        self.assertNotIn("codeModeRuntimeSubreason", invalid_subreason_diagnostic)
 
     def test_plane_conflict_is_model_observable_but_idempotency_conflict_stays_fatal(self) -> None:
         conflict = PlaneHostBinding(

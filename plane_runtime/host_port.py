@@ -30,6 +30,7 @@ from typing import Any, Callable, Iterator, Literal, Mapping, Protocol
 
 from .g1_contract import (
     CODE_MODE_ERROR_CLASSES,
+    CODE_MODE_RUNTIME_SUBREASONS,
     CODE_MODE_PHASES,
     G1ContractError,
     validate_eager_input_schema,
@@ -102,11 +103,7 @@ _HOST_RESULT_DISPOSITIONS: Mapping[tuple[str, str | None], HostResultDisposition
         ("invalid", "VALIDATION_ERROR"): "continue_with_tool_result",
         ("invalid", "READ_ALREADY_CONSUMED"): "continue_with_tool_result",
         ("invalid", "STANDARD_ROUTE_MISMATCH"): "continue_with_tool_result",
-        # A generated Code Mode module may fail in the restricted isolate.
-        # Return that finite, bounded result to the model so it can correct
-        # the module in the same invocation; host/transport failures remain
-        # poison unless explicitly classified above.
-        ("invalid", "CODE_MODE_FAILED"): "continue_with_tool_result",
+        ("invalid", "CODE_MODE_FAILED"): "poison_invocation",
         ("denied", "NOT_AUTHORIZED"): "continue_with_tool_result",
         ("conflict", "PLANE_CONFLICT"): "continue_with_tool_result",
     }
@@ -1430,10 +1427,17 @@ class PlaneHostBinding:
         diagnostic["codeModeHostStatus"] = bounded_status
         diagnostic["codeModeFailureClass"] = failure_class
         diagnostic.pop("codeModeErrorClass", None)
+        diagnostic.pop("codeModeRuntimeSubreason", None)
         if error_code == "CODE_MODE_FAILED" and isinstance(output, Mapping):
             error_class = output.get("codeModeErrorClass")
             if isinstance(error_class, str) and error_class in CODE_MODE_ERROR_CLASSES:
                 diagnostic["codeModeErrorClass"] = error_class
+            runtime_subreason = output.get("codeModeRuntimeSubreason")
+            if (
+                isinstance(runtime_subreason, str)
+                and runtime_subreason in CODE_MODE_RUNTIME_SUBREASONS
+            ):
+                diagnostic["codeModeRuntimeSubreason"] = runtime_subreason
         self._host_operation_diagnostic = diagnostic
         if self.diagnostic_callback is not None:
             try:
@@ -1648,6 +1652,14 @@ class PlaneHostBinding:
             if self._is_cancelled():
                 self._fail("Plane host callback cancelled")
                 raise PlaneHostCancelled("Plane host callback cancelled")
+            if (
+                self._fatal_error is not None
+                and not self._fatal_error_after_terminal
+                and isinstance(self._host_operation_diagnostic, Mapping)
+                and self._host_operation_diagnostic.get("codeModeHostStatus") == "invalid"
+                and self._host_operation_diagnostic.get("codeModeFailureClass") == "code_mode"
+            ):
+                raise PlaneHostUnavailable("Plane Code Mode invocation is poisoned")
             if self._outcome_unknown:
                 return HostCallResult(
                     request_ref=f"host-request:outcome-unknown:{self.invocation_id}",
@@ -1979,11 +1991,18 @@ class PlaneHostBinding:
                     with self._lock:
                         if not self._code_mode_continuation_used:
                             self._code_mode_phase_hint = "post_search"
+            disposition = _host_result_disposition(result, action=action)
             if (
-                _host_result_disposition(result, action=action) == "poison_invocation"
+                disposition == "poison_invocation"
                 and not _recoverable_outcome_publication_rejection(request, result)
             ):
                 self._fail(result.error_message or "Plane host rejected the callback")
+                if (
+                    action == "code"
+                    and result.status == "invalid"
+                    and result.error_code == "CODE_MODE_FAILED"
+                ):
+                    raise RuntimeError("Plane Code Mode execution failed")
             if self._is_cancelled():
                 self._set_callback_phase("adapter_event")
                 self._fail("Plane host callback cancelled")
