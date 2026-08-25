@@ -19,6 +19,7 @@ from plane_runtime.hermes_adapter import (
     HermesKernelAdapter,
     ProviderOutcomeUnknownError,
     _emit_plane_runtime_diagnostics,
+    _record_plane_runtime_host_callback,
     _classify_runtime_exception,
 )
 from plane_runtime.host_port import CallablePlaneHostPort, current_plane_host
@@ -52,6 +53,35 @@ def _runtime_diagnostics(bodies: list[dict[str, object]]) -> list[dict[str, obje
 
 
 class AdapterPresentationTests(unittest.TestCase):
+    def test_host_callback_projection_preserves_only_finite_runtime_subreason(self) -> None:
+        class Agent:
+            _plane_runtime_diagnostics = {"hostCallbacks": []}
+
+        agent = Agent()
+        _record_plane_runtime_host_callback(
+            agent,
+            {
+                "callbackPhase": "host_return",
+                "operationRefDigest": "a" * 64,
+                "codeModeRuntimeSubreason": "catalog_operation_unavailable",
+            },
+        )
+        self.assertEqual(
+            agent._plane_runtime_diagnostics["hostCallbacks"][0][
+                "codeModeRuntimeSubreason"
+            ],
+            "catalog_operation_unavailable",
+        )
+        _record_plane_runtime_host_callback(
+            agent,
+            {
+                "callbackPhase": "host_return",
+                "operationRefDigest": "b" * 64,
+                "codeModeRuntimeSubreason": "raw-message",
+            },
+        )
+        self.assertEqual(len(agent._plane_runtime_diagnostics["hostCallbacks"]), 1)
+
     def test_runtime_diagnostics_use_bounded_canonical_inline_text(self) -> None:
         class Agent:
             _plane_runtime_diagnostics = {

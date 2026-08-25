@@ -2596,6 +2596,7 @@ print("text_response")
                     status="invalid",
                     output={
                         "codeModeErrorClass": "module_parse_or_load",
+                        "codeModeRuntimeSubreason": "prepared_read_handoff_unavailable",
                         "rawSource": "must-not-leak",
                     },
                     errorCode="CODE_MODE_FAILED",
@@ -2620,6 +2621,10 @@ print("text_response")
         assert diagnostic is not None
         self.assertEqual(diagnostic["codeModeFailureClass"], "code_mode")
         self.assertEqual(diagnostic["codeModeErrorClass"], "module_parse_or_load")
+        self.assertEqual(
+            diagnostic["codeModeRuntimeSubreason"],
+            "prepared_read_handoff_unavailable",
+        )
         self.assertEqual(callbacks[-1], diagnostic)
         encoded = json.dumps(diagnostic, sort_keys=True)
         self.assertNotIn("must-not-leak", encoded)
@@ -2648,6 +2653,31 @@ print("text_response")
         invalid_diagnostic = invalid.host_operation_diagnostic
         assert invalid_diagnostic is not None
         self.assertNotIn("codeModeErrorClass", invalid_diagnostic)
+
+        unknown_subreason = PlaneHostBinding(
+            port=CallablePlaneHostPort(
+                lambda request: _result(
+                    request,
+                    status="invalid",
+                    output={"codeModeRuntimeSubreason": "raw-message"},
+                    errorCode="CODE_MODE_FAILED",
+                    errorMessage="must-not-leak",
+                )
+            ),
+            run_id="run:diagnostic-unknown-subreason",
+            invocation_id="invocation:diagnostic-unknown-subreason",
+            correlation_id="correlation:diagnostic-unknown-subreason",
+            cancellation=lambda: False,
+        )
+        unknown_subreason.call(
+            action="code",
+            operation_ref="plane.code-mode.execute@1",
+            input={"source": "opaque-module"},
+            source="code",
+        )
+        unknown_diagnostic = unknown_subreason.host_operation_diagnostic
+        assert unknown_diagnostic is not None
+        self.assertNotIn("codeModeRuntimeSubreason", unknown_diagnostic)
 
     def test_plane_conflict_is_model_observable_but_idempotency_conflict_stays_fatal(self) -> None:
         conflict = PlaneHostBinding(

@@ -160,6 +160,13 @@ CODE_MODE_ERROR_CLASSES = frozenset(
         "child_exit_no_result",
     }
 )
+CODE_MODE_RUNTIME_SUBREASONS = frozenset(
+    {
+        "catalog_operation_unavailable",
+        "prepared_read_handoff_unavailable",
+        "authorized_work_item_read_unavailable",
+    }
+)
 _PREPARED_HANDOFF_STAGES = frozenset(
     {"register", "runtime_auto_read", "hermes_model_read", "host_normalize", "registry_resolve", "registry_consume"}
 )
@@ -230,6 +237,7 @@ def _bounded_host_operation_diagnostic(value: Mapping[str, Any] | None) -> dict[
         "codeModeHostStatus",
         "codeModeFailureClass",
         "codeModeErrorClass",
+        "codeModeRuntimeSubreason",
         "socketPhase",
         "socketState",
         "preparedHandoff",
@@ -267,6 +275,13 @@ def _bounded_host_operation_diagnostic(value: Mapping[str, Any] | None) -> dict[
         ):
             return None
         result["codeModeErrorClass"] = value["codeModeErrorClass"]
+    if "codeModeRuntimeSubreason" in value:
+        if (
+            not isinstance(value["codeModeRuntimeSubreason"], str)
+            or value["codeModeRuntimeSubreason"] not in CODE_MODE_RUNTIME_SUBREASONS
+        ):
+            return None
+        result["codeModeRuntimeSubreason"] = value["codeModeRuntimeSubreason"]
     socket_fields = {"socketPhase", "socketState"}
     present = socket_fields.intersection(value)
     if present and present != socket_fields:
@@ -901,6 +916,7 @@ def _validate_failure(value: Any, name: str = "failure") -> dict[str, Any]:
             "codeModeHostStatus",
             "codeModeFailureClass",
             "codeModeErrorClass",
+            "codeModeRuntimeSubreason",
             "runtimePhase",
             "exceptionClass",
             "childDiagnostic",
@@ -952,6 +968,11 @@ def _validate_failure(value: Any, name: str = "failure") -> dict[str, Any]:
         or data["codeModeErrorClass"] not in CODE_MODE_ERROR_CLASSES
     ):
         raise G1ContractError(f"{name}.codeModeErrorClass is invalid")
+    if "codeModeRuntimeSubreason" in data and (
+        not isinstance(data["codeModeRuntimeSubreason"], str)
+        or data["codeModeRuntimeSubreason"] not in CODE_MODE_RUNTIME_SUBREASONS
+    ):
+        raise G1ContractError(f"{name}.codeModeRuntimeSubreason is invalid")
     socket_fields = {"socketPhase", "socketState"}
     present_socket_fields = socket_fields.intersection(data)
     if present_socket_fields and present_socket_fields != socket_fields:

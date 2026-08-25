@@ -30,6 +30,7 @@ from typing import Any, Callable, Iterator, Literal, Mapping, Protocol
 
 from .g1_contract import (
     CODE_MODE_ERROR_CLASSES,
+    CODE_MODE_RUNTIME_SUBREASONS,
     CODE_MODE_PHASES,
     G1ContractError,
     validate_eager_input_schema,
@@ -1157,6 +1158,17 @@ class PlaneHostBinding:
         with self._lock:
             return self._terminal_action_reason
 
+    def fail_code_mode(self) -> None:
+        """Stop this invocation after a bounded Code Mode execution failure."""
+
+        with self._lock:
+            # Record the fatal failure before arming the existing terminal
+            # batch guard so the adapter reports a failed invocation rather
+            # than treating it as a late callback after a product terminal.
+            self._fail("Code Mode execution failed")
+            if self._terminal_action_reason is None:
+                self._terminal_action_reason = "code_mode_failed"
+
     def prepared_read_handoff_pending(self) -> bool:
         """Return whether a search produced an unconsumed prepared read."""
 
@@ -1430,10 +1442,17 @@ class PlaneHostBinding:
         diagnostic["codeModeHostStatus"] = bounded_status
         diagnostic["codeModeFailureClass"] = failure_class
         diagnostic.pop("codeModeErrorClass", None)
+        diagnostic.pop("codeModeRuntimeSubreason", None)
         if error_code == "CODE_MODE_FAILED" and isinstance(output, Mapping):
             error_class = output.get("codeModeErrorClass")
             if isinstance(error_class, str) and error_class in CODE_MODE_ERROR_CLASSES:
                 diagnostic["codeModeErrorClass"] = error_class
+            runtime_subreason = output.get("codeModeRuntimeSubreason")
+            if (
+                isinstance(runtime_subreason, str)
+                and runtime_subreason in CODE_MODE_RUNTIME_SUBREASONS
+            ):
+                diagnostic["codeModeRuntimeSubreason"] = runtime_subreason
         self._host_operation_diagnostic = diagnostic
         if self.diagnostic_callback is not None:
             try:
@@ -2431,12 +2450,15 @@ def _handle_plane_code_mode(args: Mapping[str, Any], **_: Any) -> str:
             "input": {},
         }
         _bounded_json(capsule, "codeMode.capsule", MAX_HOST_INPUT_BYTES)
-        result = _binding_or_error().call(
+        binding = _binding_or_error()
+        result = binding.call(
             action="code",
             operation_ref=PLANE_CODE_MODE_EXECUTE_OPERATION,
             input=capsule,
             source="code",
         )
+        if result.status == "invalid" and result.error_code == "CODE_MODE_FAILED":
+            binding.fail_code_mode()
         return result.model_payload()
     except PlaneHostCancelled as exc:
         return _error_payload(str(exc), code="cancelled")

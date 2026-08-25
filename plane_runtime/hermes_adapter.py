@@ -23,6 +23,7 @@ from agent.error_classifier import (
 
 from .g1_contract import (
     CODE_MODE_ERROR_CLASSES,
+    CODE_MODE_RUNTIME_SUBREASONS,
     G1ContractError,
     G1InvocationEnvelope,
     G1RunSnapshot,
@@ -1079,6 +1080,14 @@ def _record_plane_runtime_host_callback(agent: Any, diagnostic: Any) -> None:
         if not isinstance(error_class, str) or error_class not in CODE_MODE_ERROR_CLASSES:
             return
         callback["codeModeErrorClass"] = error_class
+    runtime_subreason = diagnostic.get("codeModeRuntimeSubreason")
+    if runtime_subreason is not None:
+        if (
+            not isinstance(runtime_subreason, str)
+            or runtime_subreason not in CODE_MODE_RUNTIME_SUBREASONS
+        ):
+            return
+        callback["codeModeRuntimeSubreason"] = runtime_subreason
     callbacks.append(callback)
 
 

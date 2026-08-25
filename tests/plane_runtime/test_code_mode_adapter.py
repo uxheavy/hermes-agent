@@ -14,6 +14,7 @@ from plane_runtime.host_port import (
     PLANE_CODE_MODE_TOOL,
     PLANE_CODE_MODE_TOOLSET,
     PLANE_OPERATION_TOOL,
+    PLANE_PUBLISH_TOOL,
     bind_plane_host,
     install_plane_tools,
 )
@@ -33,13 +34,19 @@ def _result(request: dict, *, status: str = "ok", output: object = None, **extra
     }
 
 
-def _binding(rpc, *, cancellation=lambda: False) -> PlaneHostBinding:
+def _binding(
+    rpc,
+    *,
+    cancellation=lambda: False,
+    eager_operation_refs=frozenset(),
+) -> PlaneHostBinding:
     return PlaneHostBinding(
         port=CallablePlaneHostPort(rpc),
         run_id="run:test",
         invocation_id="invocation:test",
         correlation_id="correlation:test",
         cancellation=cancellation,
+        eager_operation_refs=eager_operation_refs,
     )
 
 
@@ -122,6 +129,52 @@ class CodeModeAdapterTests(unittest.TestCase):
             "input": {},
         })
         self.assertEqual(json.loads(result)["output"], {"value": "from-plane-isolate"})
+
+    def test_code_mode_failure_stops_followup_publication_at_handler_boundary(self) -> None:
+        requests: list[dict] = []
+
+        def failed(request: dict) -> dict:
+            requests.append(request)
+            return _result(
+                request,
+                status="invalid",
+                output={
+                    "codeModeErrorClass": "execution_runtime",
+                    "codeModeRuntimeSubreason": "catalog_operation_unavailable",
+                },
+                errorCode="CODE_MODE_FAILED",
+                errorMessage="bounded failure",
+            )
+
+        binding = _binding(
+            failed,
+            eager_operation_refs=frozenset({"operation:conversation-publish@1"}),
+        )
+        with bind_plane_host(binding):
+            execute_result = registry.dispatch(
+                PLANE_CODE_MODE_TOOL,
+                {"typescript_source": "export default () => 1;"},
+            )
+            execute_diagnostic = binding.host_operation_diagnostic
+            publish_result = registry.dispatch(
+                PLANE_PUBLISH_TOOL,
+                {
+                    "kind": "conversation",
+                    "operationRef": "operation:conversation-publish@1",
+                    "resourceRef": "conversation:test",
+                    "content": "must not publish",
+                },
+            )
+
+        self.assertEqual(json.loads(execute_result)["errorCode"], "CODE_MODE_FAILED")
+        self.assertEqual(json.loads(publish_result)["error"]["code"], "plane_host_error")
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(binding.terminal_action_reason(), "code_mode_failed")
+        self.assertIsNotNone(execute_diagnostic)
+        self.assertEqual(
+            execute_diagnostic["codeModeRuntimeSubreason"],  # type: ignore[index]
+            "catalog_operation_unavailable",
+        )
 
     def test_python_source_is_opaque_and_never_falls_back_to_python(self) -> None:
         requests: list[dict] = []

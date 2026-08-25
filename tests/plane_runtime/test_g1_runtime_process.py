@@ -1611,6 +1611,7 @@ class G1RuntimeProcessTests(unittest.TestCase):
                 "operationRefDigest": "a" * 64,
                 "codeModeHostStatus": "invalid",
                 "codeModeFailureClass": "code_mode",
+                "codeModeRuntimeSubreason": "authorized_work_item_read_unavailable",
                 "socketPhase": "invoke",
                 "socketState": "failed",
                 "preparedHandoff": {
@@ -1631,6 +1632,10 @@ class G1RuntimeProcessTests(unittest.TestCase):
         exit_frame = _terminal_failure(snapshot, invocation, result, 0)
         self.assertEqual(exit_frame["failure"]["codeModeHostStatus"], "invalid")
         self.assertEqual(exit_frame["failure"]["codeModeFailureClass"], "code_mode")
+        self.assertEqual(
+            exit_frame["failure"]["codeModeRuntimeSubreason"],
+            "authorized_work_item_read_unavailable",
+        )
         self.assertEqual(exit_frame["failure"]["socketPhase"], "invoke")
         self.assertEqual(exit_frame["failure"]["socketState"], "failed")
         self.assertEqual(
