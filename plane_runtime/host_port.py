@@ -740,6 +740,7 @@ class PlaneHostBinding:
     _plane_terminal_payload: Any = field(default=None, init=False, repr=False)
     _prepared_read_handoff_pending: bool = field(default=False, init=False, repr=False)
     code_mode_phase: str = "none"
+    _code_mode_tool_choice: str | None = field(default=None, init=False, repr=False)
     _code_mode_phase_hint: str | None = field(default=None, init=False, repr=False)
     _code_mode_phase_claimed: bool = field(default=False, init=False, repr=False)
     _outcome_publication_metadata: dict[str, Any] | None = field(
@@ -775,6 +776,12 @@ class PlaneHostBinding:
             raise ValueError("Plane task kit is outside its bound")
         if not isinstance(self.declaration_slice, str) or len(self.declaration_slice.encode("utf-8")) > MAX_DECLARATION_SLICE_BYTES:
             raise ValueError("Plane declaration slice is outside its bound")
+        if self.plane_agent_route:
+            object.__setattr__(
+                self,
+                "_code_mode_tool_choice",
+                PLANE_EXECUTE_TOOL if self.declaration_slice.strip() else PLANE_DISCOVER_TOOL,
+            )
 
     @property
     def fatal_error(self) -> str | None:
@@ -815,6 +822,23 @@ class PlaneHostBinding:
     def code_mode_phase_hint(self) -> str | None:
         with self._lock:
             return self._code_mode_phase_hint
+
+    def code_mode_tool_choice(self) -> str | None:
+        """Return the next model tool selected by the invocation state machine."""
+
+        with self._lock:
+            return self._code_mode_tool_choice
+
+    def observe_code_mode_result(self, output: Any) -> None:
+        """Advance the model-facing phase from one bounded execute result."""
+
+        with self._lock:
+            if self._code_mode_tool_choice is None:
+                return
+            if _contains_capability_not_found(output):
+                self._code_mode_tool_choice = PLANE_DISCOVER_TOOL
+            else:
+                self._code_mode_tool_choice = PLANE_EXECUTE_TOOL
 
     def consume_code_mode_phase(self, *, tool_available: bool) -> str | None:
         """Atomically claim one forced Code Mode continuation request."""
@@ -862,6 +886,7 @@ class PlaneHostBinding:
         with self._lock:
             self._terminal_action_reason = kind
             self._plane_terminal_payload = payload
+            self._code_mode_tool_choice = None
 
     def set_declaration_slice(self, declarations: str) -> None:
         """Replace the one trusted discovery slot for the next execution."""
@@ -872,6 +897,8 @@ class PlaneHostBinding:
             raise PlaneHostBoundsError("Plane declaration slice exceeds its bound")
         with self._lock:
             self.declaration_slice = declarations
+            if self.plane_agent_route:
+                self._code_mode_tool_choice = PLANE_EXECUTE_TOOL
 
     def _fail(self, message: str) -> None:
         if self._fatal_error is None:
@@ -1575,6 +1602,16 @@ def _declarations_from_result(result: HostCallResult) -> str | None:
     return None
 
 
+def _contains_capability_not_found(value: Any) -> bool:
+    if isinstance(value, Mapping):
+        if value.get("code") == "CAPABILITY_NOT_FOUND":
+            return True
+        return any(_contains_capability_not_found(item) for item in value.values())
+    if isinstance(value, list):
+        return any(_contains_capability_not_found(item) for item in value)
+    return False
+
+
 def _handle_plane_discover(args: Mapping[str, Any], **_: Any) -> str:
     try:
         data = _object(args, PLANE_DISCOVER_TOOL)
@@ -1675,6 +1712,7 @@ def _handle_plane_execute(args: Mapping[str, Any], **_: Any) -> str:
         )
         if result.status not in {"ok", "replayed"}:
             return _host_tool_error(result, field="code")
+        binding.observe_code_mode_result(result.output)
         terminal = _terminal_response(result.output)
         if terminal is not None:
             status, _response = terminal

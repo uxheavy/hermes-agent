@@ -1139,6 +1139,12 @@ class HermesKernelAdapter:
                     "_plane_runtime_consume_code_mode_phase",
                     host_binding.consume_code_mode_phase,
                 )
+                if plane_code_mode_route:
+                    setattr(
+                        agent,
+                        "_plane_runtime_code_mode_tool_choice",
+                        host_binding.code_mode_tool_choice,
+                    )
             # Plane's provider allowance is a hard invocation boundary. The
             # interactive Hermes summary fallback would spend an additional
             # provider call after that boundary, so return a finite budget

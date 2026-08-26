@@ -57,24 +57,37 @@ _OPENROUTER_PROVIDER_SORT_VALUES = {"throughput", "latency", "price"}
 # narrower non-rate-limit case.  See issue #24996.
 _FALLBACK_EXHAUSTED_COOLDOWN_S = 5.0
 
+_PLANE_DISCOVER_TOOL = "Plane:discover"
+_PLANE_EXECUTE_TOOL = "Plane:execute"
 _PLANE_CODE_MODE_TOOL = "plane_execute_typescript"
 
 
 def _plane_tool_name(tool):
     if not isinstance(tool, dict):
         return None
-    if tool.get("name") == _PLANE_CODE_MODE_TOOL:
-        return _PLANE_CODE_MODE_TOOL
+    if isinstance(tool.get("name"), str):
+        return tool["name"]
     function = tool.get("function")
-    if isinstance(function, dict) and function.get("name") == _PLANE_CODE_MODE_TOOL:
-        return _PLANE_CODE_MODE_TOOL
+    if isinstance(function, dict) and isinstance(function.get("name"), str):
+        return function["name"]
     return None
 
 
 def _plane_codex_request_overrides(agent, tools):
-    """Require one bounded Code Mode turn after a trusted prepared search."""
+    """Apply the host-owned ADR-0011 tool phase for Codex Responses."""
 
     configured = getattr(agent, "request_overrides", None)
+    overrides = dict(configured) if isinstance(configured, dict) else {}
+
+    choose_phase = getattr(agent, "_plane_runtime_code_mode_tool_choice", None)
+    if callable(choose_phase):
+        choice = choose_phase()
+        if choice not in {_PLANE_DISCOVER_TOOL, _PLANE_EXECUTE_TOOL}:
+            raise RuntimeError("Plane Code Mode tool-choice state is invalid")
+        if any(_plane_tool_name(tool) == choice for tool in (tools or [])):
+            overrides["tool_choice"] = {"type": "function", "name": choice}
+        return overrides
+
     tool_available = any(
         _plane_tool_name(tool) == _PLANE_CODE_MODE_TOOL for tool in (tools or [])
     )
@@ -90,7 +103,6 @@ def _plane_codex_request_overrides(agent, tools):
             raise RuntimeError("Plane Code Mode continuation state is unavailable")
     if phase not in {None, "post_search"}:
         raise RuntimeError("Plane Code Mode continuation state is invalid")
-    overrides = dict(configured) if isinstance(configured, dict) else {}
     if phase == "post_search":
         overrides["tool_choice"] = {"type": "function", "name": _PLANE_CODE_MODE_TOOL}
     return overrides
