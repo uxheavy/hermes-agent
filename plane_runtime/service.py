@@ -11,6 +11,7 @@ import argparse
 import errno
 import json
 import os
+import re
 import selectors
 import signal
 import sys
@@ -70,6 +71,18 @@ MAX_SERVICE_REQUEST_BYTES = (
 SERVICE_FRAME_TIMEOUT_SECONDS = 1.0
 SERVICE_FRAME_READ_CHUNK_BYTES = 16 * 1024
 SERVICE_FRAME_TERMINATOR_ALLOWANCE = 2
+
+
+def _write_failure_diagnostic(error: BaseException) -> None:
+    exception_class = type(error).__name__
+    module = type(error).__module__
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", exception_class):
+        exception_class = "Unknown"
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.]*", module):
+        module = "unknown"
+    sys.stderr.write(
+        f"event=agent.runtime.service status=failed exceptionClass={exception_class} module={module}\n"
+    )
 
 
 class _BootstrapCancellation:
@@ -794,7 +807,8 @@ def main(argv: list[str] | None = None) -> int:
                     sys.stdout,
                     **service_kwargs,
                 )
-        except Exception:
+        except Exception as error:
+            _write_failure_diagnostic(error)
             return 2
         finally:
             if host_port is not None:

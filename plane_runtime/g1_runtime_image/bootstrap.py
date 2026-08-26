@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import shutil
 import signal
 import subprocess
@@ -24,6 +25,30 @@ from ..hermes_adapter import validate_absolute_unix_socket_path
 _MODEL_USAGE_PROTOCOL = "plane.agent-runtime/internal-usage/v1"
 _MAX_DIAGNOSTIC_BYTES = 16 * 1024
 _MAX_UNIX_SOCKET_PATH_BYTES = 103
+_DIAGNOSTIC_RE = re.compile(r"event=agent\.runtime\.service status=failed exceptionClass=([A-Za-z_][A-Za-z0-9_]*) module=([A-Za-z_][A-Za-z0-9_.]*)\n")
+
+
+def _write_failure_diagnostic(error: BaseException, source: str) -> None:
+    exception_class = type(error).__name__
+    module = type(error).__module__
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", exception_class):
+        exception_class = "Unknown"
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.]*", module):
+        module = "unknown"
+    sys.stderr.write(
+        f"event=agent.runtime.{source} status=failed exceptionClass={exception_class} module={module}\n"
+    )
+
+
+def _forward_child_diagnostic(raw: bytes, overflow: bool) -> None:
+    if overflow:
+        return
+    try:
+        match = _DIAGNOSTIC_RE.fullmatch(raw.decode("ascii"))
+    except UnicodeDecodeError:
+        return
+    if match is not None:
+        sys.stderr.write(raw.decode("ascii"))
 
 def _plane_host_socket(value: object) -> str | None:
     if value is None:
@@ -136,6 +161,7 @@ def _run(
         child.stdout.close()
         returncode = int(child.wait())
         stderr_thread.join(timeout=1.0)
+        _forward_child_diagnostic(bytes(diagnostics), overflow[0])
         _forward_valid_model_usage(bytes(diagnostics), overflow[0])
         return returncode
     finally:
@@ -166,9 +192,10 @@ def main(argv: list[str] | None = None) -> int:
             _plane_host_socket(args.plane_host_socket),
             _provider_relay_socket(args.provider_relay_socket),
         )
-    except Exception:
+    except Exception as error:
         if frames is not None:
             frames.clear()
+        _write_failure_diagnostic(error, "bootstrap")
         return 2
 
 

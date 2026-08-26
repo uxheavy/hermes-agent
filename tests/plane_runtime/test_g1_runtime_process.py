@@ -920,6 +920,36 @@ class G1RuntimeProcessTests(unittest.TestCase):
                 run.assert_not_called()
                 self.assertNotIn(canary, diagnostics.getvalue())
 
+    def test_service_reports_bounded_failure_without_exception_text(self) -> None:
+        snapshot = make_snapshot()
+        invocation = make_invocation(snapshot)
+        frames = G1BootstrapFrames(
+            1,
+            {},
+            json.dumps(
+                {"invocation": invocation, "run": snapshot}, sort_keys=True, separators=(",", ":")
+            ).encode(),
+        )
+        payload = bytes(frames.child_bytes())
+
+        class BinaryStdin:
+            def __init__(self, value: bytes) -> None:
+                self.buffer = io.BytesIO(value)
+
+        diagnostics = io.StringIO()
+        with mock.patch("sys.stdin", BinaryStdin(payload)), mock.patch("sys.stderr", diagnostics):
+            with mock.patch("plane_runtime.g1_service.serve_once_g1", side_effect=RuntimeError("secret-value")):
+                self.assertEqual(service_main(["--once", "--g1-production", "--g1-bootstrap-child"]), 2)
+        self.assertEqual(
+            diagnostics.getvalue(),
+            "event=agent.runtime.service status=failed exceptionClass=RuntimeError module=builtins\n",
+        )
+        self.assertNotIn("secret-value", diagnostics.getvalue())
+        forwarded = io.StringIO()
+        with mock.patch("sys.stderr", forwarded):
+            bootstrap._forward_child_diagnostic(diagnostics.getvalue().encode("ascii"), False)
+        self.assertEqual(forwarded.getvalue(), diagnostics.getvalue())
+
     def test_credential_bootstrap_forwards_dedicated_plane_host_socket_argument(self) -> None:
         dispatch = json.dumps(
             {"modelCallAllowance": 1, "protocol": "plane.agent-runtime/dispatch-control/v1"},
