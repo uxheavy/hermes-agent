@@ -29,6 +29,8 @@ MAX_EAGER_OPERATIONS = 64
 MAX_EAGER_INPUT_SCHEMA_BYTES = 16 * 1024
 MAX_EAGER_PRESENTATION_BYTES = 512 * 1024
 MAX_EAGER_SCHEMA_PROPERTIES = 4096
+MAX_PLANE_TOOL_COUNT = 2
+MAX_PLANE_DECLARATION_BYTES = 16 * 1024
 
 # Frozen bytes from the paired Plane G1 runtime contract manifest.
 G1_CONTRACT_DIGESTS = {
@@ -291,6 +293,74 @@ def _snapshot_ref(value: Any, name: str) -> str:
     return value
 
 
+def _validate_eager_tool_catalog(catalog: Mapping[str, Any]) -> None:
+    _reject_unknown(catalog, {"catalogDigest", "eagerOperations"}, "toolCatalog")
+    _required(catalog, {"catalogDigest", "eagerOperations"}, "toolCatalog")
+    _content_ref(catalog["catalogDigest"], "toolCatalog.catalogDigest")
+    operations = catalog["eagerOperations"]
+    if not isinstance(operations, list) or len(operations) > MAX_EAGER_OPERATIONS:
+        raise G1ContractError(
+            f"toolCatalog.eagerOperations must contain at most {MAX_EAGER_OPERATIONS} items"
+        )
+    for index, item in enumerate(operations):
+        operation = _object(item, f"toolCatalog.eagerOperations[{index}]")
+        operation_name = f"toolCatalog.eagerOperations[{index}]"
+        _reject_unknown(operation, {"operationRef", "schemaDigest", "inputSchema", "disclosure"}, operation_name)
+        _required(operation, {"operationRef", "schemaDigest", "inputSchema", "disclosure"}, operation_name)
+        _ref(operation["operationRef"], f"{operation_name}.operationRef", "operation")
+        _content_ref(operation["schemaDigest"], f"{operation_name}.schemaDigest")
+        validate_eager_input_schema(operation["inputSchema"], f"{operation_name}.inputSchema")
+        if operation["disclosure"] != "eager":
+            raise G1ContractError(f"{operation_name}.disclosure must be eager")
+    if len(_canonical(catalog)) > MAX_EAGER_PRESENTATION_BYTES:
+        raise G1ContractError(f"toolCatalog exceeds {MAX_EAGER_PRESENTATION_BYTES} canonical JSON bytes")
+
+
+def _validate_plane_tool_catalog(catalog: Mapping[str, Any]) -> None:
+    _reject_unknown(catalog, {"catalogDigest", "server", "tools", "taskKit"}, "toolCatalog")
+    _required(catalog, {"catalogDigest", "server", "tools", "taskKit"}, "toolCatalog")
+    _content_ref(catalog["catalogDigest"], "toolCatalog.catalogDigest")
+    if catalog["server"] != "Plane":
+        raise G1ContractError("toolCatalog.server must be Plane")
+    tools = catalog["tools"]
+    if not isinstance(tools, list) or len(tools) != MAX_PLANE_TOOL_COUNT:
+        raise G1ContractError("toolCatalog.tools must contain exactly two tools")
+    names: set[str] = set()
+    for index, item in enumerate(tools):
+        tool = _object(item, f"toolCatalog.tools[{index}]")
+        name = f"toolCatalog.tools[{index}]"
+        _reject_unknown(tool, {"name", "description", "inputSchema"}, name)
+        _required(tool, {"name", "description", "inputSchema"}, name)
+        tool_name = _text(tool["name"], f"{name}.name", maximum=32)
+        if tool_name not in {"discover", "execute"} or tool_name in names:
+            raise G1ContractError("toolCatalog.tools must contain discover and execute once")
+        names.add(tool_name)
+        _text(tool["description"], f"{name}.description")
+        validate_eager_input_schema(tool["inputSchema"], f"{name}.inputSchema")
+    if names != {"discover", "execute"}:
+        raise G1ContractError("toolCatalog.tools must contain discover and execute")
+    task_kit = _object(catalog["taskKit"], "toolCatalog.taskKit")
+    _reject_unknown(task_kit, {"task", "declarations", "example"}, "toolCatalog.taskKit")
+    _required(task_kit, {"task", "declarations", "example"}, "toolCatalog.taskKit")
+    task = _object(task_kit["task"], "toolCatalog.taskKit.task")
+    _reject_unknown(task, {"target", "objective", "acceptanceCriteria"}, "toolCatalog.taskKit.task")
+    _required(task, {"target", "objective", "acceptanceCriteria"}, "toolCatalog.taskKit.task")
+    _ref(task["target"], "toolCatalog.taskKit.task.target", "target")
+    _text(task["objective"], "toolCatalog.taskKit.task.objective")
+    criteria = task["acceptanceCriteria"]
+    if not isinstance(criteria, list) or len(criteria) > 64:
+        raise G1ContractError("toolCatalog.taskKit.task.acceptanceCriteria must contain at most 64 items")
+    for item in criteria:
+        _text(item, "toolCatalog.taskKit.task.acceptanceCriteria[]")
+    declarations = task_kit["declarations"]
+    _text(declarations, "toolCatalog.taskKit.declarations", maximum=MAX_PLANE_DECLARATION_BYTES)
+    if len(declarations) > MAX_PLANE_DECLARATION_BYTES:
+        raise G1ContractError("toolCatalog.taskKit.declarations exceeds 16384 characters")
+    _text(task_kit["example"], "toolCatalog.taskKit.example", maximum=MAX_TEXT_BYTES)
+    if len(_canonical(catalog)) > MAX_EAGER_PRESENTATION_BYTES:
+        raise G1ContractError(f"toolCatalog exceeds {MAX_EAGER_PRESENTATION_BYTES} canonical JSON bytes")
+
+
 def _validate_snapshot(raw: Any) -> dict[str, Any]:
     data = _object(raw, "RunSnapshot")
     _reject_unknown(
@@ -346,36 +416,10 @@ def _validate_snapshot(raw: Any) -> dict[str, Any]:
         _content_ref(item_data["contentDigest"], f"context[{index}].contentDigest")
 
     catalog = _object(data["toolCatalog"], "RunSnapshot.toolCatalog")
-    _reject_unknown(catalog, {"catalogDigest", "eagerOperations"}, "toolCatalog")
-    _required(catalog, {"catalogDigest", "eagerOperations"}, "toolCatalog")
-    _content_ref(catalog["catalogDigest"], "toolCatalog.catalogDigest")
-    operations = catalog["eagerOperations"]
-    if not isinstance(operations, list) or len(operations) > MAX_EAGER_OPERATIONS:
-        raise G1ContractError(
-            f"toolCatalog.eagerOperations must contain at most {MAX_EAGER_OPERATIONS} items"
-        )
-    for index, item in enumerate(operations):
-        operation = _object(item, f"toolCatalog.eagerOperations[{index}]")
-        operation_name = f"toolCatalog.eagerOperations[{index}]"
-        _reject_unknown(
-            operation,
-            {"operationRef", "schemaDigest", "inputSchema", "disclosure"},
-            operation_name,
-        )
-        _required(
-            operation,
-            {"operationRef", "schemaDigest", "inputSchema", "disclosure"},
-            operation_name,
-        )
-        _ref(operation["operationRef"], f"{operation_name}.operationRef", "operation")
-        _content_ref(operation["schemaDigest"], f"{operation_name}.schemaDigest")
-        validate_eager_input_schema(operation["inputSchema"], f"{operation_name}.inputSchema")
-        if operation["disclosure"] != "eager":
-            raise G1ContractError(f"{operation_name}.disclosure must be eager")
-    if len(_canonical(catalog)) > MAX_EAGER_PRESENTATION_BYTES:
-        raise G1ContractError(
-            f"toolCatalog exceeds {MAX_EAGER_PRESENTATION_BYTES} canonical JSON bytes"
-        )
+    if "server" in catalog:
+        _validate_plane_tool_catalog(catalog)
+    else:
+        _validate_eager_tool_catalog(catalog)
 
     policy = _object(data["runtimePolicy"], "RunSnapshot.runtimePolicy")
     _reject_unknown(
@@ -390,6 +434,7 @@ def _validate_snapshot(raw: Any) -> dict[str, Any]:
             "maxCodeModeInputBytes",
             "maxCodeModeOutputBytes",
             "maxCodeModeCalls",
+            "codeModePhase",
         },
         "runtimePolicy",
     )
@@ -529,6 +574,26 @@ class G1RunSnapshot:
     @property
     def eager_operations(self) -> tuple[Mapping[str, Any], ...]:
         return tuple(self.raw["toolCatalog"]["eagerOperations"])
+
+    @property
+    def is_plane_code_mode(self) -> bool:
+        return self.raw["toolCatalog"].get("server") == "Plane"
+
+    @property
+    def plane_task_kit(self) -> Mapping[str, Any]:
+        return self.raw["toolCatalog"]["taskKit"]
+
+    @property
+    def plane_task(self) -> Mapping[str, Any]:
+        return self.plane_task_kit["task"]
+
+    @property
+    def plane_initial_declarations(self) -> str:
+        return str(self.plane_task_kit["declarations"])
+
+    @property
+    def plane_example(self) -> str:
+        return str(self.plane_task_kit["example"])
 
     @property
     def model_provider(self) -> str:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import copy
 import unittest
 
 from plane_runtime.g1_contract import G1InvocationEnvelope, G1RunSnapshot
@@ -15,11 +16,12 @@ from plane_runtime.host_port import (
     PLANE_DISCOVERY_OPERATION,
     PLANE_EXECUTE_TOOL,
     PLANE_CODE_MODE_EXECUTE_OPERATION,
+    PLANE_RUNTIME_TOOLSET,
     install_plane_tools,
     current_plane_host,
 )
 from tools.registry import registry
-from tests.plane_runtime.test_g1_runtime_process import make_invocation, make_snapshot
+from tests.plane_runtime.test_g1_runtime_process import _digest, make_invocation, make_snapshot
 
 
 def _result(request: dict, *, output: object = None, status: str = "ok", **extra: object) -> dict:
@@ -33,6 +35,39 @@ def _result(request: dict, *, output: object = None, status: str = "ok", **extra
         "output": output,
         **extra,
     }
+
+
+def _plane_snapshot() -> dict[str, object]:
+    raw = copy.deepcopy(make_snapshot())
+    raw["toolCatalog"] = {
+        "catalogDigest": "content:" + "a" * 64,
+        "server": "Plane",
+        "tools": [
+            {
+                "name": "discover",
+                "description": "The complete intended workflow.",
+                "inputSchema": {"type": "object", "required": ["query"]},
+            },
+            {
+                "name": "execute",
+                "description": "TypeScript statements executed as an async function body.",
+                "inputSchema": {"type": "object", "required": ["code"]},
+            },
+        ],
+        "taskKit": {
+            "task": {
+                "target": "target:test",
+                "objective": "Persisted objective.",
+                "acceptanceCriteria": ["Persisted criterion."],
+            },
+            "declarations": "persisted declarations",
+            "example": "persisted example",
+        },
+    }
+    raw["contentDigest"] = _digest(
+        "snapshot", {key: value for key, value in raw.items() if key != "contentDigest"}
+    )
+    return raw
 
 
 class Adr0011CodeModeTests(unittest.TestCase):
@@ -53,8 +88,16 @@ class Adr0011CodeModeTests(unittest.TestCase):
         execute = next(item["function"] for item in definitions if item["function"]["name"] == PLANE_EXECUTE_TOOL)
         self.assertEqual(discover["parameters"]["required"], ["query"])
         self.assertEqual(discover["parameters"]["properties"]["query"]["maxLength"], 500)
+        self.assertEqual(
+            discover["parameters"]["properties"]["query"]["description"],
+            "The complete intended workflow, for example: list urgent unassigned work items, assign one member, then finish.",
+        )
         self.assertEqual(execute["parameters"]["required"], ["code"])
         self.assertEqual(execute["parameters"]["properties"]["code"]["maxLength"], 8192)
+        self.assertEqual(
+            execute["parameters"]["properties"]["code"]["description"],
+            "TypeScript statements executed as an async function body with ambient plane and task objects. Imports and exports are forbidden.",
+        )
         for description in (discover["description"], execute["description"]):
             self.assertNotIn("operationRef", description)
             self.assertNotIn("prepared-call", description)
@@ -87,13 +130,36 @@ class Adr0011CodeModeTests(unittest.TestCase):
         self.assertEqual(requests[0]["input"], {"query": "list work items, then finish"})
         self.assertEqual(binding.declaration_slice, result["declarations"])
 
+    def test_model_bounds_count_characters(self) -> None:
+        binding = PlaneHostBinding(
+            port=CallablePlaneHostPort(lambda request: _result(request)),
+            run_id="run:test",
+            invocation_id="invocation:bounds",
+            correlation_id="correlation:bounds",
+            cancellation=lambda: False,
+        )
+        from plane_runtime.host_port import bind_plane_host
+
+        with bind_plane_host(binding):
+            discover_error = json.loads(registry.dispatch(PLANE_DISCOVER_TOOL, {"query": "x" * 501}))
+            execute_error = json.loads(registry.dispatch(PLANE_EXECUTE_TOOL, {"code": "x" * 8193}))
+        self.assertEqual(discover_error["error"]["code"], "DISCOVER_FAILED")
+        self.assertEqual(execute_error["error"]["code"], "SOURCE_TOO_LARGE")
+
+    def test_run_snapshot_uses_plane_authored_task_kit_and_declarations(self) -> None:
+        snapshot = G1RunSnapshot.from_dict(_plane_snapshot())
+        self.assertTrue(snapshot.is_plane_code_mode)
+        self.assertEqual(snapshot.plane_task["objective"], "Persisted objective.")
+        self.assertEqual(snapshot.plane_initial_declarations, "persisted declarations")
+        self.assertEqual(snapshot.plane_example, "persisted example")
+
     def test_execute_routes_only_code_and_projects_terminal_results(self) -> None:
         for terminal in ("completed", "waiting_for_input", "blocked"):
             requests: list[dict] = []
 
             def rpc(request: dict, terminal: str = terminal) -> dict:
                 requests.append(request)
-                return _result(request, output={"status": terminal})
+                return _result(request, output={"result": {"terminal": {"kind": terminal}}})
 
             binding = PlaneHostBinding(
                 port=CallablePlaneHostPort(rpc),
@@ -112,9 +178,7 @@ class Adr0011CodeModeTests(unittest.TestCase):
             self.assertEqual(result, {"status": terminal})
             self.assertEqual(requests[0]["action"], "code")
             self.assertEqual(requests[0]["operationRef"], PLANE_CODE_MODE_EXECUTE_OPERATION)
-            self.assertIn("await plane.finish", requests[0]["input"]["source"])
-            self.assertEqual(len(requests[0]["input"]["input"]["taskKitDigest"]), 64)
-            self.assertEqual(len(requests[0]["input"]["input"]["declarationSliceDigest"]), 64)
+            self.assertEqual(requests[0]["input"], {"code": "await plane.finish({ kind: \"" + terminal + "\" });"})
 
     def test_execute_returns_compact_value_and_explicit_missing_finish_error(self) -> None:
         outputs = iter(({"status": "returned", "value": {"ok": True}}, None))
@@ -145,7 +209,7 @@ class Adr0011CodeModeTests(unittest.TestCase):
         self.assertIsNotNone(registry.get_entry("plane_operation"))
 
     def test_adapter_binds_task_kit_and_uses_only_plane_route_tools(self) -> None:
-        snapshot = G1RunSnapshot.from_dict(make_snapshot())
+        snapshot = G1RunSnapshot.from_dict(_plane_snapshot())
         invocation = G1InvocationEnvelope.from_dict(make_invocation(snapshot.to_dict()))
         captured: dict[str, object] = {}
 
@@ -186,7 +250,9 @@ class Adr0011CodeModeTests(unittest.TestCase):
         self.assertNotIn("plane_operation", prompt)
         self.assertNotIn("plane_publish", prompt)
         self.assertNotIn("prepared-call", prompt)
-        self.assertIn('"objective":"Return a deterministic runtime outcome."', str(captured["task_kit"]))
+        self.assertIn('"objective":"Persisted objective."', str(captured["task_kit"]))
+        self.assertIn("persisted declarations", prompt)
+        self.assertIn("persisted example", prompt)
 
     def test_non_plane_adapter_keeps_existing_toolset_path(self) -> None:
         snapshot = G1RunSnapshot.from_dict(make_snapshot())
@@ -219,6 +285,45 @@ class Adr0011CodeModeTests(unittest.TestCase):
         self.assertEqual(result.kind, "completed")
         self.assertEqual(captured["toolsets"], [])
         self.assertNotIn(PLANE_AGENT_TOOLSET, captured["toolsets"])
+
+    def test_legacy_snapshot_with_host_port_keeps_legacy_route(self) -> None:
+        snapshot = G1RunSnapshot.from_dict(make_snapshot())
+        invocation = G1InvocationEnvelope.from_dict(make_invocation(snapshot.to_dict()))
+        captured: dict[str, object] = {}
+
+        class FakeAgent:
+            session_input_tokens = 0
+            session_output_tokens = 0
+            session_api_calls = 1
+
+            def run_conversation(self, _message: str, *, system_message: str) -> dict[str, str]:
+                del system_message
+                binding = current_plane_host()
+                assert binding is not None
+                captured["plane_agent_route"] = binding.plane_agent_route
+                captured["task_kit"] = binding.task_kit
+                captured["declarations"] = binding.declaration_slice
+                return {"final_response": "legacy transcript"}
+
+        def factory(**kwargs: object) -> FakeAgent:
+            captured["toolsets"] = kwargs["enabled_toolsets"]
+            return FakeAgent()
+
+        class Credentials:
+            def resolve(self, _provider: str) -> dict[str, str]:
+                return {"api_key": "provider-free-test-secret"}
+
+        result = HermesKernelAdapter(
+            agent_factory=factory,
+            credential_source=Credentials(),
+            host_port=CallablePlaneHostPort(lambda request: _result(request)),
+        ).dispatch(snapshot, invocation, lambda: False, lambda _body: None, model_call_allowance=1)
+
+        self.assertEqual(result.kind, "completed")
+        self.assertEqual(captured["toolsets"], [PLANE_RUNTIME_TOOLSET])
+        self.assertFalse(captured["plane_agent_route"])
+        self.assertEqual(captured["task_kit"], "{}")
+        self.assertEqual(captured["declarations"], "")
 
 
 if __name__ == "__main__":

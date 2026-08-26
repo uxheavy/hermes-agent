@@ -81,51 +81,15 @@ def build_model_guidance(snapshot: G1RunSnapshot) -> str:
 
 
 def build_plane_task_kit(snapshot: G1RunSnapshot) -> dict[str, Any]:
-    """Return only the immutable assignment values allowed in generated code."""
+    """Return Plane's persisted immutable task data without local synthesis."""
 
-    return {
-        "target": snapshot.target_ref,
-        "objective": snapshot.objective,
-        "acceptanceCriteria": list(snapshot.acceptance_criteria),
-    }
+    return _plain(snapshot.plane_task)
 
 
 def build_initial_declarations(snapshot: G1RunSnapshot) -> str:
-    """Build the bounded base declarations without exposing gateway vocabulary."""
+    """Return Plane's persisted initial declaration slice unchanged."""
 
-    methods: list[str] = []
-    method_names = {
-        "operation:work_item.read": ("workItems", "retrieve"),
-        "operation:search_workspace": ("workItems", "search"),
-        "operation:agent.assignment.delegate": ("assignments", "delegate"),
-    }
-    for operation in snapshot.eager_operations:
-        namespace_method = method_names.get(str(operation["operationRef"]))
-        if namespace_method is None:
-            continue
-        namespace, method = namespace_method
-        declaration = f"  {method}(input: Readonly<Record<string, unknown>>): Promise<unknown>;"
-        entry = next((item for item in methods if item.startswith(f"  {namespace}:")), None)
-        if entry is None:
-            methods.append(f"  {namespace}: {{\n{declaration}\n  }};")
-        elif declaration not in entry:
-            methods[methods.index(entry)] = entry[:-3] + f"\n{declaration}\n  }};"
-    declarations = "\n".join(
-        (
-            "type JsonPrimitive = string | number | boolean | null;",
-            "type JsonValue = JsonPrimitive | readonly JsonValue[] | { readonly [key: string]: JsonValue };",
-            "type PlaneRef<Kind extends string> = string & { readonly __planeKind: Kind };",
-            "declare const task: Readonly<{ target: PlaneRef<string>; objective: string; acceptanceCriteria: readonly string[] }>;",
-            "type FinishInput = { kind: \"completed\"; summary: string; content?: string; artifacts?: readonly PlaneRef<\"artifact\">[]; evidence?: readonly PlaneRef<string>[] } | { kind: \"waiting_for_input\"; question: string; context?: JsonValue } | { kind: \"blocked\"; reason: string; evidence?: readonly PlaneRef<string>[] };",
-            "declare const plane: Readonly<{",
-            *methods,
-            "  finish(input: FinishInput): Promise<never>;",
-            "}>;",
-        )
-    )
-    if len(declarations.encode("utf-8")) > 16 * 1024:
-        raise PresentationBoundsError("Plane declaration slice exceeds 16384 UTF-8 bytes")
-    return declarations
+    return snapshot.plane_initial_declarations
 
 
 def build_plane_code_mode_guidance(snapshot: G1RunSnapshot) -> str:
@@ -147,6 +111,8 @@ def build_plane_code_mode_guidance(snapshot: G1RunSnapshot) -> str:
             task_kit,
             "Initial declarations:",
             build_initial_declarations(snapshot),
+            "Relevant example:",
+            snapshot.plane_example,
             "Rules:",
             *(f"- {rule}" for rule in _PLANE_CODE_MODE_RULES),
         )

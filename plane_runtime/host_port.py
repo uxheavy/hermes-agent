@@ -54,7 +54,9 @@ MAX_HOST_INPUT_BYTES = 8 * 1024
 MAX_HOST_RESULT_TEXT_BYTES = 12 * 1024
 MAX_LEGACY_CODE_MODE_SOURCE_BYTES = 4 * 1024
 MAX_CODE_MODE_SOURCE_BYTES = 8 * 1024
-MAX_DISCOVER_QUERY_BYTES = 500
+MAX_DISCOVERY_QUERY_CHARS = 500
+MAX_EXECUTE_CODE_CHARS = 8192
+MAX_DISCOVER_QUERY_BYTES = MAX_DISCOVERY_QUERY_CHARS
 MAX_DECLARATION_SLICE_BYTES = 16 * 1024
 MAX_EXECUTE_RESULT_BYTES = 8 * 1024
 MAX_PLANE_EXECUTE_INPUT_BYTES = 16 * 1024
@@ -157,6 +159,14 @@ def _text(value: Any, name: str, maximum: int) -> str:
         raise PlaneHostError(f"{name} must be a non-empty string")
     if len(value.encode("utf-8")) > maximum:
         raise PlaneHostBoundsError(f"{name} exceeds {maximum} UTF-8 bytes")
+    return value
+
+
+def _chars(value: Any, name: str, maximum: int) -> str:
+    if not isinstance(value, str) or not value:
+        raise PlaneHostError(f"{name} must be a non-empty string")
+    if len(value) > maximum:
+        raise PlaneHostBoundsError(f"{name} must be 1..{maximum} characters")
     return value
 
 
@@ -1569,7 +1579,7 @@ def _handle_plane_discover(args: Mapping[str, Any], **_: Any) -> str:
     try:
         data = _object(args, PLANE_DISCOVER_TOOL)
         _reject_unknown(data, {"query"}, PLANE_DISCOVER_TOOL)
-        query = _text(data.get("query"), f"{PLANE_DISCOVER_TOOL}.query", MAX_DISCOVER_QUERY_BYTES)
+        query = _chars(data.get("query"), f"{PLANE_DISCOVER_TOOL}.query", MAX_DISCOVERY_QUERY_CHARS)
         result = _binding_or_error().call(
             action="discover",
             operation_ref=PLANE_DISCOVERY_OPERATION,
@@ -1617,14 +1627,29 @@ def _handle_plane_discover(args: Mapping[str, Any], **_: Any) -> str:
         return _tool_error("DISCOVER_FAILED", str(exc), resolution="Narrow the workflow query and retry discovery.", recovery="narrow_query")
 
 
-def _execute_status(output: Any) -> tuple[str, Any] | None:
-    if not isinstance(output, Mapping):
-        return None
-    status = output.get("status")
-    if status in {"completed", "waiting_for_input", "blocked"}:
-        return str(status), None
-    if status == "returned":
-        return "returned", output.get("value")
+_TERMINAL_KINDS = frozenset({"completed", "waiting_for_input", "blocked"})
+
+
+def _terminal_response(output: Any) -> tuple[str, dict[str, Any]] | None:
+    """Project Plane's finite terminal result through its nested envelope."""
+
+    candidates = [output]
+    if isinstance(output, Mapping) and isinstance(output.get("result"), Mapping):
+        candidates.insert(0, output["result"])
+    for candidate in candidates:
+        if not isinstance(candidate, Mapping):
+            continue
+        kind = candidate.get("status")
+        if kind not in _TERMINAL_KINDS:
+            terminal = candidate.get("terminal")
+            kind = terminal.get("kind") if isinstance(terminal, Mapping) else None
+            candidate = terminal if isinstance(terminal, Mapping) else candidate
+        if kind in _TERMINAL_KINDS:
+            response = {"status": kind}
+            for key in ("question", "reason"):
+                if isinstance(candidate.get(key), str) and candidate[key]:
+                    response[key] = candidate[key]
+            return str(kind), response
     return None
 
 
@@ -1632,7 +1657,7 @@ def _handle_plane_execute(args: Mapping[str, Any], **_: Any) -> str:
     try:
         data = _object(args, PLANE_EXECUTE_TOOL)
         _reject_unknown(data, {"code"}, PLANE_EXECUTE_TOOL)
-        code = _text(data.get("code"), f"{PLANE_EXECUTE_TOOL}.code", MAX_CODE_MODE_SOURCE_BYTES)
+        code = _chars(data.get("code"), f"{PLANE_EXECUTE_TOOL}.code", MAX_EXECUTE_CODE_CHARS)
         if not code.strip():
             return _tool_error(
                 "VALIDATION_ERROR",
@@ -1642,41 +1667,25 @@ def _handle_plane_execute(args: Mapping[str, Any], **_: Any) -> str:
                 field="code",
             )
         binding = _binding_or_error()
-        # The existing Plane capsule is the trusted host boundary. The model
-        # supplies only a body; the adapter supplies the module wrapper.
-        source = "export default async ({ host, input }) => {\n" + code + "\n};"
-        capsule = {
-            "schemaVersion": PLANE_CODE_MODE_SCHEMA_VERSION,
-            "entrypoint": "default",
-            "source": source,
-            "input": {
-                "taskKitDigest": binding.task_kit_digest(),
-                "declarationSliceDigest": binding.declaration_slice_digest(),
-            },
-        }
-        _bounded_json(capsule, "codeMode.capsule", MAX_PLANE_EXECUTE_INPUT_BYTES)
         result = binding.call(
             action="code",
             operation_ref=PLANE_CODE_MODE_EXECUTE_OPERATION,
-            input=capsule,
-            source="code",
+            input={"code": code},
+            source="model",
         )
         if result.status not in {"ok", "replayed"}:
             return _host_tool_error(result, field="code")
-        terminal = _execute_status(result.output)
+        terminal = _terminal_response(result.output)
         if terminal is not None:
-            status, value = terminal
-            if status == "returned":
-                encoded = _bounded_json(value, "Plane:execute.value", MAX_EXECUTE_RESULT_BYTES)
-                return json.dumps(
-                    {"status": "returned", "value": json.loads(encoded)},
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                )
+            status, _response = terminal
             binding.mark_terminal(status, result.output)
             return json.dumps({"status": status}, separators=(",", ":"))
         if result.output is not None:
-            value = result.output.get("value") if isinstance(result.output, Mapping) and "value" in result.output else result.output
+            value = result.output
+            if isinstance(value, Mapping) and value.get("status") == "returned" and "value" in value:
+                value = value["value"]
+            elif isinstance(value, Mapping) and isinstance(value.get("result"), Mapping):
+                value = value["result"]
             encoded = _bounded_json(value, "Plane:execute.value", MAX_EXECUTE_RESULT_BYTES)
             return json.dumps({"status": "returned", "value": json.loads(encoded)}, separators=(",", ":"))
         return _tool_error(
@@ -1792,11 +1801,8 @@ def install_plane_tools() -> None:
                         "query": {
                             "type": "string",
                             "minLength": 1,
-                            "maxLength": MAX_DISCOVER_QUERY_BYTES,
-                            "description": (
-                                "The complete intended workflow, for example: list urgent unassigned "
-                                "work items, assign one member, then finish."
-                            ),
+                            "maxLength": MAX_DISCOVERY_QUERY_CHARS,
+                            "description": "The complete intended workflow, for example: list urgent unassigned work items, assign one member, then finish.",
                         }
                     },
                 },
@@ -1812,9 +1818,10 @@ def install_plane_tools() -> None:
                 "name": PLANE_EXECUTE_TOOL,
                 "description": (
                     "Run one bounded TypeScript function body against the current Plane assignment. "
-                    "plane and task are injected and frozen. Imports and exports are forbidden. "
-                    "Return compact JSON for further reasoning, or call await plane.finish(...) exactly once. "
-                    "Plane owns identity, authorization, pagination, idempotency, receipts, and recovery."
+                    "plane and task are injected and frozen. Use ordinary typed resource methods; do not import, export, "
+                    "construct a client, or return large data. Return compact JSON for further reasoning, or call "
+                    "await plane.finish(...) exactly once to complete, wait for input, or block. Plane owns identity, "
+                    "authorization, pagination, idempotency, receipts, and recovery."
                 ),
                 "parameters": {
                     "type": "object",
@@ -1824,11 +1831,8 @@ def install_plane_tools() -> None:
                         "code": {
                             "type": "string",
                             "minLength": 1,
-                            "maxLength": MAX_CODE_MODE_SOURCE_BYTES,
-                            "description": (
-                                "TypeScript statements executed as an async function body with ambient "
-                                "plane and task objects. Imports and exports are forbidden."
-                            ),
+                            "maxLength": MAX_EXECUTE_CODE_CHARS,
+                            "description": "TypeScript statements executed as an async function body with ambient plane and task objects. Imports and exports are forbidden.",
                         }
                     },
                 },

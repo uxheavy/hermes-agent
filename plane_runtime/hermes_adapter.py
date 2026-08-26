@@ -32,12 +32,15 @@ from .host_port import (
     bind_plane_host,
     install_plane_tools,
     PLANE_AGENT_TOOLSET,
+    PLANE_CODE_MODE_TOOLSET,
+    PLANE_RUNTIME_TOOLSET,
 )
 from .presentation import (
     PresentationBoundsError,
     build_model_guidance,
     build_plane_code_mode_guidance,
     build_plane_task_kit,
+    build_initial_declarations,
 )
 
 
@@ -954,8 +957,10 @@ class HermesKernelAdapter:
             )
 
         event_limit = int(snapshot.raw["runtimePolicy"]["maxEventPayloadBytes"])
+        plane_route = self._host_port is not None
+        plane_code_mode_route = plane_route and snapshot.is_plane_code_mode
         try:
-            prompt = build_plane_code_mode_guidance(snapshot) if self._host_port is not None else build_model_guidance(snapshot)
+            prompt = build_plane_code_mode_guidance(snapshot) if plane_code_mode_route else build_model_guidance(snapshot)
         except PresentationBoundsError:
             return HermesKernelResult(
                 kind="failed",
@@ -1016,9 +1021,8 @@ class HermesKernelAdapter:
                     }
                 )
 
-        if self._host_port is not None:
-            # Plane Code Mode has one deliberately closed model surface. The
-            # host still owns the generic gateway and the restricted child.
+        if plane_code_mode_route:
+            # ADR-0011 has one deliberately closed model surface.
             enabled_toolsets = [PLANE_AGENT_TOOLSET]
         else:
             enabled_toolsets = [
@@ -1026,8 +1030,12 @@ class HermesKernelAdapter:
                 for toolset in self._enabled_toolsets
                 if toolset != "code_execution"
             ]
-            if _code_mode_is_available(snapshot):
+            if self._host_port is None and _code_mode_is_available(snapshot):
                 enabled_toolsets.append("code_execution")
+            if plane_route:
+                enabled_toolsets.append(PLANE_RUNTIME_TOOLSET)
+                if _code_mode_is_available(snapshot):
+                    enabled_toolsets.append(PLANE_CODE_MODE_TOOLSET)
         # Preserve caller ordering while keeping adapter-added toolsets
         # idempotent when a compatibility caller already supplied one.
         enabled_toolsets = list(dict.fromkeys(enabled_toolsets))
@@ -1086,19 +1094,30 @@ class HermesKernelAdapter:
                 cancellation=cancellation,
                 emit_body=emit_body,
                 task_kit=json.dumps(
-                    build_plane_task_kit(snapshot),
+                    build_plane_task_kit(snapshot)
+                    if plane_code_mode_route
+                    else {},
                     ensure_ascii=False,
                     sort_keys=True,
                     separators=(",", ":"),
                 ),
-                plane_agent_route=True,
-                eager_operation_refs=frozenset(
-                    str(operation["operationRef"])
-                    for operation in snapshot.eager_operations
+                declaration_slice=(
+                    build_initial_declarations(snapshot)
+                    if plane_code_mode_route
+                    else ""
+                ),
+                plane_agent_route=plane_code_mode_route,
+                eager_operation_refs=(
+                    frozenset(
+                        str(operation["operationRef"])
+                        for operation in snapshot.eager_operations
+                    )
+                    if not plane_code_mode_route
+                    else frozenset()
                 ),
                 code_mode_phase=str(snapshot.raw.get("runtimePolicy", {}).get("codeModePhase", "none")),
             )
-            if self._host_port is not None
+            if plane_route
             else None
         )
         try:
