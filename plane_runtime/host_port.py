@@ -33,10 +33,13 @@ from .g1_contract import G1ContractError, validate_eager_input_schema
 
 HOST_PROTOCOL = "plane.agent-runtime/v1"
 PLANE_RUNTIME_TOOLSET = "plane_runtime"
+PLANE_AGENT_TOOLSET = "plane_agent"
 PLANE_CODE_MODE_TOOLSET = "plane_runtime_code_mode"
 PLANE_OPERATION_TOOL = "plane_operation"
 PLANE_PUBLISH_TOOL = "plane_publish"
 PLANE_CODE_MODE_TOOL = "plane_execute_typescript"
+PLANE_DISCOVER_TOOL = "Plane:discover"
+PLANE_EXECUTE_TOOL = "Plane:execute"
 PLANE_CODE_MODE_SCHEMA_VERSION = "plane.code-mode/v1"
 PLANE_CODE_MODE_EXECUTE_OPERATION = "plane.code-mode.execute@1"
 CODE_MODE_PHASES = frozenset({"none", "post_search"})
@@ -49,7 +52,12 @@ MAX_HOST_REQUEST_BYTES = 16 * 1024
 MAX_HOST_RESULT_BYTES = 16 * 1024
 MAX_HOST_INPUT_BYTES = 8 * 1024
 MAX_HOST_RESULT_TEXT_BYTES = 12 * 1024
-MAX_CODE_MODE_SOURCE_BYTES = 4 * 1024
+MAX_LEGACY_CODE_MODE_SOURCE_BYTES = 4 * 1024
+MAX_CODE_MODE_SOURCE_BYTES = 8 * 1024
+MAX_DISCOVER_QUERY_BYTES = 500
+MAX_DECLARATION_SLICE_BYTES = 16 * 1024
+MAX_EXECUTE_RESULT_BYTES = 8 * 1024
+MAX_PLANE_EXECUTE_INPUT_BYTES = 16 * 1024
 MAX_HOST_CALLS = 32
 MAX_HOST_OPERATION_REF_BYTES = 256
 MAX_HOST_CONTENT_BYTES = 4 * 1024
@@ -704,6 +712,9 @@ class PlaneHostBinding:
     correlation_id: str
     cancellation: Callable[[], bool]
     emit_body: Callable[[Mapping[str, Any]], None] | None = None
+    task_kit: str = ""
+    declaration_slice: str = ""
+    plane_agent_route: bool = False
     eager_operation_refs: frozenset[str] = field(default_factory=frozenset)
     max_calls: int = MAX_HOST_CALLS
     records: list[HostCallRecord] = field(default_factory=list)
@@ -716,6 +727,7 @@ class PlaneHostBinding:
     _terminal_action_reason: str | None = field(default=None, init=False, repr=False)
     _terminal_action_result: HostCallResult | None = field(default=None, init=False, repr=False)
     _terminal_action_request: HostCallRequest | None = field(default=None, init=False, repr=False)
+    _plane_terminal_payload: Any = field(default=None, init=False, repr=False)
     _prepared_read_handoff_pending: bool = field(default=False, init=False, repr=False)
     code_mode_phase: str = "none"
     _code_mode_phase_hint: str | None = field(default=None, init=False, repr=False)
@@ -724,6 +736,11 @@ class PlaneHostBinding:
         default=None, init=False, repr=False
     )
     _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name == "task_kit" and "task_kit" in self.__dict__:
+            raise AttributeError("Plane task kit is immutable")
+        object.__setattr__(self, name, value)
 
     def __post_init__(self) -> None:
         if not callable(getattr(self.port, "invoke", None)):
@@ -744,6 +761,10 @@ class PlaneHostBinding:
             raise ValueError("Plane host eager operation refs must be operation references")
         if self.code_mode_phase not in CODE_MODE_PHASES:
             raise ValueError("Plane host Code Mode phase is unsupported")
+        if not isinstance(self.task_kit, str) or len(self.task_kit.encode("utf-8")) > MAX_HOST_INPUT_BYTES:
+            raise ValueError("Plane task kit is outside its bound")
+        if not isinstance(self.declaration_slice, str) or len(self.declaration_slice.encode("utf-8")) > MAX_DECLARATION_SLICE_BYTES:
+            raise ValueError("Plane declaration slice is outside its bound")
 
     @property
     def fatal_error(self) -> str | None:
@@ -813,6 +834,34 @@ class PlaneHostBinding:
             if self._outcome_publication_metadata is None:
                 return None
             return dict(self._outcome_publication_metadata)
+
+    def plane_terminal_payload(self) -> Any:
+        with self._lock:
+            return self._plane_terminal_payload
+
+    def task_kit_digest(self) -> str:
+        return hashlib.sha256(self.task_kit.encode("utf-8")).hexdigest()
+
+    def declaration_slice_digest(self) -> str:
+        with self._lock:
+            return hashlib.sha256(self.declaration_slice.encode("utf-8")).hexdigest()
+
+    def mark_terminal(self, kind: str, payload: Any = None) -> None:
+        if kind not in {"completed", "waiting_for_input", "blocked"}:
+            raise PlaneHostError("Plane terminal kind is unsupported")
+        with self._lock:
+            self._terminal_action_reason = kind
+            self._plane_terminal_payload = payload
+
+    def set_declaration_slice(self, declarations: str) -> None:
+        """Replace the one trusted discovery slot for the next execution."""
+
+        if not isinstance(declarations, str) or not declarations.strip():
+            raise PlaneHostError("Plane declaration slice must be non-empty text")
+        if len(declarations.encode("utf-8")) > MAX_DECLARATION_SLICE_BYTES:
+            raise PlaneHostBoundsError("Plane declaration slice exceeds its bound")
+        with self._lock:
+            self.declaration_slice = declarations
 
     def _fail(self, message: str) -> None:
         if self._fatal_error is None:
@@ -1006,7 +1055,13 @@ class PlaneHostBinding:
                     input=input,
                     source=source,
                 )
-                _bounded_json(request.input, "host.input", MAX_HOST_INPUT_BYTES)
+                _bounded_json(
+                    request.input,
+                    "host.input",
+                    MAX_PLANE_EXECUTE_INPUT_BYTES
+                    if action == "code" and operation_ref == PLANE_CODE_MODE_EXECUTE_OPERATION
+                    else MAX_HOST_INPUT_BYTES,
+                )
             except PlaneHostError as exc:
                 self._fail(str(exc) or "Plane host request was invalid")
                 raise
@@ -1433,7 +1488,7 @@ def _handle_plane_code_mode(args: Mapping[str, Any], **_: Any) -> str:
         source = _text(
             data.get("typescript_source"),
             f"{PLANE_CODE_MODE_TOOL}.typescript_source",
-            MAX_CODE_MODE_SOURCE_BYTES,
+            MAX_LEGACY_CODE_MODE_SOURCE_BYTES,
         )
         if not source.strip():
             raise PlaneHostError(
@@ -1445,7 +1500,7 @@ def _handle_plane_code_mode(args: Mapping[str, Any], **_: Any) -> str:
             "source": source,
             "input": {},
         }
-        _bounded_json(capsule, "codeMode.capsule", MAX_HOST_INPUT_BYTES)
+        _bounded_json(capsule, "codeMode.capsule", MAX_PLANE_EXECUTE_INPUT_BYTES)
         result = _binding_or_error().call(
             action="code",
             operation_ref=PLANE_CODE_MODE_EXECUTE_OPERATION,
@@ -1457,6 +1512,185 @@ def _handle_plane_code_mode(args: Mapping[str, Any], **_: Any) -> str:
         return _error_payload(str(exc), code="cancelled")
     except PlaneHostError as exc:
         return _error_payload(str(exc))
+
+
+def _tool_error(
+    code: str,
+    message: str,
+    *,
+    resolution: str,
+    retryable: bool = False,
+    recovery: str = "none",
+    field: str | None = None,
+) -> str:
+    error: dict[str, Any] = {
+        "code": code[:128],
+        "message": message[:2048],
+        "resolution": resolution[:2048],
+        "retryable": retryable,
+        "recovery": recovery,
+    }
+    if field is not None:
+        error["field"] = field[:128]
+    return json.dumps(
+        {"status": "error", "error": error},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _host_tool_error(result: HostCallResult, *, field: str) -> str:
+    code = result.error_code or "PLANE_HOST_ERROR"
+    recovery = "reconcile" if code == "OUTCOME_UNKNOWN" else "fix_code"
+    retryable = result.status in {"invalid", "unavailable"} and recovery != "reconcile"
+    return _tool_error(
+        code,
+        result.error_message or "Plane host rejected the request.",
+        resolution="Correct the request according to the error, then retry only when it is safe.",
+        retryable=retryable,
+        recovery=recovery,
+        field=field,
+    )
+
+
+def _declarations_from_result(result: HostCallResult) -> str | None:
+    output = result.output
+    if isinstance(output, Mapping):
+        declarations = output.get("declarations")
+        if declarations is None and isinstance(output.get("result"), Mapping):
+            declarations = output["result"].get("declarations")
+        if isinstance(declarations, str):
+            return declarations
+    return None
+
+
+def _handle_plane_discover(args: Mapping[str, Any], **_: Any) -> str:
+    try:
+        data = _object(args, PLANE_DISCOVER_TOOL)
+        _reject_unknown(data, {"query"}, PLANE_DISCOVER_TOOL)
+        query = _text(data.get("query"), f"{PLANE_DISCOVER_TOOL}.query", MAX_DISCOVER_QUERY_BYTES)
+        result = _binding_or_error().call(
+            action="discover",
+            operation_ref=PLANE_DISCOVERY_OPERATION,
+            input={"query": query},
+            source="model",
+        )
+        if result.status not in {"ok", "replayed"}:
+            return _host_tool_error(result, field="query")
+        declarations = _declarations_from_result(result)
+        if declarations is None:
+            return _tool_error(
+                "DISCOVERY_INVALID",
+                "Plane discovery did not return declarations.",
+                resolution="Narrow the workflow query and try discovery again.",
+                recovery="narrow_query",
+                field="query",
+            )
+        if not declarations.strip():
+            return _tool_error(
+                "NARROW_QUERY",
+                "Plane discovery matched no bounded declaration slice.",
+                resolution="Describe one complete intended workflow more narrowly.",
+                recovery="narrow_query",
+                field="query",
+            )
+        if len(declarations.encode("utf-8")) > MAX_DECLARATION_SLICE_BYTES:
+            return _tool_error(
+                "NARROW_QUERY",
+                "The declaration slice exceeds its bound.",
+                resolution="Describe one complete intended workflow more narrowly.",
+                recovery="narrow_query",
+                field="query",
+            )
+        binding = _binding_or_error()
+        binding.set_declaration_slice(declarations)
+        return json.dumps(
+            {"status": "ok", "declarations": declarations},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    except PlaneHostCancelled as exc:
+        return _tool_error("CANCELLED", str(exc), resolution="Wait for the invocation to be resumed.", recovery="wait")
+    except PlaneHostError as exc:
+        return _tool_error("DISCOVER_FAILED", str(exc), resolution="Narrow the workflow query and retry discovery.", recovery="narrow_query")
+
+
+def _execute_status(output: Any) -> tuple[str, Any] | None:
+    if not isinstance(output, Mapping):
+        return None
+    status = output.get("status")
+    if status in {"completed", "waiting_for_input", "blocked"}:
+        return str(status), None
+    if status == "returned":
+        return "returned", output.get("value")
+    return None
+
+
+def _handle_plane_execute(args: Mapping[str, Any], **_: Any) -> str:
+    try:
+        data = _object(args, PLANE_EXECUTE_TOOL)
+        _reject_unknown(data, {"code"}, PLANE_EXECUTE_TOOL)
+        code = _text(data.get("code"), f"{PLANE_EXECUTE_TOOL}.code", MAX_CODE_MODE_SOURCE_BYTES)
+        if not code.strip():
+            return _tool_error(
+                "VALIDATION_ERROR",
+                "Plane:execute code must be non-empty TypeScript statements.",
+                resolution="Provide a bounded function body without imports or exports.",
+                recovery="fix_code",
+                field="code",
+            )
+        binding = _binding_or_error()
+        # The existing Plane capsule is the trusted host boundary. The model
+        # supplies only a body; the adapter supplies the module wrapper.
+        source = "export default async ({ host, input }) => {\n" + code + "\n};"
+        capsule = {
+            "schemaVersion": PLANE_CODE_MODE_SCHEMA_VERSION,
+            "entrypoint": "default",
+            "source": source,
+            "input": {
+                "taskKitDigest": binding.task_kit_digest(),
+                "declarationSliceDigest": binding.declaration_slice_digest(),
+            },
+        }
+        _bounded_json(capsule, "codeMode.capsule", MAX_PLANE_EXECUTE_INPUT_BYTES)
+        result = binding.call(
+            action="code",
+            operation_ref=PLANE_CODE_MODE_EXECUTE_OPERATION,
+            input=capsule,
+            source="code",
+        )
+        if result.status not in {"ok", "replayed"}:
+            return _host_tool_error(result, field="code")
+        terminal = _execute_status(result.output)
+        if terminal is not None:
+            status, value = terminal
+            if status == "returned":
+                encoded = _bounded_json(value, "Plane:execute.value", MAX_EXECUTE_RESULT_BYTES)
+                return json.dumps(
+                    {"status": "returned", "value": json.loads(encoded)},
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+            binding.mark_terminal(status, result.output)
+            return json.dumps({"status": status}, separators=(",", ":"))
+        if result.output is not None:
+            value = result.output.get("value") if isinstance(result.output, Mapping) and "value" in result.output else result.output
+            encoded = _bounded_json(value, "Plane:execute.value", MAX_EXECUTE_RESULT_BYTES)
+            return json.dumps({"status": "returned", "value": json.loads(encoded)}, separators=(",", ":"))
+        return _tool_error(
+            "MISSING_TERMINAL_PUBLICATION",
+            "Plane execution ended without a JSON return or plane.finish(...).",
+            resolution="Return compact JSON for more reasoning or call plane.finish(...) exactly once.",
+            recovery="fix_code",
+        )
+    except PlaneHostCancelled as exc:
+        return _tool_error("CANCELLED", str(exc), resolution="Wait for the invocation to be resumed.", recovery="wait")
+    except PlaneHostBoundsError as exc:
+        return _tool_error("SOURCE_TOO_LARGE", str(exc), resolution="Shorten the function body or return less data.", recovery="fix_code", field="code")
+    except PlaneHostError as exc:
+        return _tool_error("EXECUTE_FAILED", str(exc), resolution="Correct the code and retry only when safe.", recovery="fix_code", field="code")
 
 
 def _handle_plane_operation(args: Mapping[str, Any], **_: Any) -> str:
@@ -1540,6 +1774,70 @@ def install_plane_tools() -> None:
         from tools.registry import registry
 
         registry.register(
+            PLANE_DISCOVER_TOOL,
+            PLANE_AGENT_TOOLSET,
+            {
+                "name": PLANE_DISCOVER_TOOL,
+                "description": (
+                    "Find Plane Agent SDK methods and TypeScript types for one intended workflow. "
+                    "Use when the current task declarations do not contain a method needed to "
+                    "complete the assignment. Describe the whole workflow, not an API name. "
+                    "Returns one bounded replacement declaration slice. Discovery does not authorize execution."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["query"],
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": MAX_DISCOVER_QUERY_BYTES,
+                            "description": (
+                                "The complete intended workflow, for example: list urgent unassigned "
+                                "work items, assign one member, then finish."
+                            ),
+                        }
+                    },
+                },
+            },
+            _handle_plane_discover,
+            description="Bounded Plane capability discovery",
+            max_result_size_chars=MAX_DECLARATION_SLICE_BYTES,
+        )
+        registry.register(
+            PLANE_EXECUTE_TOOL,
+            PLANE_AGENT_TOOLSET,
+            {
+                "name": PLANE_EXECUTE_TOOL,
+                "description": (
+                    "Run one bounded TypeScript function body against the current Plane assignment. "
+                    "plane and task are injected and frozen. Imports and exports are forbidden. "
+                    "Return compact JSON for further reasoning, or call await plane.finish(...) exactly once. "
+                    "Plane owns identity, authorization, pagination, idempotency, receipts, and recovery."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["code"],
+                    "properties": {
+                        "code": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": MAX_CODE_MODE_SOURCE_BYTES,
+                            "description": (
+                                "TypeScript statements executed as an async function body with ambient "
+                                "plane and task objects. Imports and exports are forbidden."
+                            ),
+                        }
+                    },
+                },
+            },
+            _handle_plane_execute,
+            description="Bounded Plane TypeScript execution",
+            max_result_size_chars=MAX_HOST_RESULT_TEXT_BYTES,
+        )
+        registry.register(
             PLANE_CODE_MODE_TOOL,
             PLANE_CODE_MODE_TOOLSET,
             {
@@ -1565,7 +1863,7 @@ def install_plane_tools() -> None:
                     "properties": {
                         "typescript_source": {
                             "type": "string",
-                            "maxLength": 4096,
+                        "maxLength": MAX_LEGACY_CODE_MODE_SOURCE_BYTES,
                             "description": (
                                 "Complete bounded TypeScript module exporting default "
                                 "async function ({host,input})."
@@ -1647,6 +1945,13 @@ __all__ = [
     "PlaneHostPort",
     "PlaneHostUnavailable",
     "MAX_CODE_MODE_SOURCE_BYTES",
+    "MAX_DECLARATION_SLICE_BYTES",
+    "MAX_DISCOVER_QUERY_BYTES",
+    "MAX_EXECUTE_RESULT_BYTES",
+    "MAX_LEGACY_CODE_MODE_SOURCE_BYTES",
+    "PLANE_AGENT_TOOLSET",
+    "PLANE_DISCOVER_TOOL",
+    "PLANE_EXECUTE_TOOL",
     "PLANE_CODE_MODE_EXECUTE_OPERATION",
     "PLANE_CODE_MODE_SCHEMA_VERSION",
     "PLANE_CODE_MODE_TOOLSET",

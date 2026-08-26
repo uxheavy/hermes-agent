@@ -31,9 +31,14 @@ from .host_port import (
     PlaneHostPort,
     bind_plane_host,
     install_plane_tools,
-    PLANE_CODE_MODE_TOOLSET,
+    PLANE_AGENT_TOOLSET,
 )
-from .presentation import PresentationBoundsError, build_model_guidance
+from .presentation import (
+    PresentationBoundsError,
+    build_model_guidance,
+    build_plane_code_mode_guidance,
+    build_plane_task_kit,
+)
 
 
 _CREDENTIAL_PROTOCOL = "plane.agent-runtime/credentials/v1"
@@ -950,7 +955,7 @@ class HermesKernelAdapter:
 
         event_limit = int(snapshot.raw["runtimePolicy"]["maxEventPayloadBytes"])
         try:
-            prompt = build_model_guidance(snapshot)
+            prompt = build_plane_code_mode_guidance(snapshot) if self._host_port is not None else build_model_guidance(snapshot)
         except PresentationBoundsError:
             return HermesKernelResult(
                 kind="failed",
@@ -1011,17 +1016,18 @@ class HermesKernelAdapter:
                     }
                 )
 
-        enabled_toolsets = [
-            toolset
-            for toolset in self._enabled_toolsets
-            if toolset != "code_execution"
-        ]
-        if self._host_port is None and _code_mode_is_available(snapshot):
-            enabled_toolsets.append("code_execution")
         if self._host_port is not None:
-            enabled_toolsets.append("plane_runtime")
+            # Plane Code Mode has one deliberately closed model surface. The
+            # host still owns the generic gateway and the restricted child.
+            enabled_toolsets = [PLANE_AGENT_TOOLSET]
+        else:
+            enabled_toolsets = [
+                toolset
+                for toolset in self._enabled_toolsets
+                if toolset != "code_execution"
+            ]
             if _code_mode_is_available(snapshot):
-                enabled_toolsets.append(PLANE_CODE_MODE_TOOLSET)
+                enabled_toolsets.append("code_execution")
         # Preserve caller ordering while keeping adapter-added toolsets
         # idempotent when a compatibility caller already supplied one.
         enabled_toolsets = list(dict.fromkeys(enabled_toolsets))
@@ -1079,6 +1085,13 @@ class HermesKernelAdapter:
                 correlation_id=invocation.correlation_id,
                 cancellation=cancellation,
                 emit_body=emit_body,
+                task_kit=json.dumps(
+                    build_plane_task_kit(snapshot),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                plane_agent_route=True,
                 eager_operation_refs=frozenset(
                     str(operation["operationRef"])
                     for operation in snapshot.eager_operations
@@ -1355,6 +1368,60 @@ class HermesKernelAdapter:
                 usage=usage,
                 model_calls=model_calls,
                 failure_cause=provider_failure_cause,
+            )
+        plane_terminal_kind = (
+            host_binding.terminal_action_reason()
+            if host_binding is not None and host_binding.plane_agent_route
+            else None
+        )
+        if plane_terminal_kind == "waiting_for_input":
+            payload = host_binding.plane_terminal_payload()
+            question = payload.get("question") if isinstance(payload, Mapping) else None
+            return HermesKernelResult(
+                kind="waiting_for_input",
+                question=bound_runtime_text(
+                    redact_runtime_text(
+                        question if isinstance(question, str) and question else "Plane is waiting for input.",
+                        credential_values,
+                    ),
+                    event_limit,
+                ),
+                usage=usage,
+                model_calls=model_calls,
+            )
+        if plane_terminal_kind == "blocked":
+            payload = host_binding.plane_terminal_payload()
+            reason = payload.get("reason") if isinstance(payload, Mapping) else None
+            return HermesKernelResult(
+                kind="blocked",
+                failure_code="runtime_error",
+                failure_message=bound_runtime_text(
+                    redact_runtime_text(
+                        reason if isinstance(reason, str) and reason else "Plane execution was blocked.",
+                        credential_values,
+                    ),
+                    event_limit,
+                ),
+                retryable=False,
+                usage=usage,
+                model_calls=model_calls,
+            )
+        if (
+            host_binding is not None
+            and host_binding.plane_agent_route
+            and plane_terminal_kind is None
+        ):
+            return HermesKernelResult(
+                kind="failed",
+                failure_code="runtime_error",
+                failure_message=(
+                    "MISSING_TERMINAL_PUBLICATION: Plane Code Mode ended without "
+                    "an applied plane.finish(...)"
+                ),
+                retryable=False,
+                failure_cause="runtime_unknown_failure",
+                usage=usage,
+                model_calls=model_calls,
             )
         question = result.get("input_request") or result.get("waiting_for_input")
         if isinstance(question, str) and question:

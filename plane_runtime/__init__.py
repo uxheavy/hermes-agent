@@ -119,6 +119,9 @@ from .host_port import (
     bind_plane_host,
     current_plane_host,
     install_plane_tools,
+    PLANE_AGENT_TOOLSET,
+    PLANE_DISCOVER_TOOL,
+    PLANE_EXECUTE_TOOL,
     plane_code_mode,
 )
 
@@ -237,5 +240,8 @@ __all__ = [
     "bind_plane_host",
     "current_plane_host",
     "install_plane_tools",
+    "PLANE_AGENT_TOOLSET",
+    "PLANE_DISCOVER_TOOL",
+    "PLANE_EXECUTE_TOOL",
     "plane_code_mode",
 ]
