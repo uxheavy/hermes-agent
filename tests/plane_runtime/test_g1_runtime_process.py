@@ -78,6 +78,7 @@ def make_snapshot() -> dict[str, object]:
         "context": [],
         "toolCatalog": {
             "catalogDigest": "content:" + "c" * 64,
+            "modelToolset": "standard",
             "eagerOperations": [
                 {
                     "operationRef": "operation:work_item.read",
@@ -177,6 +178,7 @@ def make_plane_accepted_snapshot() -> dict[str, object]:
     ]
     snapshot["toolCatalog"] = {
         "catalogDigest": "content:" + "c" * 64,
+        "modelToolset": "standard",
         "eagerOperations": [
             {
                 "operationRef": "operation:search_workspace",

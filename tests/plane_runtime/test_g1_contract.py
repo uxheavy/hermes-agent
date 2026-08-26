@@ -68,6 +68,22 @@ class G1ContractTests(unittest.TestCase):
 
         self.assertIsNotNone(operation)
 
+    def test_standard_route_presentation_is_accepted(self) -> None:
+        raw = make_snapshot()
+        raw["toolCatalog"]["modelToolset"] = "standard"  # type: ignore[index]
+        raw["toolCatalog"]["standardRoute"] = {  # type: ignore[index]
+            "schemaVersion": "plane.standard-route/v1",
+            "steps": [{"operationRef": "operation:work_item.read"}],
+        }
+        raw["contentDigest"] = _digest(
+            "snapshot",
+            {key: value for key, value in raw.items() if key != "contentDigest"},
+        )
+
+        snapshot = G1RunSnapshot.from_dict(raw)
+
+        self.assertEqual(snapshot.raw["toolCatalog"]["modelToolset"], "standard")  # type: ignore[index]
+
     def test_snapshot_content_digest_authenticates_input_schema(self) -> None:
         raw = make_snapshot()
         raw["toolCatalog"]["eagerOperations"][0]["inputSchema"]["required"] = ["other"]  # type: ignore[index]
@@ -89,6 +105,7 @@ class G1ContractTests(unittest.TestCase):
         over_count = make_snapshot()
         over_count["toolCatalog"] = {
             "catalogDigest": "content:" + "c" * 64,
+            "modelToolset": "standard",
             "eagerOperations": [
                 {
                     "operationRef": f"operation:operation-{index}",
@@ -109,6 +126,7 @@ class G1ContractTests(unittest.TestCase):
         aggregate = make_snapshot()
         aggregate["toolCatalog"] = {
             "catalogDigest": "content:" + "c" * 64,
+            "modelToolset": "standard",
             "eagerOperations": [
                 {
                     "operationRef": f"operation:operation-{index}",

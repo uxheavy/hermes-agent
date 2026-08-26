@@ -293,10 +293,40 @@ def _snapshot_ref(value: Any, name: str) -> str:
     return value
 
 
+def _validate_standard_route(value: Any) -> dict[str, Any]:
+    route = _object(value, "toolCatalog.standardRoute")
+    _reject_unknown(route, {"schemaVersion", "steps"}, "toolCatalog.standardRoute")
+    _required(route, {"schemaVersion", "steps"}, "toolCatalog.standardRoute")
+    if route["schemaVersion"] != "plane.standard-route/v1":
+        raise G1ContractError("toolCatalog.standardRoute schemaVersion is unsupported")
+    steps = route["steps"]
+    if not isinstance(steps, list) or not 1 <= len(steps) <= 7:
+        raise G1ContractError("toolCatalog.standardRoute steps must contain 1..7 items")
+    normalized = []
+    for index, item in enumerate(steps):
+        name = f"toolCatalog.standardRoute.steps[{index}]"
+        step = _object(item, name)
+        _reject_unknown(step, {"operationRef", "optional", "expectedStatus", "expectedErrorCode"}, name)
+        _required(step, {"operationRef"}, name)
+        operation_ref = _ref(step["operationRef"], f"{name}.operationRef", "operation")
+        if step.get("optional") is not None and step["optional"] is not True:
+            raise G1ContractError(f"{name}.optional must be true")
+        if step.get("optional") is True and operation_ref != "operation:work_item.read":
+            raise G1ContractError(f"{name}.optional is reserved for prepared work_item.read")
+        if step.get("expectedStatus") is not None and step["expectedStatus"] != "denied":
+            raise G1ContractError(f"{name}.expectedStatus is unsupported")
+        if step.get("expectedErrorCode") is not None and step["expectedErrorCode"] != "NOT_AUTHORIZED":
+            raise G1ContractError(f"{name}.expectedErrorCode is unsupported")
+        normalized.append(operation_ref)
+    return {"steps": normalized}
+
+
 def _validate_eager_tool_catalog(catalog: Mapping[str, Any]) -> None:
-    _reject_unknown(catalog, {"catalogDigest", "eagerOperations"}, "toolCatalog")
-    _required(catalog, {"catalogDigest", "eagerOperations"}, "toolCatalog")
+    _reject_unknown(catalog, {"catalogDigest", "modelToolset", "eagerOperations", "standardRoute"}, "toolCatalog")
+    _required(catalog, {"catalogDigest", "modelToolset", "eagerOperations"}, "toolCatalog")
     _content_ref(catalog["catalogDigest"], "toolCatalog.catalogDigest")
+    if catalog["modelToolset"] not in {"standard", "code_mode_only"}:
+        raise G1ContractError("toolCatalog.modelToolset is unsupported")
     operations = catalog["eagerOperations"]
     if not isinstance(operations, list) or len(operations) > MAX_EAGER_OPERATIONS:
         raise G1ContractError(
@@ -312,6 +342,11 @@ def _validate_eager_tool_catalog(catalog: Mapping[str, Any]) -> None:
         validate_eager_input_schema(operation["inputSchema"], f"{operation_name}.inputSchema")
         if operation["disclosure"] != "eager":
             raise G1ContractError(f"{operation_name}.disclosure must be eager")
+    if "standardRoute" in catalog:
+        route_operations = _validate_standard_route(catalog["standardRoute"])["steps"]
+        disclosed = {operation["operationRef"] for operation in operations}
+        if any(operation_ref not in disclosed for operation_ref in route_operations):
+            raise G1ContractError("toolCatalog.standardRoute step is not disclosed in eagerOperations")
     if len(_canonical(catalog)) > MAX_EAGER_PRESENTATION_BYTES:
         raise G1ContractError(f"toolCatalog exceeds {MAX_EAGER_PRESENTATION_BYTES} canonical JSON bytes")
 
