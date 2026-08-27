@@ -1497,6 +1497,19 @@ def _build_child_agent(
     child_optional_kwargs: Dict[str, Any] = {}
     if isinstance(child_max_tokens, int):
         child_optional_kwargs["max_tokens"] = child_max_tokens
+    # In-process delegated agents share the invocation's provider-egress
+    # authority.  Keep the construction hook private and pass the same
+    # callable only when the parent actually owns one; it is never part of
+    # the child prompt, runtime snapshot, or model-facing kwargs.
+    child_http_client_factory = getattr(parent_agent, "__dict__", {}).get(
+        "_http_client_factory"
+    )
+    if child_http_client_factory is None:
+        from agent.auxiliary_client import _runtime_main_value
+
+        child_http_client_factory = _runtime_main_value("http_client_factory")
+    if callable(child_http_client_factory):
+        child_optional_kwargs["http_client_factory"] = child_http_client_factory
 
     from agent.delegation_context import delegated_child_context
 

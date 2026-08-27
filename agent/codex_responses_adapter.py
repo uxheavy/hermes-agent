@@ -264,6 +264,23 @@ def _derive_responses_function_call_id(
 # Schema conversion
 # ---------------------------------------------------------------------------
 
+_PLANE_RESPONSES_WIRE_NAMES = {
+    "Plane:discover": "Plane_discover",
+    "Plane:execute": "Plane_execute",
+}
+_PLANE_RESPONSES_MODEL_NAMES = {
+    wire_name: model_name
+    for model_name, wire_name in _PLANE_RESPONSES_WIRE_NAMES.items()
+}
+
+
+def _responses_wire_name(name: str) -> str:
+    return _PLANE_RESPONSES_WIRE_NAMES.get(name, name)
+
+
+def _responses_model_name(name: str) -> str:
+    return _PLANE_RESPONSES_MODEL_NAMES.get(name, name)
+
 def _responses_tools(tools: Optional[List[Dict[str, Any]]] = None) -> Optional[List[Dict[str, Any]]]:
     """Convert chat-completions tool schemas to Responses function-tool schemas."""
     if not tools:
@@ -277,7 +294,7 @@ def _responses_tools(tools: Optional[List[Dict[str, Any]]] = None) -> Optional[L
             continue
         converted.append({
             "type": "function",
-            "name": name,
+            "name": _responses_wire_name(name),
             "description": fn.get("description", ""),
             "strict": False,
             "parameters": fn.get("parameters", {"type": "object", "properties": {}}),
@@ -570,7 +587,7 @@ def _chat_messages_to_responses_input(
                         items.append({
                             "type": "function_call",
                             "call_id": _clamp_responses_call_id(call_id),
-                            "name": fn_name,
+                            "name": _responses_wire_name(fn_name),
                             "arguments": arguments,
                         })
                 continue
@@ -657,7 +674,7 @@ def _preflight_codex_input_items(
                 {
                     "type": "function_call",
                     "call_id": call_id.strip(),
-                    "name": name.strip(),
+                    "name": _responses_wire_name(name.strip()),
                     "arguments": arguments,
                 }
             )
@@ -921,7 +938,7 @@ def _preflight_codex_api_kwargs(
             normalized_tools.append(
                 {
                     "type": "function",
-                    "name": name.strip(),
+                    "name": _responses_wire_name(name.strip()),
                     "description": description,
                     "strict": strict,
                     "parameters": parameters,
@@ -983,6 +1000,11 @@ def _preflight_codex_api_kwargs(
     ):
         val = api_kwargs.get(passthrough_key)
         if val is not None:
+            if passthrough_key == "tool_choice" and isinstance(val, dict):
+                val = dict(val)
+                name = val.get("name")
+                if isinstance(name, str):
+                    val["name"] = _responses_wire_name(name)
             normalized[passthrough_key] = val
 
     extra_headers = api_kwargs.get("extra_headers")
@@ -1325,7 +1347,7 @@ def _normalize_codex_response(
         elif item_type == "function_call":
             if item_status in {"queued", "in_progress", "incomplete"}:
                 continue
-            fn_name = getattr(item, "name", "") or ""
+            fn_name = _responses_model_name(getattr(item, "name", "") or "")
             arguments = getattr(item, "arguments", "{}")
             if not isinstance(arguments, str):
                 arguments = json.dumps(arguments, ensure_ascii=False)
@@ -1346,7 +1368,7 @@ def _normalize_codex_response(
                 function=SimpleNamespace(name=fn_name, arguments=arguments),
             ))
         elif item_type == "custom_tool_call":
-            fn_name = getattr(item, "name", "") or ""
+            fn_name = _responses_model_name(getattr(item, "name", "") or "")
             arguments = getattr(item, "input", "{}")
             if not isinstance(arguments, str):
                 arguments = json.dumps(arguments, ensure_ascii=False)

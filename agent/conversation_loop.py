@@ -112,6 +112,102 @@ _API_CALL_MODULES = frozenset({
     "chat_completion_helpers",
 })
 
+_PLANE_RUNTIME_DIAGNOSTIC_TOOL_NAMES = frozenset(
+    {"plane_execute_typescript", "plane_publish"}
+)
+
+
+def _plane_runtime_toolset_class(tools: Any) -> str:
+    """Return a finite, non-sensitive projection of provider-visible tools."""
+
+    names = set()
+    if isinstance(tools, list):
+        for tool in tools:
+            if not isinstance(tool, dict):
+                continue
+            function = tool.get("function")
+            name = tool.get("name")
+            if not isinstance(name, str) and isinstance(function, dict):
+                name = function.get("name")
+            if name in _PLANE_RUNTIME_DIAGNOSTIC_TOOL_NAMES:
+                names.add(name)
+            elif isinstance(name, str):
+                names.add("other")
+    if names == {"plane_execute_typescript"}:
+        return "execute_only"
+    if names == _PLANE_RUNTIME_DIAGNOSTIC_TOOL_NAMES:
+        return "execute_and_publish"
+    if not names:
+        return "empty"
+    return "other"
+
+
+def _plane_runtime_tool_call_class(tool_calls: Any) -> str:
+    """Return a finite, non-sensitive projection of model tool selection."""
+
+    names = set()
+    for call in tool_calls or []:
+        function = getattr(call, "function", None)
+        name = getattr(function, "name", None)
+        if name == "plane_execute_typescript":
+            names.add("execute")
+        elif name == "plane_publish":
+            names.add("publish")
+        elif isinstance(name, str):
+            names.add("other")
+    if not names:
+        return "none"
+    if names == {"execute"}:
+        return "execute"
+    if names == {"publish"}:
+        return "publish"
+    if names == {"other"}:
+        return "other"
+    return "multiple"
+
+
+def _record_plane_runtime_request(agent: Any, api_kwargs: Any) -> None:
+    """Retain only bounded request-choice metadata for runtime diagnosis."""
+
+    diagnostics = getattr(agent, "_plane_runtime_diagnostics", None)
+    if not isinstance(diagnostics, dict):
+        return
+    requests = diagnostics.setdefault("requests", [])
+    if len(requests) >= 32 or not isinstance(api_kwargs, dict):
+        return
+    choice = api_kwargs.get("tool_choice")
+    if choice not in {"required", "auto"}:
+        choice = "absent"
+    tools = api_kwargs.get("tools")
+    requests.append(
+        {
+            "sequence": len(requests) + 1,
+            "toolChoice": choice,
+            "visibleToolset": _plane_runtime_toolset_class(tools),
+            "visibleToolCount": min(len(tools), 64) if isinstance(tools, list) else 0,
+            "serialized": True,
+        }
+    )
+
+
+def _record_plane_runtime_response(agent: Any, assistant_message: Any) -> None:
+    """Retain only bounded response-class metadata; never retain model text."""
+
+    diagnostics = getattr(agent, "_plane_runtime_diagnostics", None)
+    if not isinstance(diagnostics, dict):
+        return
+    responses = diagnostics.setdefault("responses", [])
+    if len(responses) >= 32:
+        return
+    tool_calls = getattr(assistant_message, "tool_calls", None) or []
+    responses.append(
+        {
+            "sequence": len(responses) + 1,
+            "responseClass": "tool_call" if tool_calls else "text_response",
+            "toolCall": _plane_runtime_tool_call_class(tool_calls),
+        }
+    )
+
 
 def _apply_active_turn_redirect(agent: Any, messages: List[Dict[str, Any]], text: str) -> None:
     """Append a provider-safe checkpoint and correction to the live turn.
@@ -1184,6 +1280,18 @@ def run_conversation(
     _plugin_user_context = _ctx.plugin_user_context
     _ext_prefetch_cache = _ctx.ext_prefetch_cache
 
+    # An adapter may install this hook before entering the loop. Keep a
+    # bounded, turn-local diagnostic so an external runtime can distinguish a
+    # missing hook from a hook that observed a terminal action but lost its
+    # exit reason during finalization. The fields contain no model or tool
+    # payloads and are consumed only by the turn finalizer.
+    agent._terminal_hook_installed = callable(
+        getattr(agent, "_terminal_action_check", None)
+    )
+    agent._terminal_action_observed = False
+    agent._terminal_action_snapshot = None
+    agent._turn_provider_responses = 0
+
     # Commentary deduplication spans all provider continuations and tool calls
     # within one user turn, but must not suppress the same phrase next turn.
     agent._delivered_interim_texts = set()
@@ -2001,6 +2109,13 @@ def run_conversation(
         api_kwargs = None  # Guard against UnboundLocalError in except handler
         api_request_id = f"{turn_id}:api:{api_call_count}"
         agent._current_api_request_id = api_request_id
+        _plane_provider_relay = bool(
+            getattr(
+                getattr(agent, "_http_client_factory", None),
+                "_plane_provider_relay",
+                False,
+            )
+        )
 
         while retry_count < max_retries:
             # ── Nous Portal rate limit guard ──────────────────────
@@ -2115,6 +2230,8 @@ def run_conversation(
                     _original_api_kwargs = dict(api_kwargs)
                     _llm_middleware_trace = []
 
+                _record_plane_runtime_request(agent, api_kwargs)
+
                 try:
                     from hermes_cli.lifecycle import (
                         has_hook,
@@ -2173,7 +2290,7 @@ def run_conversation(
                 except Exception:
                     pass
 
-                if env_var_enabled("HERMES_DUMP_REQUESTS"):
+                if env_var_enabled("HERMES_DUMP_REQUESTS") and not _plane_provider_relay:
                     agent._dump_api_request_debug(api_kwargs, reason="preflight")
 
                 # This object is private to the in-process MoA facade.  Add it
@@ -2599,6 +2716,7 @@ def run_conversation(
                     continue  # Retry the API call
 
                 agent._turn_received_provider_response = True
+                agent._turn_provider_responses += 1
 
                 # Check finish_reason before proceeding
                 if agent.api_mode == "codex_responses":
@@ -3675,10 +3793,15 @@ def run_conversation(
                     num_messages=len(api_messages) if api_messages else 0,
                 )
                 logger.debug(
-                    "Error classified: reason=%s status=%s retryable=%s compress=%s rotate=%s fallback=%s",
+                    "Error classified: reason=%s status=%s retryable=%s terminal=%s compress=%s rotate=%s fallback=%s",
                     classified.reason.value, classified.status_code,
-                    classified.retryable, classified.should_compress,
+                    classified.retryable, classified.terminal, classified.should_compress,
                     classified.should_rotate_credential, classified.should_fallback,
+                )
+                safe_error_message = (
+                    "provider outcome is unknown; reconcile before retrying"
+                    if classified.terminal
+                    else str(api_error)
                 )
                 agent._invoke_api_request_error_hook(
                     task_id=effective_task_id,
@@ -3686,9 +3809,9 @@ def run_conversation(
                     api_request_id=api_request_id,
                     api_call_count=api_call_count,
                     api_start_time=api_start_time,
-                    api_kwargs=api_kwargs,
+                    api_kwargs=None if classified.terminal else api_kwargs,
                     error_type=type(api_error).__name__,
-                    error_message=str(api_error),
+                    error_message=safe_error_message,
                     status_code=status_code,
                     retry_count=retry_count,
                     max_retries=max_retries,
@@ -3713,12 +3836,15 @@ def run_conversation(
                         )
                         continue
 
-                recovered_with_pool, _retry.has_retried_429 = agent._recover_with_credential_pool(
-                    status_code=status_code,
-                    has_retried_429=_retry.has_retried_429,
-                    classified_reason=classified.reason,
-                    error_context=error_context,
-                )
+                if classified.terminal:
+                    recovered_with_pool = False
+                else:
+                    recovered_with_pool, _retry.has_retried_429 = agent._recover_with_credential_pool(
+                        status_code=status_code,
+                        has_retried_429=_retry.has_retried_429,
+                        classified_reason=classified.reason,
+                        error_context=error_context,
+                    )
                 if recovered_with_pool:
                     continue
 
@@ -4863,6 +4989,8 @@ def run_conversation(
                         }
                     )
                 ) and not is_context_length_error
+                is_budget_exhausted = classified.reason == FailoverReason.budget_exhausted
+                is_terminal_failure = classified.terminal
 
                 if is_client_error:
                     # Try fallback before aborting — a different provider may
@@ -4871,21 +4999,33 @@ def run_conversation(
                     # exists; otherwise "trying fallback..." is a lie and the
                     # session looks like it's recovering when it's about to
                     # abort silently (#35314, #17446).
-                    if agent._has_pending_fallback():
+                    if (
+                        not is_terminal_failure
+                        and agent._has_pending_fallback()
+                        and not is_budget_exhausted
+                    ):
                         if classified.reason == FailoverReason.content_policy_blocked:
                             agent._buffer_status("⚠️ Provider safety filter blocked this request — trying fallback...")
                         elif classified.reason == FailoverReason.ssl_cert_verification:
                             agent._buffer_status("⚠️ TLS certificate verification failed — trying fallback...")
                         else:
                             agent._buffer_status(f"⚠️ Non-retryable error (HTTP {status_code}) — trying fallback...")
-                    if agent._try_activate_fallback():
+                    if (
+                        not is_terminal_failure
+                        and not is_budget_exhausted
+                        and agent._try_activate_fallback()
+                    ):
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt)
                         retry_count = 0
                         compression_attempts = 0
                         _retry.primary_recovery_attempted = False
                         continue
-                    if api_kwargs is not None:
+                    if (
+                        api_kwargs is not None
+                        and not is_terminal_failure
+                        and not _plane_provider_relay
+                    ):
                         agent._dump_api_request_debug(
                             api_kwargs, reason="non_retryable_client_error", error=api_error,
                         )
@@ -4898,8 +5038,16 @@ def run_conversation(
                     # returned ``error`` field and downstream consumers deliver
                     # it verbatim (e.g. a cron failure notification dumped a
                     # ~60KB Cloudflare challenge page as 31 Discord messages).
-                    _nonretryable_summary = agent._summarize_api_error(api_error)
-                    if classified.reason == FailoverReason.content_policy_blocked:
+                    _nonretryable_summary = (
+                        "Provider outcome is unknown; reconcile the invocation before retrying."
+                        if is_terminal_failure
+                        else agent._summarize_api_error(api_error)
+                    )
+                    if is_terminal_failure:
+                        agent._emit_status(
+                            "❌ Provider outcome is unknown; reconcile the invocation before retrying."
+                        )
+                    elif classified.reason == FailoverReason.content_policy_blocked:
                         agent._emit_status(
                             f"❌ Provider safety filter blocked this request: "
                             f"{_nonretryable_summary}"
@@ -4914,7 +5062,16 @@ def run_conversation(
                             f"❌ Non-retryable error (HTTP {status_code}): "
                             f"{_nonretryable_summary}"
                         )
-                    agent._vprint(f"{agent.log_prefix}❌ Non-retryable client error (HTTP {status_code}). Aborting.", force=True)
+                    if is_terminal_failure:
+                        agent._vprint(
+                            f"{agent.log_prefix}❌ Provider outcome is unknown. Aborting without retry or fallback.",
+                            force=True,
+                        )
+                    else:
+                        agent._vprint(
+                            f"{agent.log_prefix}❌ Non-retryable client error (HTTP {status_code}). Aborting.",
+                            force=True,
+                        )
                     agent._vprint(f"{agent.log_prefix}   🔌 Provider: {_provider}  Model: {_model}", force=True)
                     agent._vprint(f"{agent.log_prefix}   🌐 Endpoint: {_base}", force=True)
                     # Actionable guidance for common auth errors
@@ -5019,7 +5176,13 @@ def run_conversation(
                             f"{agent.log_prefix}        for localhost, or add the server's cert to your trust store.",
                             force=True,
                         )
-                    logger.error(f"{agent.log_prefix}Non-retryable client error: {api_error}")
+                    if is_terminal_failure:
+                        logger.error(
+                            "%sProvider outcome is unknown; invocation stopped before replay",
+                            agent.log_prefix,
+                        )
+                    else:
+                        logger.error(f"{agent.log_prefix}Non-retryable client error: {api_error}")
                     # Skip session persistence when the error is likely
                     # context-overflow related (status 400 + large session).
                     # Persisting the failed user message would make the
@@ -5071,7 +5234,7 @@ def run_conversation(
                             "failure_reason": classified.reason.value,
                             "billing_block": _ce_block,
                         }
-                    return {
+                    result = {
                         "final_response": _nonretryable_summary,
                         "messages": messages,
                         "api_calls": api_call_count,
@@ -5079,6 +5242,9 @@ def run_conversation(
                         "failed": True,
                         "error": _nonretryable_summary,
                     }
+                    if is_budget_exhausted or is_terminal_failure:
+                        result["failure_reason"] = classified.reason.value
+                    return result
 
                 if retry_count >= max_retries:
                     # Before falling back, try rebuilding the primary
@@ -5226,7 +5392,7 @@ def run_conversation(
                         agent.log_prefix, max_retries, _final_summary,
                         _provider, _model, len(api_messages), f"{approx_tokens:,}",
                     )
-                    if api_kwargs is not None:
+                    if api_kwargs is not None and not _plane_provider_relay:
                         agent._dump_api_request_debug(
                             api_kwargs, reason="max_retries_exhausted", error=api_error,
                         )
@@ -5453,6 +5619,7 @@ def run_conversation(
             normalized = _transport.normalize_response(response, **_normalize_kwargs)
             assistant_message = normalized
             finish_reason = normalized.finish_reason
+            _record_plane_runtime_response(agent, assistant_message)
             
             # Normalize content to string — some OpenAI-compatible servers
             # (llama-server, etc.) return content as a dict or list instead
@@ -6111,6 +6278,32 @@ def run_conversation(
                     final_response = ""
                     failed = True
                     break
+
+                terminal_action_check = getattr(agent, "_terminal_action_check", None)
+                if callable(terminal_action_check):
+                    terminal_action_reason = terminal_action_check()
+                    if terminal_action_reason is not None:
+                        if (
+                            not isinstance(terminal_action_reason, str)
+                            or not terminal_action_reason
+                        ):
+                            raise TypeError("terminal action reason must be a non-empty string")
+                        agent._terminal_action_observed = True
+                        _iteration_budget = getattr(agent, "iteration_budget", None)
+                        agent._terminal_action_snapshot = {
+                            "reason": terminal_action_reason,
+                            "observed_at": "post_tool_batch",
+                            "api_call_count": api_call_count,
+                            "provider_responses": agent._turn_provider_responses,
+                            "iteration_budget_used": getattr(
+                                _iteration_budget, "used", 0
+                            ),
+                            "iteration_budget_remaining": getattr(
+                                _iteration_budget, "remaining", 0
+                            ),
+                        }
+                        _turn_exit_reason = f"terminal_action({terminal_action_reason})"
+                        break
 
                 if agent._tool_guardrail_halt_decision is not None:
                     decision = agent._tool_guardrail_halt_decision
@@ -6854,6 +7047,47 @@ def run_conversation(
                     agent._session_messages = messages
                     logger.debug("pre_verify nudge issued (attempt %d)",
                                  agent._pre_verify_nudges)
+                    _pending_verification_response = final_response
+                    _pending_verification_response_previewed = (
+                        agent._interim_content_was_streamed(final_response or "")
+                    )
+                    final_response = None
+                    continue
+
+                # A Plane search may return more than one authorized opaque
+                # work-item read call. Do not let ordinary prose terminate the
+                # invocation while that canonical handoff is still pending;
+                # the model must consume one prepared read first. This guard is
+                # separate from the terminal publication check: it advances
+                # the route without granting publication success.
+                try:
+                    _prepared_read_pending_check = getattr(
+                        agent, "_plane_runtime_prepared_read_pending_check", None
+                    )
+                    _prepared_read_pending = (
+                        _prepared_read_pending_check()
+                        if callable(_prepared_read_pending_check)
+                        else False
+                    )
+                except Exception:
+                    logger.debug("prepared Plane read guard failed", exc_info=True)
+                    _prepared_read_pending = False
+                if _prepared_read_pending:
+                    final_msg["finish_reason"] = "prepared_read_required"
+                    final_msg["_prepared_read_synthetic"] = True
+                    messages.append(final_msg)
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "A prepared Plane work-item read is pending. "
+                                "Continue with exactly one returned workItemReadCall "
+                                "before providing final text."
+                            ),
+                            "_prepared_read_synthetic": True,
+                        }
+                    )
+                    agent._session_messages = messages
                     _pending_verification_response = final_response
                     _pending_verification_response_previewed = (
                         agent._interim_content_was_streamed(final_response or "")

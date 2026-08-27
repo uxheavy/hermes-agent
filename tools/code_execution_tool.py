@@ -29,6 +29,7 @@ Remote execution additionally requires Python 3 in the terminal backend.
 """
 
 import base64
+import contextlib
 import functools
 import json
 import logging
@@ -49,6 +50,18 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from tools.thread_context import propagate_context_to_thread
 
+
+@contextlib.contextmanager
+def _plane_code_execution_context():
+    """Mark parent-RPC tool dispatch as trusted restricted Code Mode."""
+    try:
+        from plane_runtime.host_port import plane_code_mode
+    except Exception:
+        yield
+        return
+    with plane_code_mode():
+        yield
+
 # Availability gate.  On Windows we fall back to loopback TCP for the
 # sandbox RPC transport (AF_UNIX is unreliable on Windows Python) — see
 # ``_use_tcp_rpc`` in ``_execute_local`` below.  That makes execute_code
@@ -67,6 +80,8 @@ SANDBOX_ALLOWED_TOOLS = frozenset([
     "search_files",
     "patch",
     "terminal",
+    # Parent-RPC mediated, credential-free Plane host callback.
+    "plane_operation",
 ])
 
 # Resource limit defaults (overridable via config.yaml → code_execution.*)
@@ -354,6 +369,12 @@ _TOOL_STUBS = {
         "command: str, timeout: int = None, workdir: str = None",
         '"""Run a shell command (foreground only). Returns dict with "output" and "exit_code"."""',
         '{"command": command, "timeout": timeout, "workdir": workdir}',
+    ),
+    "plane_operation": (
+        "plane_operation",
+        "action: str, operation_ref: str = None, input: dict = None",
+        '"""Call one credential-free Plane host operation through parent RPC."""',
+        '{"action": action, "operationRef": operation_ref, "input": input or {}}',
     ),
 }
 
@@ -676,9 +697,10 @@ def _rpc_server_loop(
                     try:
                         sys.stdout = devnull
                         sys.stderr = devnull
-                        result = handle_function_call(
-                            tool_name, tool_args, task_id=task_id
-                        )
+                        with _plane_code_execution_context():
+                            result = handle_function_call(
+                                tool_name, tool_args, task_id=task_id
+                            )
                     finally:
                         sys.stdout, sys.stderr = _real_stdout, _real_stderr
                         devnull.close()
@@ -958,9 +980,10 @@ def _rpc_poll_loop(
                         try:
                             sys.stdout = devnull
                             sys.stderr = devnull
-                            tool_result = handle_function_call(
-                                tool_name, tool_args, task_id=task_id
-                            )
+                            with _plane_code_execution_context():
+                                tool_result = handle_function_call(
+                                    tool_name, tool_args, task_id=task_id
+                                )
                         finally:
                             sys.stdout, sys.stderr = _real_stdout, _real_stderr
                             devnull.close()

@@ -57,6 +57,54 @@ _OPENROUTER_PROVIDER_SORT_VALUES = {"throughput", "latency", "price"}
 # narrower non-rate-limit case.  See issue #24996.
 _FALLBACK_EXHAUSTED_COOLDOWN_S = 5.0
 
+_PLANE_LEGACY_CODE_MODE_TOOL = "plane_execute_typescript"
+_PLANE_DIRECT_CODE_MODE_TOOL = "Plane:execute"
+
+
+def _plane_tool_name(tool):
+    if not isinstance(tool, dict):
+        return None
+    if tool.get("name") in {_PLANE_LEGACY_CODE_MODE_TOOL, _PLANE_DIRECT_CODE_MODE_TOOL}:
+        return tool["name"]
+    function = tool.get("function")
+    if isinstance(function, dict) and function.get("name") in {
+        _PLANE_LEGACY_CODE_MODE_TOOL,
+        _PLANE_DIRECT_CODE_MODE_TOOL,
+    }:
+        return function["name"]
+    return None
+
+
+def _plane_codex_request_overrides(agent, tools):
+    """Require one bounded Code Mode turn after a trusted prepared search."""
+
+    configured = getattr(agent, "request_overrides", None)
+    available_tools = {
+        name for tool in (tools or []) if (name := _plane_tool_name(tool)) is not None
+    }
+    selected_tool = (
+        _PLANE_DIRECT_CODE_MODE_TOOL
+        if _PLANE_DIRECT_CODE_MODE_TOOL in available_tools
+        else _PLANE_LEGACY_CODE_MODE_TOOL
+    )
+    tool_available = selected_tool in available_tools
+    consume_phase = getattr(agent, "_plane_runtime_consume_code_mode_phase", None)
+    if callable(consume_phase):
+        phase = consume_phase(tool_available=tool_available)
+    else:
+        hint_check = getattr(agent, "_plane_runtime_code_mode_phase_hint", None)
+        if not callable(hint_check):
+            return configured
+        phase = hint_check()
+        if phase == "post_search":
+            raise RuntimeError("Plane Code Mode continuation state is unavailable")
+    if phase not in {None, "post_search"}:
+        raise RuntimeError("Plane Code Mode continuation state is invalid")
+    overrides = dict(configured) if isinstance(configured, dict) else {}
+    if phase == "post_search":
+        overrides["tool_choice"] = {"type": "function", "name": selected_tool}
+    return overrides
+
 
 def _context_thread_target(callback):
     """Bind a no-argument thread target to the caller's ContextVars."""
@@ -1224,7 +1272,7 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
             base_url=agent.base_url,
             max_tokens=agent.max_tokens,
             timeout=agent._resolved_api_call_timeout(),
-            request_overrides=agent.request_overrides,
+            request_overrides=_plane_codex_request_overrides(agent, tools_for_api),
             is_github_responses=is_github_responses,
             is_codex_backend=is_codex_backend,
             is_xai_responses=is_xai_responses,
@@ -1961,6 +2009,36 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             }
             if _fb_timeout is not None:
                 agent._client_kwargs["timeout"] = _fb_timeout
+
+            # The resolver above is also used by auxiliary callers and
+            # therefore constructs its own SDK client.  When an embedding has
+            # supplied the primary agent's HTTP-client factory, rebuild this
+            # OpenAI-compatible fallback through the same agent seam before
+            # exposing it to the conversation loop.  Native Messages,
+            # Bedrock, MoA, and ACP modes do not enter this branch or do not
+            # use an OpenAI-compatible HTTP client and remain unchanged.
+            http_client_factory = getattr(agent, "__dict__", {}).get(
+                "_http_client_factory"
+            )
+            if (
+                http_client_factory is not None
+                and fb_api_mode in {"chat_completions", "codex_responses"}
+                and fb_provider not in {"copilot-acp", "moa"}
+            ):
+                resolved_client = fb_client
+                try:
+                    fb_client = agent._create_openai_client(
+                        dict(agent._client_kwargs),
+                        reason="fallback",
+                        shared=True,
+                    )
+                finally:
+                    try:
+                        resolved_client.close()
+                    except Exception:
+                        pass
+                agent.client = fb_client
+            if _fb_timeout is not None:
                 # Rebuild the shared OpenAI client so the configured
                 # timeout takes effect on the very next fallback request,
                 # not only after a later credential-rotation rebuild.

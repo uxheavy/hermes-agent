@@ -503,6 +503,7 @@ class AIAgent:
         checkpoint_max_file_size_mb: int = 10,
         pass_session_id: bool = False,
         requested_provider: str = None,
+        http_client_factory: Optional[Callable[[], Any]] = None,
     ):
         """Forwarder — see ``agent.agent_init.init_agent``."""
         if tool_delay is not None:
@@ -512,7 +513,8 @@ class AIAgent:
                 DeprecationWarning,
                 stacklevel=2,
             )
-        from agent.agent_init import init_agent
+        from agent.agent_init import _validate_http_client_factory, init_agent
+        _validate_http_client_factory(http_client_factory)
         init_agent(
             self,
             base_url=base_url,
@@ -586,6 +588,7 @@ class AIAgent:
             checkpoint_max_total_size_mb=checkpoint_max_total_size_mb,
             checkpoint_max_file_size_mb=checkpoint_max_file_size_mb,
             pass_session_id=pass_session_id,
+            http_client_factory=http_client_factory,
         )
 
     def _get_session_db_for_recall(self):

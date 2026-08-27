@@ -43,6 +43,16 @@ class ServerDisconnectedError(MockTransportError):
     pass
 
 
+class ProviderOutcomeUnknownError(Exception):
+    code = "outcome_unknown"
+    retryable = False
+    upstream_initiated = True
+    terminal_failure = True
+
+    def __init__(self):
+        super().__init__("provider outcome is unknown; reconcile before retrying")
+
+
 # ── Test: FailoverReason enum ──────────────────────────────────────────
 
 class TestFailoverReason:
@@ -52,7 +62,7 @@ class TestFailoverReason:
 
     def test_enum_members_exist(self):
         expected = {
-            "auth", "auth_permanent", "billing", "rate_limit",
+            "auth", "auth_permanent", "billing", "budget_exhausted", "rate_limit",
             "upstream_rate_limit",
             "overloaded", "server_error", "timeout",
             "ssl_cert_verification",
@@ -62,6 +72,7 @@ class TestFailoverReason:
             "multimodal_tool_content_unsupported",
             "provider_policy_blocked",
             "content_policy_blocked",
+            "outcome_unknown",
             "thinking_signature", "long_context_tier",
             "oauth_long_context_beta_forbidden",
             "llama_cpp_grammar_pattern",
@@ -90,8 +101,38 @@ class TestClassifiedError:
         assert e.should_compress is False
         assert e.should_rotate_credential is False
         assert e.should_fallback is False
+        assert e.terminal is False
         assert e.status_code is None
         assert e.message == ""
+
+
+def test_invocation_model_call_budget_is_finite_and_not_retryable():
+    result = classify_api_error(
+        MockAPIError("forbidden", status_code=403, body={"error": "budget_exhausted"}),
+        provider="openai-codex",
+        model="gpt-5.6-luna",
+    )
+
+    assert result.reason == FailoverReason.budget_exhausted
+    assert result.retryable is False
+    assert result.should_rotate_credential is False
+    assert result.should_fallback is False
+
+
+def test_provider_outcome_unknown_is_terminal_and_not_retryable():
+    wrapped = RuntimeError("SDK connection wrapper")
+    wrapped.__cause__ = ProviderOutcomeUnknownError()
+    result = classify_api_error(
+        wrapped,
+        provider="openai-codex",
+        model="gpt-5.6-luna",
+    )
+
+    assert result.reason == FailoverReason.outcome_unknown
+    assert result.retryable is False
+    assert result.terminal is True
+    assert result.should_rotate_credential is False
+    assert result.should_fallback is False
 
 
 # ── Test: Status code extraction ───────────────────────────────────────
@@ -1047,6 +1088,5 @@ class TestExpandedOverflowPatterns:
         )
         result = classify_api_error(e, provider="openrouter", model="m")
         assert result.reason == FailoverReason.context_overflow
-
 
 

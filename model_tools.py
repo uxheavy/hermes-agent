@@ -468,7 +468,12 @@ def _compute_tool_definitions(
     # available.  Without this, the model sees "web_search is available in
     # execute_code" even when the API key isn't configured or the toolset is
     # disabled (#560-discord).
-    if "execute_code" in available_tool_names:
+    execute_code_entry = registry.get_entry("execute_code")
+    if (
+        "execute_code" in available_tool_names
+        and execute_code_entry is not None
+        and execute_code_entry.toolset == "code_execution"
+    ):
         from tools.code_execution_tool import SANDBOX_ALLOWED_TOOLS, build_execute_code_schema, _get_execution_mode
         sandbox_enabled = SANDBOX_ALLOWED_TOOLS & available_tool_names
         dynamic_schema = build_execute_code_schema(sandbox_enabled, mode=_get_execution_mode())

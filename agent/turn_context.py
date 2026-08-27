@@ -392,6 +392,9 @@ def build_turn_context(
             api_key=getattr(agent, "api_key", "") or "",
             api_mode=getattr(agent, "api_mode", "") or "",
             auth_mode=getattr(agent, "auth_mode", "") or "",
+            http_client_factory=(getattr(agent, "__dict__", {}) or {}).get(
+                "_http_client_factory"
+            ),
         )
     except Exception:
         pass

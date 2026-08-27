@@ -30,6 +30,7 @@ class FailoverReason(enum.Enum):
 
     # Billing / quota
     billing = "billing"                  # 402 or confirmed credit exhaustion — rotate immediately
+    budget_exhausted = "budget_exhausted"  # Invocation-local hard model-call cap — never retry
     rate_limit = "rate_limit"            # 429 or quota-based throttling — backoff then rotate
     # Upstream model rate-limited (aggregator 429) — fallback to a different
     # model, NOT credential rotation. The user's key is healthy.
@@ -63,6 +64,7 @@ class FailoverReason(enum.Enum):
     multimodal_tool_content_unsupported = "multimodal_tool_content_unsupported"  # Provider rejected list-type content in tool messages (e.g. Xiaomi MiMo) — downgrade to text and retry
 
     # Provider-specific
+    outcome_unknown = "outcome_unknown"  # Upstream may have accepted the request; never replay
     thinking_signature = "thinking_signature"  # Anthropic thinking block sig invalid
     long_context_tier = "long_context_tier"    # Anthropic "extra usage" tier gate
     oauth_long_context_beta_forbidden = "oauth_long_context_beta_forbidden"  # Anthropic OAuth subscription rejects 1M context beta — disable beta and retry
@@ -91,6 +93,7 @@ class ClassifiedError:
     should_compress: bool = False
     should_rotate_credential: bool = False
     should_fallback: bool = False
+    terminal: bool = False
 
     @property
     def is_auth(self) -> bool:
@@ -688,6 +691,34 @@ def classify_api_error(
         }
         defaults.update(overrides)
         return ClassifiedError(**defaults)
+
+    # A narrow provider adapter may mark an error when the upstream request
+    # could have been accepted. This generic signal prevents credential
+    # rotation and fallback without importing provider-specific code into the
+    # retry loop.
+    if _is_terminal_provider_error(error):
+        return _result(
+            FailoverReason.outcome_unknown,
+            retryable=False,
+            should_rotate_credential=False,
+            should_fallback=False,
+            terminal=True,
+        )
+
+    # Plane's relay uses a bounded, invocation-local model-call allowance.
+    # Replaying this request cannot make progress and would violate that
+    # allowance, so this must win over generic HTTP 403/auth handling.
+    if (
+        error_code.casefold() == "budget_exhausted"
+        or "model-call budget is exhausted" in error_msg
+        or "model call budget is exhausted" in error_msg
+    ):
+        return _result(
+            FailoverReason.budget_exhausted,
+            retryable=False,
+            should_rotate_credential=False,
+            should_fallback=False,
+        )
 
     # ── 1. Provider-specific patterns (highest priority) ────────────
 
@@ -1645,6 +1676,24 @@ def _extract_status_code(error: Exception) -> Optional[int]:
     return None
 
 
+def _is_terminal_provider_error(error: Exception) -> bool:
+    """Find a typed no-replay marker through SDK exception wrapping."""
+
+    current = error
+    for _ in range(5):
+        if (
+            getattr(current, "terminal_failure", False) is True
+            and getattr(current, "retryable", None) is False
+            and getattr(current, "upstream_initiated", False) is True
+        ):
+            return True
+        cause = getattr(current, "__cause__", None) or getattr(current, "__context__", None)
+        if cause is None or cause is current:
+            break
+        current = cause
+    return False
+
+
 def _extract_error_body(error: Exception) -> dict:
     """Extract the structured error body from an SDK exception or its cause chain."""
     current = error
@@ -1690,6 +1739,8 @@ def _extract_error_code(body: dict) -> str:
         return ""
 
     error_obj = body.get("error", {})
+    if isinstance(error_obj, str) and error_obj.strip():
+        return error_obj.strip()
     if isinstance(error_obj, dict):
         code = error_obj.get("code") or error_obj.get("type") or ""
         if isinstance(code, str) and code.strip() and code.strip() != "400":
