@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import json
 import copy
+import os
+import tempfile
 import unittest
+from unittest import mock
+from pathlib import Path
 
 from plane_runtime.g1_contract import G1InvocationEnvelope, G1RunSnapshot
 from plane_runtime.hermes_adapter import HermesKernelAdapter
@@ -253,6 +257,66 @@ class Adr0011CodeModeTests(unittest.TestCase):
         self.assertIn('"objective":"Persisted objective."', str(captured["task_kit"]))
         self.assertIn("persisted declarations", prompt)
         self.assertIn("persisted example", prompt)
+
+    def test_real_aiagent_receives_only_direct_plane_tools(self) -> None:
+        snapshot = G1RunSnapshot.from_dict(_plane_snapshot())
+        invocation = G1InvocationEnvelope.from_dict(make_invocation(snapshot.to_dict()))
+        captured: dict[str, object] = {}
+
+        from run_agent import AIAgent
+
+        def factory(**kwargs: object) -> AIAgent:
+            agent = AIAgent(**kwargs)
+
+            def run_conversation(_message: str, *, system_message: str) -> dict[str, str]:
+                del system_message
+                captured["tools"] = [tool["function"]["name"] for tool in agent.tools]
+                captured["valid_tool_names"] = set(agent.valid_tool_names)
+                captured["skip_mcp_refresh"] = agent._skip_mcp_refresh
+                return {"final_response": "technical transcript"}
+
+            agent.run_conversation = run_conversation  # type: ignore[method-assign]
+            return agent
+
+        class Credentials:
+            def resolve(self, _provider: str) -> dict[str, str]:
+                return {
+                    "api_key": "provider-free-test-secret",
+                    "base_url": "http://127.0.0.1",
+                    "api_mode": "chat_completions",
+                }
+
+        with tempfile.TemporaryDirectory(prefix="hermes-plane-tools-") as hermes_home:
+            import run_agent
+
+            previous_home = run_agent._hermes_home
+            with mock.patch.dict(os.environ, {"HERMES_HOME": hermes_home}):
+                run_agent._hermes_home = Path(hermes_home)
+                try:
+                    result = HermesKernelAdapter(
+                        agent_factory=factory,
+                        credential_source=Credentials(),
+                        host_port=CallablePlaneHostPort(lambda request: _result(request)),
+                    ).dispatch(
+                        snapshot,
+                        invocation,
+                        lambda: False,
+                        lambda _body: None,
+                        model_call_allowance=1,
+                    )
+                finally:
+                    run_agent._hermes_home = previous_home
+
+        self.assertEqual(result.kind, "failed")
+        self.assertEqual(
+            set(captured["tools"]),
+            {PLANE_DISCOVER_TOOL, PLANE_EXECUTE_TOOL},
+        )
+        self.assertEqual(captured["valid_tool_names"], {PLANE_DISCOVER_TOOL, PLANE_EXECUTE_TOOL})
+        self.assertTrue(captured["skip_mcp_refresh"])
+        self.assertNotIn("tool_search", captured["valid_tool_names"])
+        self.assertNotIn("tool_describe", captured["valid_tool_names"])
+        self.assertNotIn("tool_call", captured["valid_tool_names"])
 
     def test_non_plane_adapter_keeps_existing_toolset_path(self) -> None:
         snapshot = G1RunSnapshot.from_dict(make_snapshot())

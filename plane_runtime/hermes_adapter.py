@@ -1122,6 +1122,23 @@ class HermesKernelAdapter:
         )
         try:
             agent = self._agent_factory(**agent_kwargs)
+            if plane_code_mode_route:
+                # The generic AIAgent factory may collapse this toolset behind
+                # Hermes' tool-search bridge. Plane Code Mode has a closed,
+                # direct model surface, so narrow the completed agent snapshot
+                # at this adapter seam and keep automatic refreshes from
+                # widening it.
+                from model_tools import get_tool_definitions
+
+                agent.tools = get_tool_definitions(
+                    enabled_toolsets=[PLANE_AGENT_TOOLSET],
+                    quiet_mode=True,
+                    skip_tool_search_assembly=True,
+                )
+                agent.valid_tool_names = {
+                    tool["function"]["name"] for tool in agent.tools
+                }
+                agent._skip_mcp_refresh = True
             if host_binding is not None:
                 setattr(agent, "_terminal_action_check", host_binding.terminal_action_reason)
                 setattr(
