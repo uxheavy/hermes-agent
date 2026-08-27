@@ -5,7 +5,12 @@ from __future__ import annotations
 import copy
 import json
 import unittest
+from types import SimpleNamespace
 
+from agent.conversation_loop import (
+    _record_plane_runtime_request,
+    _record_plane_runtime_response,
+)
 from plane_runtime.g1_contract import G1InvocationEnvelope, G1RunSnapshot
 from plane_runtime.hermes_adapter import HermesKernelAdapter
 from plane_runtime.host_port import CallablePlaneHostPort, current_plane_host
@@ -14,6 +19,78 @@ from tools.registry import registry
 
 
 class AdapterPresentationTests(unittest.TestCase):
+    def test_standard_failure_emits_recorded_runtime_diagnostics_once(self) -> None:
+        snapshot = G1RunSnapshot.from_dict(make_snapshot())
+        invocation = G1InvocationEnvelope.from_dict(make_invocation(snapshot.to_dict()))
+        bodies: list[dict[str, object]] = []
+
+        class ExplodingAgent:
+            session_api_calls = 2
+            session_input_tokens = 1
+            session_output_tokens = 1
+
+            def run_conversation(self, message: str, *, system_message: str) -> dict[str, str]:
+                del message, system_message
+                _record_plane_runtime_request(
+                    self,
+                    {
+                        "tool_choice": "auto",
+                        "tools": [{"function": {"name": "search_workspace"}}],
+                    },
+                )
+                _record_plane_runtime_response(
+                    self,
+                    SimpleNamespace(
+                        tool_calls=[
+                            SimpleNamespace(
+                                function=SimpleNamespace(name="search_workspace")
+                            )
+                        ],
+                        content="must-not-cross",
+                    ),
+                )
+                raise RuntimeError("private prompt and provider body must not cross")
+
+        class Credentials:
+            def resolve(self, provider: str) -> dict[str, str]:
+                del provider
+                return {"api_key": "provider-free-test-secret"}
+
+        result = HermesKernelAdapter(
+            agent_factory=lambda **kwargs: ExplodingAgent(),
+            credential_source=Credentials(),
+            host_port=CallablePlaneHostPort(lambda request: {}),
+        ).dispatch(snapshot, invocation, lambda: False, bodies.append, model_call_allowance=2)
+
+        self.assertEqual(result.kind, "failed")
+        self.assertEqual(result.failure_cause, "runtime_unknown_failure")
+        diagnostics = [
+            body["payload"]
+            for body in bodies
+            if body.get("kind") == "progress_observed"
+            and isinstance(body.get("payload"), dict)
+            and body["payload"].get("kind") == "runtime_diagnostics"
+        ]
+        self.assertEqual(len(diagnostics), 1)
+        self.assertEqual(
+            diagnostics[0]["requests"],  # type: ignore[index]
+            [
+                {
+                    "sequence": 1,
+                    "toolChoice": "auto",
+                    "visibleToolset": "other",
+                    "visibleToolCount": 1,
+                    "serialized": True,
+                }
+            ],
+        )
+        self.assertEqual(
+            diagnostics[0]["responses"],  # type: ignore[index]
+            [{"sequence": 1, "responseClass": "tool_call", "toolCall": "other"}],
+        )
+        self.assertNotIn("must-not-cross", json.dumps(bodies))
+        self.assertNotIn("private prompt", json.dumps(bodies))
+
     def test_manager_route_uses_search_then_canonical_work_item_read_input(self) -> None:
         raw = copy.deepcopy(make_snapshot())
         raw["assignment"] = {

@@ -747,6 +747,66 @@ def _terminal_lifecycle_observation(
     return encoded
 
 
+def _emit_plane_runtime_diagnostics(
+    agent: Any,
+    emit_body: Callable[[Mapping[str, Any]], None],
+) -> None:
+    """Emit the existing finite request/response projection before failure."""
+
+    diagnostics = getattr(agent, "_plane_runtime_diagnostics", None)
+    if not isinstance(diagnostics, dict):
+        return
+    requests = diagnostics.get("requests")
+    responses = diagnostics.get("responses")
+    if not isinstance(requests, list) or not isinstance(responses, list):
+        return
+    request_rows = [
+        {
+            "sequence": row["sequence"],
+            "toolChoice": row["toolChoice"],
+            "visibleToolset": row["visibleToolset"],
+            "visibleToolCount": row["visibleToolCount"],
+            "serialized": True,
+        }
+        for row in requests[:32]
+        if isinstance(row, Mapping)
+        and {
+            "sequence",
+            "toolChoice",
+            "visibleToolset",
+            "visibleToolCount",
+            "serialized",
+        }.issubset(row)
+    ]
+    response_rows = [
+        {
+            "sequence": row["sequence"],
+            "responseClass": row["responseClass"],
+            "toolCall": row["toolCall"],
+        }
+        for row in responses[:32]
+        if isinstance(row, Mapping)
+        and {"sequence", "responseClass", "toolCall"}.issubset(row)
+    ]
+    try:
+        emit_body(
+            {
+                "kind": "progress_observed",
+                "payload": {
+                    "kind": "runtime_diagnostics",
+                    "version": 1,
+                    "requests": request_rows,
+                    "responses": response_rows,
+                },
+                "publication": {"action": "observation_only"},
+            }
+        )
+    except Exception:
+        # Diagnostics are non-authoritative; a sink failure must not change
+        # failure classification or terminal behavior.
+        return
+
+
 class NeverCancelled:
     """Explicit no-cancellation seam for callers that own no control signal."""
 
@@ -1122,6 +1182,12 @@ class HermesKernelAdapter:
         )
         try:
             agent = self._agent_factory(**agent_kwargs)
+            if host_binding is not None:
+                setattr(
+                    agent,
+                    "_plane_runtime_diagnostics",
+                    {"requests": [], "responses": []},
+                )
             if plane_code_mode_route:
                 # The generic AIAgent factory may collapse this toolset behind
                 # Hermes' tool-search bridge. Plane Code Mode has a closed,
@@ -1196,6 +1262,7 @@ class HermesKernelAdapter:
                 and getattr(exc, "retryable", None) is False
                 and getattr(exc, "upstream_initiated", False) is True
             ):
+                _emit_plane_runtime_diagnostics(agent, emit_body)
                 return HermesKernelResult(
                     kind="failed",
                     failure_code="outcome_unknown",
@@ -1209,6 +1276,7 @@ class HermesKernelAdapter:
                 and not host_binding.fatal_error_after_terminal
             ):
                 diagnostic = host_binding.host_operation_diagnostic
+                _emit_plane_runtime_diagnostics(agent, emit_body)
                 return HermesKernelResult(
                     kind="failed",
                     failure_code="runtime_error",
@@ -1265,6 +1333,7 @@ class HermesKernelAdapter:
                     output_text=output_text,
                     model_calls=self._observed_model_calls(agent, None),
                 )
+            _emit_plane_runtime_diagnostics(agent, emit_body)
             return HermesKernelResult(
                 kind="failed",
                 failure_code="runtime_error",
@@ -1371,6 +1440,7 @@ class HermesKernelAdapter:
                 model_calls=model_calls,
             )
         if result.get("failed") is True:
+            _emit_plane_runtime_diagnostics(agent, emit_body)
             if result.get("failure_reason") == "outcome_unknown":
                 return HermesKernelResult(
                     kind="failed",
