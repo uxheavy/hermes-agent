@@ -27,6 +27,7 @@ from plane_runtime.host_port import (
     PlaneHostError,
     PlaneHostUnavailable,
     HostCallRequest,
+    PLANE_CODE_MODE_EXECUTE_OPERATION,
     PLANE_OUTCOME_PUBLISH_OPERATION,
     UnixSocketPlaneHostPort,
     bind_plane_host,
@@ -833,6 +834,34 @@ print("text_response")
                 },
             )
             self.assertNotIn(server.path, json.dumps(server.requests))
+
+    def test_unix_socket_client_allows_bounded_callback_beyond_legacy_two_second_deadline(self) -> None:
+        def delayed(request):
+            time.sleep(2.1)
+            return (
+                json.dumps(
+                    _result(request, output={"status": "completed"}),
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode()
+                + b"\n"
+            )
+
+        with _LocalHostServer(delayed) as server:
+            result = UnixSocketPlaneHostPort(server.path).invoke(
+                HostCallRequest(
+                    run_id="run:test",
+                    invocation_id="invocation:test",
+                    correlation_id="correlation:test",
+                    action="code",
+                    operation_ref=PLANE_CODE_MODE_EXECUTE_OPERATION,
+                    input={"code": "return await plane.finish({kind: 'completed', summary: 'done'})"},
+                    source="model",
+                )
+            )
+
+            self.assertEqual(result.status, "ok")
+            self.assertEqual(len(server.requests), 1)
 
     def test_unix_socket_client_fails_closed_on_missing_malformed_and_mismatched_results(self) -> None:
         request_ref = "host-request:changed"

@@ -555,7 +555,7 @@ class UnixSocketPlaneHostPort:
         self,
         socket_path: str,
         *,
-        timeout_seconds: float = 2.0,
+        timeout_seconds: float = 6.0,
         cancellation: Callable[[], bool] | None = None,
     ) -> None:
         if (
