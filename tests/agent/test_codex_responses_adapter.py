@@ -8,6 +8,7 @@ from agent.codex_responses_adapter import (
     _normalize_codex_response,
     _preflight_codex_api_kwargs,
     _preflight_codex_input_items,
+    _responses_tools,
 )
 
 
@@ -40,6 +41,80 @@ def test_normalize_codex_response_treats_summary_only_reasoning_as_incomplete():
     assert assistant_message.content == ""
     assert assistant_message.reasoning == "still thinking"
     assert assistant_message.codex_reasoning_items is None
+
+
+def test_plane_tool_names_use_exact_responses_wire_aliases():
+    tools = _responses_tools(
+        [
+            {
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": name,
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+            for name in ("Plane:discover", "Plane:execute", "terminal", "Other:tool")
+        ]
+    )
+    assert [tool["name"] for tool in tools] == [
+        "Plane_discover",
+        "Plane_execute",
+        "terminal",
+        "Other:tool",
+    ]
+
+    replay = _chat_messages_to_responses_input(
+        [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_plane",
+                        "type": "function",
+                        "function": {"name": "Plane:execute", "arguments": "{}"},
+                    }
+                ],
+            }
+        ]
+    )
+    assert replay[0]["name"] == "Plane_execute"
+
+    preflight = _preflight_codex_api_kwargs(
+        {
+            "model": "gpt-5.6-codex",
+            "instructions": "Use Plane.",
+            "input": replay,
+            "tools": tools,
+            "tool_choice": {"type": "function", "name": "Plane:execute"},
+            "store": False,
+        }
+    )
+    assert preflight["input"][0]["name"] == "Plane_execute"
+    assert preflight["tool_choice"] == {
+        "type": "function",
+        "name": "Plane_execute",
+    }
+
+    assistant, finish_reason = _normalize_codex_response(
+        SimpleNamespace(
+            status="completed",
+            output=[
+                SimpleNamespace(
+                    type="function_call",
+                    status="completed",
+                    id="fc_plane",
+                    call_id="call_plane",
+                    name="Plane_execute",
+                    arguments="{}",
+                )
+            ],
+        ),
+        issuer_kind="codex_backend",
+    )
+    assert finish_reason == "tool_calls"
+    assert assistant.tool_calls[0].function.name == "Plane:execute"
 
 
 
@@ -302,8 +377,6 @@ def _xai_reasoning_only_response(reasoning_text):
             )
         ],
     )
-
-
 
 
 

@@ -57,17 +57,21 @@ _OPENROUTER_PROVIDER_SORT_VALUES = {"throughput", "latency", "price"}
 # narrower non-rate-limit case.  See issue #24996.
 _FALLBACK_EXHAUSTED_COOLDOWN_S = 5.0
 
-_PLANE_CODE_MODE_TOOL = "plane_execute_typescript"
+_PLANE_LEGACY_CODE_MODE_TOOL = "plane_execute_typescript"
+_PLANE_DIRECT_CODE_MODE_TOOL = "Plane:execute"
 
 
 def _plane_tool_name(tool):
     if not isinstance(tool, dict):
         return None
-    if tool.get("name") == _PLANE_CODE_MODE_TOOL:
-        return _PLANE_CODE_MODE_TOOL
+    if tool.get("name") in {_PLANE_LEGACY_CODE_MODE_TOOL, _PLANE_DIRECT_CODE_MODE_TOOL}:
+        return tool["name"]
     function = tool.get("function")
-    if isinstance(function, dict) and function.get("name") == _PLANE_CODE_MODE_TOOL:
-        return _PLANE_CODE_MODE_TOOL
+    if isinstance(function, dict) and function.get("name") in {
+        _PLANE_LEGACY_CODE_MODE_TOOL,
+        _PLANE_DIRECT_CODE_MODE_TOOL,
+    }:
+        return function["name"]
     return None
 
 
@@ -75,9 +79,15 @@ def _plane_codex_request_overrides(agent, tools):
     """Require one bounded Code Mode turn after a trusted prepared search."""
 
     configured = getattr(agent, "request_overrides", None)
-    tool_available = any(
-        _plane_tool_name(tool) == _PLANE_CODE_MODE_TOOL for tool in (tools or [])
+    available_tools = {
+        name for tool in (tools or []) if (name := _plane_tool_name(tool)) is not None
+    }
+    selected_tool = (
+        _PLANE_DIRECT_CODE_MODE_TOOL
+        if _PLANE_DIRECT_CODE_MODE_TOOL in available_tools
+        else _PLANE_LEGACY_CODE_MODE_TOOL
     )
+    tool_available = selected_tool in available_tools
     consume_phase = getattr(agent, "_plane_runtime_consume_code_mode_phase", None)
     if callable(consume_phase):
         phase = consume_phase(tool_available=tool_available)
@@ -92,7 +102,7 @@ def _plane_codex_request_overrides(agent, tools):
         raise RuntimeError("Plane Code Mode continuation state is invalid")
     overrides = dict(configured) if isinstance(configured, dict) else {}
     if phase == "post_search":
-        overrides["tool_choice"] = {"type": "function", "name": _PLANE_CODE_MODE_TOOL}
+        overrides["tool_choice"] = {"type": "function", "name": selected_tool}
     return overrides
 
 

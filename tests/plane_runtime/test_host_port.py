@@ -453,6 +453,25 @@ class HostPortTests(unittest.TestCase):
         assert binding.code_mode_phase_hint() is None
         assert _plane_codex_request_overrides(agent, tools) == {}
 
+    def test_post_search_prefers_adr0011_direct_execute_tool(self) -> None:
+        from agent.chat_completion_helpers import _plane_codex_request_overrides
+
+        agent = SimpleNamespace(
+            request_overrides={},
+            _plane_runtime_consume_code_mode_phase=lambda *, tool_available: (
+                "post_search" if tool_available else None
+            ),
+        )
+        tools = [
+            {"type": "function", "function": {"name": "Plane:discover"}},
+            {"type": "function", "function": {"name": "Plane:execute"}},
+        ]
+
+        assert _plane_codex_request_overrides(agent, tools)["tool_choice"] == {
+            "type": "function",
+            "name": "Plane:execute",
+        }
+
     def test_armed_code_mode_fails_closed_without_tool_and_standard_flow_is_unchanged(self) -> None:
         from agent.chat_completion_helpers import _plane_codex_request_overrides
 
