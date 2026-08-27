@@ -37,14 +37,14 @@ class G1ContractTests(unittest.TestCase):
             {
                 "runSnapshot": "e84f7b5b2a92c98d1fd1bcdbd2bfc6079692cba69e7027b3f40f700b7cc0d673",
                 "invocationEnvelope": "b7a15d74406f1624cdb7cd95b42edfd1ffee596abe57e4f00ed60e2e23ded995",
-                "runtimeEvent": "a4c91dee656fdff4b1afbe8fd7fba0b4d7be9fbeecb88da748e3f3e200841444",
-                "runtimeExit": "4b3bf10674ebadc8e51e9aad26b856509cf792e238ac6af424fbfc2cc87ac181",
+                "runtimeEvent": "42ac3b41f2561fc7fac392c6e9f5b4eec8251d508ccae6739e79b2243953401a",
+                "runtimeExit": "fc93e148778bad2f7862a5c08713a76162941e1d5c2720b5c561f121164a05d3",
                 "runtimeDurableState": "444c944ec8a5054f33c8662470529a1f4565d42ff06138438beceeef7967a0da",
             },
         )
         self.assertEqual(
             G1_MANIFEST_DIGEST,
-            "f897bd22adcd91b713cb82480a1a196d9145fb434e8e155fe7c377554eb1f6be",
+            "7d802c2d6411f7d42e71946ba8b11759a8e0b7ebbd7317d53f5a0d4ec3353d6c",
         )
 
     def test_eager_presentation_fields_are_strict(self) -> None:
