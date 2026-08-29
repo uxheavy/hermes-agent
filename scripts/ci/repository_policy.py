@@ -6,7 +6,7 @@ from __future__ import annotations
 import argparse
 import ast
 import subprocess
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from pathlib import Path
 
 GENERIC_ROOTS = {"common", "helpers", "shared", "utils"}
@@ -33,12 +33,22 @@ def parse_name_status(raw: bytes) -> list[tuple[str, str, str | None]]:
 def registered_tools(source: str) -> set[str]:
     tree = ast.parse(source)
     names: set[str] = set()
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+    for statement in tree.body:
+        if not isinstance(statement, ast.Expr) or not isinstance(statement.value, ast.Call):
             continue
-        if node.func.attr != "register":
+        call = statement.value
+        if not isinstance(call.func, ast.Attribute):
             continue
-        for keyword in node.keywords:
+        if (
+            call.func.attr != "register"
+            or not isinstance(call.func.value, ast.Name)
+            or call.func.value.id != "registry"
+        ):
+            continue
+        if call.args and isinstance(call.args[0], ast.Constant):
+            if isinstance(call.args[0].value, str):
+                names.add(call.args[0].value)
+        for keyword in call.keywords:
             if keyword.arg == "name" and isinstance(keyword.value, ast.Constant):
                 if isinstance(keyword.value.value, str):
                     names.add(keyword.value.value)
@@ -84,9 +94,23 @@ def evaluate(
     *,
     base_has_path: Callable[[str], bool],
     read_text: Callable[[str], str | None],
+    all_tool_paths: Iterable[str] = (),
 ) -> list[tuple[str, str, str]]:
     errors: list[tuple[str, str, str]] = []
     toolsets = exposed_tool_names(read_text("toolsets.py") or "")
+    changed_toolsets = any(
+        status in {"A", "M", "R"} and path == "toolsets.py" for status, path, _ in changes
+    )
+    tool_paths = {
+        path
+        for status, path, _ in changes
+        if status in {"A", "M", "R"}
+        and len(Path(path).parts) == 2
+        and Path(path).parts[0] == "tools"
+        and path.endswith(".py")
+    }
+    if changed_toolsets:
+        tool_paths.update(all_tool_paths)
 
     for status, path, _old_path in changes:
         added = status in {"A", "R"}
@@ -100,16 +124,17 @@ def evaluate(
             if not base_has_path(provider_root):
                 errors.append(("HR002", path, "new memory providers belong in standalone plugin repositories"))
 
-        if added and len(parts) == 2 and parts[0] == "providers" and path.endswith(".py"):
-            if not base_has_path(path):
+        if added and len(parts) >= 2 and parts[0] == "providers":
+            provider_root = "/".join(parts[:2])
+            if not base_has_path(provider_root):
                 errors.append(("HR003", path, "new providers belong in plugins/model-providers"))
 
-        if status in {"A", "M", "R"} and len(parts) == 2 and parts[0] == "tools" and path.endswith(".py"):
-            source = read_text(path)
-            if source is None:
-                continue
-            for name in sorted(registered_tools(source) - toolsets):
-                errors.append(("HR004", path, f"registered tool {name!r} is not exposed by toolsets.py"))
+    for path in sorted(tool_paths):
+        source = read_text(path)
+        if source is None:
+            continue
+        for name in sorted(registered_tools(source) - toolsets):
+            errors.append(("HR004", path, f"registered tool {name!r} is not exposed by toolsets.py"))
 
     return errors
 
@@ -137,7 +162,12 @@ def main() -> int:
         candidate = Path(path)
         return candidate.read_text(encoding="utf-8") if candidate.is_file() else None
 
-    errors = evaluate(changes, base_has_path=base_has_path, read_text=read_text)
+    errors = evaluate(
+        changes,
+        base_has_path=base_has_path,
+        read_text=read_text,
+        all_tool_paths=(path.as_posix() for path in Path("tools").glob("*.py")),
+    )
     for rule, path, message in errors:
         print(f"{path}: {rule} {message}")
     if errors:

@@ -14,13 +14,14 @@ _MODULE = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(_MODULE)
 
 
-def evaluate(changes, files=None, existing=None):
+def evaluate(changes, files=None, existing=None, all_tool_paths=()):
     files = files or {"toolsets.py": "_HERMES_CORE_TOOLS = ['terminal']"}
     existing = existing or set()
     return _MODULE.evaluate(
         changes,
         base_has_path=lambda path: path in existing,
         read_text=lambda path: files.get(path),
+        all_tool_paths=all_tool_paths,
     )
 
 
@@ -48,6 +49,9 @@ class RepositoryPolicyTests(unittest.TestCase):
 
     def test_rejects_new_legacy_provider_modules(self):
         self.assertEqual(evaluate([("A", "providers/new_vendor.py", None)])[0][0], "HR003")
+        self.assertEqual(
+            evaluate([("A", "providers/new_vendor/__init__.py", None)])[0][0], "HR003"
+        )
 
     def test_requires_registered_tools_to_be_exposed(self):
         files = {
@@ -66,6 +70,33 @@ class RepositoryPolicyTests(unittest.TestCase):
             "tools/example.py": "registry.register(name='video', handler=handler)",
         }
         self.assertEqual(evaluate([("A", "tools/example.py", None)], files=files)[0][0], "HR004")
+
+    def test_parses_positional_top_level_registrations_only(self):
+        files = {
+            "toolsets.py": "TOOLSETS = {'core': {'tools': []}}",
+            "tools/example.py": "registry.register('example', handler=handler)",
+        }
+        self.assertEqual(evaluate([("A", "tools/example.py", None)], files=files)[0][0], "HR004")
+        files["tools/example.py"] = (
+            "other.register(name='ignored')\n"
+            "def configure():\n"
+            "    registry.register(name='nested', handler=handler)\n"
+        )
+        self.assertEqual(evaluate([("M", "tools/example.py", None)], files=files), [])
+
+    def test_toolset_changes_recheck_existing_tools(self):
+        files = {
+            "toolsets.py": "TOOLSETS = {'core': {'tools': []}}",
+            "tools/existing.py": "registry.register(name='existing', handler=handler)",
+        }
+        self.assertEqual(
+            evaluate(
+                [("M", "toolsets.py", None)],
+                files=files,
+                all_tool_paths={"tools/existing.py"},
+            )[0][0],
+            "HR004",
+        )
 
     def test_parses_renames_without_losing_the_old_path(self):
         self.assertEqual(
