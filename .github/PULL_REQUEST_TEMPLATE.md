@@ -10,6 +10,10 @@
 
 Fixes #
 
+## Existing Owner / Seam
+
+<!-- Name the existing module, adapter, service, plugin surface, or command that owns this behavior. If this adds a new seam, explain why the existing ones cannot own it. -->
+
 ## Type of Change
 
 <!-- Check the one that applies. -->
@@ -35,6 +39,10 @@ Fixes #
 1. 
 2. 
 3. 
+
+## Missing Evidence and Compatibility Risk
+
+<!-- List checks that were skipped, blocked, or unavailable. Call out intentional API, config, provider, permission, generated-file, or migration changes. Write "None" when not applicable. -->
 
 ## Checklist
 
@@ -72,4 +80,3 @@ Fixes #
 ## Screenshots / Logs
 
 <!-- If applicable, add screenshots or log output showing the fix/feature in action. -->
-
