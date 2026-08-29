@@ -46,11 +46,37 @@ def registered_tools(source: str) -> set[str]:
 
 
 def exposed_tool_names(source: str) -> set[str]:
-    return {
-        node.value
-        for node in ast.walk(ast.parse(source))
-        if isinstance(node, ast.Constant) and isinstance(node.value, str)
-    }
+    tree = ast.parse(source)
+    named_lists: dict[str, set[str]] = {}
+
+    def strings(node: ast.expr) -> set[str]:
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return {node.value}
+        if isinstance(node, ast.Name):
+            return named_lists.get(node.id, set())
+        if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+            values: set[str] = set()
+            for item in node.elts:
+                values.update(strings(item.value if isinstance(item, ast.Starred) else item))
+            return values
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            return strings(node.left) | strings(node.right)
+        return set()
+
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and len(node.targets) == 1:
+            target = node.targets[0]
+            if isinstance(target, ast.Name):
+                named_lists[target.id] = strings(node.value)
+
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Dict):
+            continue
+        for key, value in zip(node.keys, node.values, strict=True):
+            if isinstance(key, ast.Constant) and key.value == "tools":
+                names.update(strings(value))
+    return names
 
 
 def evaluate(
@@ -69,7 +95,7 @@ def evaluate(
         if added and parts and parts[0] in GENERIC_ROOTS and not base_has_path(parts[0]):
             errors.append(("HR001", path, f"new generic root {parts[0]} needs a concrete owner"))
 
-        if added and len(parts) >= 3 and parts[:2] == ("plugins", "memory"):
+        if added and len(parts) >= 4 and parts[:2] == ("plugins", "memory"):
             provider_root = "/".join(parts[:3])
             if not base_has_path(provider_root):
                 errors.append(("HR002", path, "new memory providers belong in standalone plugin repositories"))

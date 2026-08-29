@@ -43,6 +43,9 @@ class RepositoryPolicyTests(unittest.TestCase):
             [],
         )
 
+    def test_allows_shared_memory_root_files(self):
+        self.assertEqual(evaluate([("A", "plugins/memory/shared_helper.py", None)]), [])
+
     def test_rejects_new_legacy_provider_modules(self):
         self.assertEqual(evaluate([("A", "providers/new_vendor.py", None)])[0][0], "HR003")
 
@@ -53,7 +56,16 @@ class RepositoryPolicyTests(unittest.TestCase):
         }
         self.assertEqual(evaluate([("A", "tools/example.py", None)], files=files)[0][0], "HR004")
         files["toolsets.py"] = "_HERMES_CORE_TOOLS = ['terminal', 'example']"
+        self.assertEqual(evaluate([("A", "tools/example.py", None)], files=files)[0][0], "HR004")
+        files["toolsets.py"] = "TOOLSETS = {'core': {'tools': ['terminal', 'example']}}"
         self.assertEqual(evaluate([("A", "tools/example.py", None)], files=files), [])
+
+    def test_ignores_unrelated_toolset_strings(self):
+        files = {
+            "toolsets.py": "TOOLSETS = {'video': {'description': 'example', 'tools': []}}",
+            "tools/example.py": "registry.register(name='video', handler=handler)",
+        }
+        self.assertEqual(evaluate([("A", "tools/example.py", None)], files=files)[0][0], "HR004")
 
     def test_parses_renames_without_losing_the_old_path(self):
         self.assertEqual(

@@ -70,7 +70,7 @@ jobs:
         with:
           fetch-depth: 0
       - name: Check repository placement
-        run: python3 scripts/ci/repository_policy.py --base "${{ github.event.pull_request.base.sha || 'HEAD^' }}"
+        run: python3 scripts/ci/repository_policy.py --base "${{ github.event.pull_request.base.sha || github.event.before }}"
 
   # ─────────────────────────────────────────────────────────────────────
   # Lane-gated sub-workflows. Each runs in parallel after detect finishes.
